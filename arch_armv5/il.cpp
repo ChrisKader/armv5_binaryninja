@@ -7,11 +7,66 @@
 
 #include <stdarg.h>
 #include <functional>
+#include <map>
 #include "il.h"
 #include "lowlevelilinstruction.h"
 
 using namespace BinaryNinja;
 using namespace armv5;
+
+/*
+ * Detect ARM switch table pattern: ADD PC, PC, Rn followed by branch offsets.
+ * Returns true if a switch table was detected, fills targets with destinations.
+ */
+static bool DetectSwitchTableFromIL(LowLevelILFunction& il, uint64_t addr,
+    std::vector<uint64_t>& targets)
+{
+    Ref<Function> func = il.GetFunction();
+    if (!func)
+        return false;
+
+    Ref<BinaryView> view = func->GetView();
+    if (!view)
+        return false;
+
+    /* PC value at this instruction is addr + 8 (ARM pipeline) */
+    uint64_t pcValue = addr + 8;
+
+    /* Table should start at the next instruction */
+    uint64_t tableBase = addr + 4;
+
+    /*
+     * Try to find bounds check before the jump.
+     * Look for: CMP Rn, #max; BHI/BCS skip pattern
+     * For now, scan up to 256 entries or until invalid.
+     */
+    const size_t maxEntries = 256;
+
+    for (size_t i = 0; i < maxEntries; i++)
+    {
+        uint64_t entryAddr = tableBase + (i * 4);
+
+        DataBuffer entryData = view->ReadBuffer(entryAddr, 4);
+        if (entryData.GetLength() < 4)
+            break;
+
+        uint32_t offset = *(uint32_t*)entryData.GetData();
+
+        /* Sanity check: offset should be reasonable (within 1MB) */
+        if (offset > 0x100000)
+            break;
+
+        uint64_t target = pcValue + offset;
+
+        if (!view->IsValidOffset(target))
+            break;
+
+        targets.push_back(target);
+    }
+
+    /* Need at least 2 entries to be a valid switch table */
+    return targets.size() >= 2;
+}
 
 /* Macro to get register IL expression - uses proper register size */
 #define ILREG(idx) il.Register(get_register_size(instr.operands[idx].reg), RegisterToIndex(instr.operands[idx].reg))
@@ -491,6 +546,7 @@ bool LiftDataProcessing(Architecture* arch, LowLevelILFunction& il,
 
     switch (instr.operation) {
         case ARMV5_ADD:
+            /* Standard ADD handling - switch tables handled in AnalyzeBasicBlocks */
             result = il.Add(4, ReadOperand(il, instr, 1, addr),
                 ReadOperand(il, instr, 2, addr), flags);
             ConditionExecute(il, instr.cond,

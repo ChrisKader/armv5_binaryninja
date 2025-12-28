@@ -2175,7 +2175,12 @@ public:
       /* Look for CMP Rx, #imm (bounds check) */
       if (maxCases == 0 && scanInstr.operation == ARMV5_CMP && scanInstr.operands[1].cls == IMM)
       {
-        maxCases = (uint32_t)scanInstr.operands[1].imm + 1;
+        /* CMP Rx, #N followed by BHI/BCS means valid cases are 0..N-1 (N entries)
+         * CMP Rx, #N followed by BGE/BPL means valid cases are 0..N-1 (N entries)
+         * The comparison value is the first invalid case, so maxCases = imm */
+        maxCases = (uint32_t)scanInstr.operands[1].imm;
+        if (maxCases == 0)
+          maxCases = 1; /* Ensure at least 1 entry */
       }
 
       if (foundTable && maxCases > 0)
@@ -2222,61 +2227,54 @@ public:
   virtual void AnalyzeBasicBlocks(Function *function, BasicBlockAnalysisContext &context) override
   {
     auto view = function->GetView();
-    auto &directRefs = context.GetDirectCodeReferences();
 
     /*
-     * Pre-scan the function's start region to find switch tables.
-     * We scan from the function start forward looking for ADD PC, PC, Rn patterns.
-     * This runs BEFORE DefaultAnalyzeBasicBlocks so the targets get included.
+     * Run default analysis first to establish the function's basic blocks.
+     * Then we'll post-process to handle switch tables within this function.
      */
-    uint64_t funcStart = function->GetStart();
-    uint64_t maxScan = funcStart + 0x2000; /* Scan up to 8KB */
+    DefaultAnalyzeBasicBlocks(function, context);
 
+    /*
+     * Now scan the function's EXISTING blocks for switch tables.
+     * This ensures we only process switch tables that are actually within
+     * this function, not switch tables from other functions that happen
+     * to be nearby in memory.
+     */
     set<uint64_t> processedJumps;
-    set<uint64_t> allTargets;
 
-    /* First pass: scan for switch tables */
-    for (uint64_t addr = funcStart; addr < maxScan; addr += 4)
+    for (auto block : function->GetBasicBlocks())
     {
-      if (!view->IsValidOffset(addr))
-        break;
+      uint64_t blockStart = block->GetStart();
+      uint64_t blockEnd = block->GetEnd();
 
-      DataBuffer data = view->ReadBuffer(addr, 4);
-      if (data.GetLength() < 4)
-        break;
-
-      Instruction instr;
-      if (!Disassemble((const uint8_t *)data.GetData(), addr, 4, instr))
-        continue;
-
-      /* Check for ADD PC, PC, Rn (switch jump) */
-      if (instr.operation == ARMV5_ADD &&
-          instr.operands[0].cls == REG && instr.operands[0].reg == REG_PC &&
-          instr.operands[1].cls == REG && instr.operands[1].reg == REG_PC)
+      for (uint64_t addr = blockStart; addr < blockEnd; addr += 4)
       {
-        vector<pair<Ref<Architecture>, uint64_t>> targets;
-        if (DetectSwitchTable(view, addr, targets))
+        DataBuffer data = view->ReadBuffer(addr, 4);
+        if (data.GetLength() < 4)
+          break;
+
+        Instruction instr;
+        if (!Disassemble((const uint8_t *)data.GetData(), addr, 4, instr))
+          continue;
+
+        /* Check for ADD PC, PC, Rn (switch jump) */
+        if (instr.operation == ARMV5_ADD &&
+            instr.operands[0].cls == REG && instr.operands[0].reg == REG_PC &&
+            instr.operands[1].cls == REG && instr.operands[1].reg == REG_PC)
         {
-          processedJumps.insert(addr);
-          for (auto &t : targets)
+          vector<pair<Ref<Architecture>, uint64_t>> targets;
+          if (DetectSwitchTable(view, addr, targets))
           {
-            allTargets.insert(t.second);
-            /* Add to direct references so blocks get created */
-            ArchAndAddr src(this, addr);
-            directRefs[t.second].insert(src);
+            processedJumps.insert(addr);
           }
         }
       }
-
-      /* Stop if we hit a return or unconditional branch */
-      if (instr.operation == ARMV5_BX && instr.operands[0].reg == REG_LR)
-        break;
     }
 
-    /* Run the default analysis with our added direct refs */
-    DefaultAnalyzeBasicBlocks(function, context);
-
-    /* After analysis, set the indirect branches for switch tables */
+    /*
+     * For each detected switch table within this function, set up indirect
+     * branches and create basic blocks for the targets.
+     */
     for (uint64_t jumpAddr : processedJumps)
     {
       vector<pair<Ref<Architecture>, uint64_t>> targets;
@@ -2288,6 +2286,36 @@ public:
           branches.push_back(ArchAndAddr(t.first, t.second));
         }
         function->SetAutoIndirectBranches(this, jumpAddr, branches);
+
+        /*
+         * Define the jump table data as an array of uint32_t.
+         * Table starts at jumpAddr + 4 (after the ADD PC, PC, Rn instruction).
+         * Use a static set to track already-defined tables to avoid duplicates.
+         * Also add data references from each table entry to its target address.
+         */
+        static std::set<uint64_t> definedTables;
+        uint64_t tableAddr = jumpAddr + 4;
+        size_t tableSize = targets.size();
+        if (tableSize > 0 && definedTables.find(tableAddr) == definedTables.end())
+        {
+          definedTables.insert(tableAddr);
+          Ref<Type> uint32Type = Type::IntegerType(4, false);
+          Ref<Type> arrayType = Type::ArrayType(uint32Type, tableSize);
+          view->DefineUserDataVariable(tableAddr, arrayType);
+
+          /* Add data references and comments for each table entry */
+          for (size_t i = 0; i < targets.size(); i++)
+          {
+            uint64_t entryAddr = tableAddr + (i * 4);
+            uint64_t targetAddr = targets[i].second;
+            view->AddUserDataReference(entryAddr, targetAddr);
+
+            /* Add comment showing resolved target address */
+            char comment[32];
+            snprintf(comment, sizeof(comment), "-> 0x%llx", (unsigned long long)targetAddr);
+            view->SetCommentForAddress(entryAddr, comment);
+          }
+        }
       }
     }
   }
