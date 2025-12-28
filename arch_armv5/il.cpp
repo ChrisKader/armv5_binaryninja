@@ -611,279 +611,6 @@ bool LiftDataProcessing(Architecture* arch, LowLevelILFunction& il,
     return true;
 }
 
-/* Lift multiply instructions */
-bool LiftMultiply(Architecture* arch, LowLevelILFunction& il,
-    Instruction& instr, uint64_t addr)
-{
-    uint32_t flags = instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE;
-
-    switch (instr.operation) {
-        case ARMV5_MUL:
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Mult(4, ILREG(1), ILREG(2), flags)));
-            break;
-
-        case ARMV5_MLA:
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, ILREG(3), il.Mult(4, ILREG(1), ILREG(2)), flags)));
-            break;
-
-        case ARMV5_UMULL: {
-            /* 64-bit unsigned multiply: RdLo, RdHi = Rm * Rs */
-            ExprId product = il.MultDoublePrecUnsigned(4, ILREG(2), ILREG(3));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                product, flags));
-            break;
-        }
-
-        case ARMV5_UMLAL: {
-            /* 64-bit unsigned multiply-accumulate */
-            ExprId product = il.MultDoublePrecUnsigned(4, ILREG(2), ILREG(3));
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, product, acc), flags));
-            break;
-        }
-
-        case ARMV5_SMULL: {
-            ExprId product = il.MultDoublePrecSigned(4, ILREG(2), ILREG(3));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                product, flags));
-            break;
-        }
-
-        case ARMV5_SMLAL: {
-            ExprId product = il.MultDoublePrecSigned(4, ILREG(2), ILREG(3));
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, product, acc), flags));
-            break;
-        }
-
-        /*
-         * DSP Multiply Extensions (ARMv5TE)
-         *
-         * These instructions operate on 16-bit halfwords within 32-bit registers.
-         * B = Bottom halfword (bits [15:0])
-         * T = Top halfword (bits [31:16])
-         *
-         * SMULxy: Rd = Rn[x] * Rm[y]  (16x16 -> 32 signed)
-         * SMULWy: Rd = (Rn * Rm[y]) >> 16  (32x16 -> 32 signed, keep high 32 bits)
-         * SMLAxy: Rd = Rn[x] * Rm[y] + Ra  (16x16 + 32 -> 32 signed)
-         * SMLAWy: Rd = ((Rn * Rm[y]) >> 16) + Ra  (32x16 + 32 -> 32 signed)
-         * SMLALxy: {RdHi,RdLo} += Rn[x] * Rm[y]  (16x16 + 64 -> 64 signed)
-         */
-
-        /* SMULxy - 16x16 -> 32 signed multiply */
-        case ARMV5_SMULBB: {
-            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Mult(4, op1, op2)));
-            break;
-        }
-
-        case ARMV5_SMULBT: {
-            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Mult(4, op1, op2)));
-            break;
-        }
-
-        case ARMV5_SMULTB: {
-            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Mult(4, op1, op2)));
-            break;
-        }
-
-        case ARMV5_SMULTT: {
-            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Mult(4, op1, op2)));
-            break;
-        }
-
-        /* SMULWy - 32x16 -> 32 signed multiply (high 32 bits of 48-bit result) */
-        case ARMV5_SMULWB: {
-            /* Rd = (Rn * SignExtend(Rm[15:0])) >> 16 */
-            ExprId op1 = il.SignExtend(8, ILREG(1));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
-            ExprId product = il.Mult(8, op1, op2);
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.LowPart(4, il.ArithShiftRight(8, product, il.Const(1, 16)))));
-            break;
-        }
-
-        case ARMV5_SMULWT: {
-            /* Rd = (Rn * SignExtend(Rm[31:16])) >> 16 */
-            ExprId op1 = il.SignExtend(8, ILREG(1));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
-            ExprId product = il.Mult(8, op1, op2);
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.LowPart(4, il.ArithShiftRight(8, product, il.Const(1, 16)))));
-            break;
-        }
-
-        /* SMLAxy - 16x16 + 32 -> 32 signed multiply-accumulate */
-        case ARMV5_SMLABB: {
-            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) + Ra */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, il.Mult(4, op1, op2), ILREG(3))));
-            break;
-        }
-
-        case ARMV5_SMLABT: {
-            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) + Ra */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, il.Mult(4, op1, op2), ILREG(3))));
-            break;
-        }
-
-        case ARMV5_SMLATB: {
-            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) + Ra */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, il.Mult(4, op1, op2), ILREG(3))));
-            break;
-        }
-
-        case ARMV5_SMLATT: {
-            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) + Ra */
-            ExprId op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
-            ExprId op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, il.Mult(4, op1, op2), ILREG(3))));
-            break;
-        }
-
-        /* SMLAWy - 32x16 + 32 -> 32 signed multiply-accumulate */
-        case ARMV5_SMLAWB: {
-            /* Rd = ((Rn * SignExtend(Rm[15:0])) >> 16) + Ra */
-            ExprId op1 = il.SignExtend(8, ILREG(1));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
-            ExprId product = il.LowPart(4, il.ArithShiftRight(8, il.Mult(8, op1, op2), il.Const(1, 16)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, product, ILREG(3))));
-            break;
-        }
-
-        case ARMV5_SMLAWT: {
-            /* Rd = ((Rn * SignExtend(Rm[31:16])) >> 16) + Ra */
-            ExprId op1 = il.SignExtend(8, ILREG(1));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
-            ExprId product = il.LowPart(4, il.ArithShiftRight(8, il.Mult(8, op1, op2), il.Const(1, 16)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Add(4, product, ILREG(3))));
-            break;
-        }
-
-        /* SMLALxy - 16x16 + 64 -> 64 signed multiply-accumulate */
-        case ARMV5_SMLALBB: {
-            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) */
-            ExprId op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(3))));
-            ExprId product = il.Mult(8, op1, op2);
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, acc, product)));
-            break;
-        }
-
-        case ARMV5_SMLALBT: {
-            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) */
-            ExprId op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(3), il.Const(1, 16)))));
-            ExprId product = il.Mult(8, op1, op2);
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, acc, product)));
-            break;
-        }
-
-        case ARMV5_SMLALTB: {
-            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) */
-            ExprId op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(3))));
-            ExprId product = il.Mult(8, op1, op2);
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, acc, product)));
-            break;
-        }
-
-        case ARMV5_SMLALTT: {
-            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) */
-            ExprId op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
-            ExprId op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(3), il.Const(1, 16)))));
-            ExprId product = il.Mult(8, op1, op2);
-            ExprId acc = il.RegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg));
-            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
-                RegisterToIndex(instr.operands[1].reg),
-                RegisterToIndex(instr.operands[0].reg),
-                il.Add(8, acc, product)));
-            break;
-        }
-
-        default:
-            return false;
-    }
-
-    return true;
-}
-
 /* Lift branch instructions */
 bool LiftBranch(Architecture* arch, LowLevelILFunction& il,
     Instruction& instr, uint64_t addr, bool thumb)
@@ -1664,6 +1391,209 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
             ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
                 RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), il.Add(8, product, acc),
                 instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE));
+            break;
+        }
+
+        /*
+         * DSP MULTIPLY INSTRUCTIONS (ARMv5E extensions)
+         *
+         * These perform 16x16 -> 32 or 32x16 -> 32 signed multiplies.
+         * B = Bottom halfword (bits [15:0])
+         * T = Top halfword (bits [31:16])
+         *
+         * SMULxy: Rd = Rn[x] * Rm[y]  (16x16 -> 32 signed)
+         * SMULWy: Rd = (Rn * Rm[y]) >> 16  (32x16 -> 32 signed, keep high 32 bits)
+         * SMLAxy: Rd = Rn[x] * Rm[y] + Ra  (16x16 + 32 -> 32 signed)
+         * SMLAWy: Rd = ((Rn * Rm[y]) >> 16) + Ra  (32x16 + 32 -> 32 signed)
+         * SMLALxy: {RdHi,RdLo} += Rn[x] * Rm[y]  (16x16 + 64 -> 64 signed)
+         */
+
+        /* SMULxy - 16x16 -> 32 signed multiply */
+        case ARMV5_SMULBB: {
+            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Mult(4, mul_op1, mul_op2)));
+            break;
+        }
+
+        case ARMV5_SMULBT: {
+            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Mult(4, mul_op1, mul_op2)));
+            break;
+        }
+
+        case ARMV5_SMULTB: {
+            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Mult(4, mul_op1, mul_op2)));
+            break;
+        }
+
+        case ARMV5_SMULTT: {
+            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Mult(4, mul_op1, mul_op2)));
+            break;
+        }
+
+        /* SMULWy - 32x16 -> 32 signed multiply (high 32 bits of 48-bit result) */
+        case ARMV5_SMULWB: {
+            /* Rd = (Rn * SignExtend(Rm[15:0])) >> 16 */
+            ExprId mul_op1 = il.SignExtend(8, ILREG(1));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.LowPart(4, il.ArithShiftRight(8, product, il.Const(1, 16)))));
+            break;
+        }
+
+        case ARMV5_SMULWT: {
+            /* Rd = (Rn * SignExtend(Rm[31:16])) >> 16 */
+            ExprId mul_op1 = il.SignExtend(8, ILREG(1));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.LowPart(4, il.ArithShiftRight(8, product, il.Const(1, 16)))));
+            break;
+        }
+
+        /* SMLAxy - 16x16 + 32 -> 32 signed multiply-accumulate */
+        case ARMV5_SMLABB: {
+            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) + Ra */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, il.Mult(4, mul_op1, mul_op2), ILREG(3))));
+            break;
+        }
+
+        case ARMV5_SMLABT: {
+            /* Rd = SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) + Ra */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, ILREG(1)));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, il.Mult(4, mul_op1, mul_op2), ILREG(3))));
+            break;
+        }
+
+        case ARMV5_SMLATB: {
+            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) + Ra */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, ILREG(2)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, il.Mult(4, mul_op1, mul_op2), ILREG(3))));
+            break;
+        }
+
+        case ARMV5_SMLATT: {
+            /* Rd = SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) + Ra */
+            ExprId mul_op1 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(1), il.Const(1, 16))));
+            ExprId mul_op2 = il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16))));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, il.Mult(4, mul_op1, mul_op2), ILREG(3))));
+            break;
+        }
+
+        /* SMLAWy - 32x16 + 32 -> 32 signed multiply-accumulate */
+        case ARMV5_SMLAWB: {
+            /* Rd = ((Rn * SignExtend(Rm[15:0])) >> 16) + Ra */
+            ExprId mul_op1 = il.SignExtend(8, ILREG(1));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
+            ExprId product = il.LowPart(4, il.ArithShiftRight(8, il.Mult(8, mul_op1, mul_op2), il.Const(1, 16)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, product, ILREG(3))));
+            break;
+        }
+
+        case ARMV5_SMLAWT: {
+            /* Rd = ((Rn * SignExtend(Rm[31:16])) >> 16) + Ra */
+            ExprId mul_op1 = il.SignExtend(8, ILREG(1));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
+            ExprId product = il.LowPart(4, il.ArithShiftRight(8, il.Mult(8, mul_op1, mul_op2), il.Const(1, 16)));
+            ConditionExecute(il, instr.cond,
+                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
+                    il.Add(4, product, ILREG(3))));
+            break;
+        }
+
+        /* SMLALxy - 16x16 + 64 -> 64 signed multiply-accumulate */
+        case ARMV5_SMLALBB: {
+            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[15:0]) * SignExtend(Rm[15:0]) */
+            ExprId mul_op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(3))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ExprId acc = il.RegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg));
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg),
+                il.Add(8, acc, product)));
+            break;
+        }
+
+        case ARMV5_SMLALBT: {
+            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[15:0]) * SignExtend(Rm[31:16]) */
+            ExprId mul_op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(2))));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(3), il.Const(1, 16)))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ExprId acc = il.RegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg));
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg),
+                il.Add(8, acc, product)));
+            break;
+        }
+
+        case ARMV5_SMLALTB: {
+            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[31:16]) * SignExtend(Rm[15:0]) */
+            ExprId mul_op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, ILREG(3))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ExprId acc = il.RegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg));
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg),
+                il.Add(8, acc, product)));
+            break;
+        }
+
+        case ARMV5_SMLALTT: {
+            /* {RdHi,RdLo} = {RdHi,RdLo} + SignExtend(Rn[31:16]) * SignExtend(Rm[31:16]) */
+            ExprId mul_op1 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(2), il.Const(1, 16)))));
+            ExprId mul_op2 = il.SignExtend(8, il.SignExtend(4, il.LowPart(2, il.ArithShiftRight(4, ILREG(3), il.Const(1, 16)))));
+            ExprId product = il.Mult(8, mul_op1, mul_op2);
+            ExprId acc = il.RegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg));
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4,
+                RegisterToIndex(instr.operands[1].reg),
+                RegisterToIndex(instr.operands[0].reg),
+                il.Add(8, acc, product)));
             break;
         }
 
