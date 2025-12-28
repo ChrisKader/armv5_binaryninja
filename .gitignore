@@ -18,8 +18,8 @@ debug
 test_thumb
 *.dSYM/
 
-# Test data
-data/*.bin
+# Test data - entire directory ignored
+data/
 bnlog
 
 # OS files
