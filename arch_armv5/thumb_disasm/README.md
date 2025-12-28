@@ -1,35 +1,74 @@
-# ARM Thumb Decomposer/Disassembler
-This is a disassembler for ARM Thumb (16-bit only, ARMv4T/ARMv5T). It does not contain Thumb-2 or ThumbEE.
+# Thumb Disassembler
 
-# Terms
-I'm using "Decomposer" to mean that instruction data is analyzed and a useful description of that instruction data is produced.
-More specific, an "instruction info" struct is created, capturing information about the instruction like its source registers and such.
-I'm using "Disassembler" to mean that this "instruction info" struct from the decompose stage can be parsed to generated a human readable string that we commonly associate with disassembly.
-This contains the instruction mnemonic and operands and any annotations (like the S suffix or condition flag).
+16-bit Thumb instruction decoder for ARMv4T/ARMv5T (original Thumb only, not Thumb-2).
 
-# High Level Strategy
-Capture as much as possible from the specification (ARM Architecture Reference Manual, ARMv5 edition).
-Currently that's being done in spec.txt.
-Then, parse that information (see generator.py) into C++ source (see spec.cpp).
-Finally, add another source file that calls into spec.cpp to interface with the rest of Binary Ninja.
+## Architecture
 
-# Lower Level Strategy
-The tables of instructions become nodes in a graph.
-When one table refers to another, that's an edge to another table.
-And when a table holds only references to instruction encodings, it's a terminal node.
-So decomposing/disassembling is traversing the graph from root to tip.
-The intermediate language used to capture this table/node info kind of gets into a tradeoff game.
-On one hand, I want to be able to copy/paste as much as possible from the spec.
-On the other, I want the language to be simple enough that I don't need to recall anything from CompSci to write a simple parser for it.
-The parser can be written in a nice easy language too; here, python.
+The disassembler uses a specification-driven approach:
 
-# How To Actually Generate?
-Just run generator.py. It will read spec.txt and write spec.cpp.
+1. **spec.txt** - Instruction encodings copied from ARM Architecture Reference Manual
+2. **generator.py** - Parses spec.txt and generates C++ source
+3. **spec.cpp** - Generated decoder tables and logic
+4. **disassembler.cpp/h** - Interface for decomposition and string formatting
 
-# Notes
-- 's' suffix on instructions means it updates the flags
-- cmp,cmn,tst,teq are result-less forms of subs,adds,ands,eors, but only update flags (but don't require the extra 's' suffix)
-- there are 4 flags N,Z,C,V for negative,zero,carry,overflow
-- the 'c' on b<c> is a conditional execution code (14 total) that test the flags
-  - code can be 'eq', 'ne', 'cs'/'hs', 'cc'/'lo', 'mi', 'pl', 'vs', 'vc', 'hi', 'ls', 'ge', 'lt', 'gt', 'le', 'al'/''
+### Design Philosophy
 
+Instruction tables form a graph where:
+- Nodes are decode tables
+- Edges connect tables that reference each other
+- Terminal nodes contain instruction encodings
+
+Decoding traverses from root to terminal, extracting fields along the way.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `arch_thumb.cpp` | Binary Ninja architecture integration |
+| `il_thumb.cpp` | LLIL lifting for Thumb instructions |
+| `disassembler.cpp/h` | Decomposer and string formatter |
+| `spec.cpp` | Generated decode tables |
+| `spec.txt` | Instruction specification source |
+| `generator.py` | Code generator |
+
+## Regenerating
+
+If you modify `spec.txt`, regenerate the decoder:
+
+```bash
+python3 generator.py
+```
+
+This reads `spec.txt` and writes `spec.cpp`.
+
+## Terminology
+
+- **Decomposer**: Analyzes instruction bytes and produces an `InstructionInfo` struct with operation, registers, immediates, etc.
+- **Disassembler**: Converts `InstructionInfo` to human-readable assembly text.
+
+## Condition Codes
+
+Thumb conditional branches use the same condition codes as ARM:
+
+| Code | Meaning | Flags |
+|------|---------|-------|
+| EQ | Equal | Z=1 |
+| NE | Not equal | Z=0 |
+| CS/HS | Carry set / Unsigned >= | C=1 |
+| CC/LO | Carry clear / Unsigned < | C=0 |
+| MI | Negative | N=1 |
+| PL | Positive or zero | N=0 |
+| VS | Overflow | V=1 |
+| VC | No overflow | V=0 |
+| HI | Unsigned > | C=1 and Z=0 |
+| LS | Unsigned <= | C=0 or Z=1 |
+| GE | Signed >= | N=V |
+| LT | Signed < | N!=V |
+| GT | Signed > | Z=0 and N=V |
+| LE | Signed <= | Z=1 or N!=V |
+
+## Notes
+
+- The `S` suffix indicates flag-updating instructions
+- CMP, CMN, TST, TEQ implicitly update flags (no `S` suffix needed)
+- Flags: N (negative), Z (zero), C (carry), V (overflow)
