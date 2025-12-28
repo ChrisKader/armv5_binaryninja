@@ -185,18 +185,92 @@ class TestPrologueDetection:
             f"got {detected_count}"
         )
 
+    def test_pattern1b_push_scratch_only(self, btrom_view):
+        """Pattern 1b: PUSH {r0-r3, ip, lr} with 3+ scratch registers only.
+
+        Example: push {r0, r1, r2, lr} = 0xE92D4007
+        These are wrapper/thunk functions that save args before a call.
+        """
+        func_starts = {f.start for f in btrom_view.functions}
+
+        # Known addresses with scratch-only PUSH from btrom.bin
+        test_addrs = [
+            0x33c,    # push {r0, r1, r2, lr}
+            0x36c,    # push {r0, r1, r2, lr}
+            0x388,    # push {r0, r1, r2, lr} (inside func at 0x384, but 0x384 should be detected)
+        ]
+
+        # At least 2 of these should be detected (0x388 might be inside another func)
+        detected_count = sum(1 for addr in test_addrs if addr in func_starts)
+
+        assert detected_count >= 2, (
+            f"Expected at least 2 of {len(test_addrs)} scratch-only PUSH prologues "
+            f"to be detected, got {detected_count}"
+        )
+
+    def test_pattern6_mov_bx_lr(self, btrom_view):
+        """Pattern 6: MOV/MVN Rd, #imm followed by BX LR after return.
+
+        Example:
+            bx lr               ; end of previous function
+            mvn r0, #0          ; 0xE3E00000 - start of return -1 function
+            bx lr               ; 0xE12FFF1E
+
+        These are short functions that return a constant value.
+        """
+        func_starts = {f.start for f in btrom_view.functions}
+
+        # Known addresses with MOV+BX pattern from btrom.bin
+        test_addrs = [
+            0x838,    # mvn r0, #0 followed by bx lr (return -1)
+            0xa7f8,   # mov r0, #0 followed by bx lr (return 0)
+        ]
+
+        detected_count = sum(1 for addr in test_addrs if addr in func_starts)
+
+        assert detected_count >= 1, (
+            f"Expected at least 1 MOV+BX LR pattern to be detected, "
+            f"got {detected_count}"
+        )
+
+    def test_pattern7_mcr_mrc_after_return(self, btrom_view):
+        """Pattern 7: MCR/MRC (coprocessor access) after return.
+
+        Example:
+            bx lr               ; end of previous function
+            mrc p15, ...        ; start of CP15 accessor function
+
+        These are system register accessor functions.
+        """
+        func_starts = {f.start for f in btrom_view.functions}
+
+        # Known addresses with MCR/MRC after return from btrom.bin
+        test_addrs = [
+            0x7d8,    # mrc after bx lr
+            0x7f4,    # mrc after bx lr
+            0x7fc,    # mrc after bx lr
+        ]
+
+        detected_count = sum(1 for addr in test_addrs if addr in func_starts)
+
+        assert detected_count >= 2, (
+            f"Expected at least 2 MCR/MRC prologues to be detected, "
+            f"got {detected_count}"
+        )
+
     def test_function_count_improved(self, btrom_view):
         """Verify that the new patterns detect more functions than before.
 
         Before the prologue improvements: ~917 functions
-        After: Should have more due to 2-reg PUSH, STR+SUB, and MRS patterns.
+        After round 1 (2-reg PUSH, STR+SUB, MRS): ~1081 functions
+        After round 2 (scratch PUSH, MOV+BX, MCR/MRC): Should be even more
         """
         func_count = len(list(btrom_view.functions))
 
-        # We expect at least 950 functions now (was 917 before)
-        # This is a conservative estimate - actual improvement should be ~18%
-        assert func_count >= 950, (
-            f"Expected at least 950 functions with new prologue patterns, "
+        # We expect at least 1100 functions now with all patterns
+        # This includes scratch-only PUSH, MOV+BX LR, and MCR/MRC patterns
+        assert func_count >= 1100, (
+            f"Expected at least 1100 functions with new prologue patterns, "
             f"got {func_count}"
         )
 
@@ -276,3 +350,33 @@ class TestPrologueEncodings:
         """Verify BX LR encoding is 0xE12FFF1E."""
         expected = 0xE12FFF1E
         assert (expected & 0x0FFFFFFF) == 0x012FFF1E
+
+    def test_push_scratch_only_encoding(self):
+        """Verify push {r0, r1, r2, lr} encoding is 0xE92D4007."""
+        # STMFD sp!, {r0, r1, r2, lr}
+        # reglist: bits 0,1,2,14 = 0x4007
+        expected = 0xE92D4007
+        assert (expected & 0xFFFF0000) == 0xE92D0000, "Should be STMFD"
+        assert (expected & 0x4000) != 0, "Should have lr"
+        assert bin(expected & 0xFFFF).count('1') == 4, "Should have 4 registers"
+        assert (expected & 0x0FF0) == 0, "Should NOT have callee-saved (r4-r11)"
+
+    def test_mov_imm_encoding(self):
+        """Verify MOV Rd, #imm encoding pattern."""
+        # MOV r0, #0 = 0xE3A00000
+        mov_r0_0 = 0xE3A00000
+        assert (mov_r0_0 & 0x0FE00000) == 0x03A00000, "Should match MOV imm pattern"
+
+        # MVN r0, #0 = 0xE3E00000 (returns -1)
+        mvn_r0_0 = 0xE3E00000
+        assert (mvn_r0_0 & 0x0FE00000) == 0x03E00000, "Should match MVN imm pattern"
+
+    def test_mcr_mrc_encoding(self):
+        """Verify MCR/MRC encoding patterns."""
+        # MRC p15, 0, r0, c0, c0, 0 = 0xEE100F10
+        mrc_example = 0xEE100F10
+        assert (mrc_example & 0x0F000010) == 0x0E000010, "Should match MCR/MRC pattern"
+
+        # MCR p15, 0, r0, c1, c0, 0 = 0xEE010F10
+        mcr_example = 0xEE010F10
+        assert (mcr_example & 0x0F000010) == 0x0E000010, "Should match MCR/MRC pattern"

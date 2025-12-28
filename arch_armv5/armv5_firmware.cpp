@@ -273,6 +273,11 @@ struct MemRegion {
  *   Encoding: 0xE92D4xxx where reglist includes r4-r11
  *   Example: push {r4, r5, lr} = 0xE92D4030
  *
+ * Pattern 1b: STMFD/PUSH sp!, {r0-r3, ip, lr} with 3+ scratch registers only
+ *   Encoding: 0xE92D4xxx where reglist has 3+ regs but no r4-r11
+ *   Example: push {r0, r1, r2, lr} = 0xE92D4007
+ *   Common for wrapper/thunk functions that save args before a call
+ *
  * Pattern 2: STMFD/PUSH sp!, {rX, lr} with 2 registers
  *   Encoding: 0xE92D40xx where popcount(reglist) == 2
  *   Example: push {r4, lr} = 0xE92D4010
@@ -292,9 +297,20 @@ struct MemRegion {
  *   Interrupt enable/disable utility functions
  *   Only detected when immediately following BX LR, MOV PC LR, or POP {..., pc}
  *
+ * Pattern 6: MOV/MVN Rd, #imm followed by BX LR (short return-value function)
+ *   Encoding: 0xE3A0xxxx or 0xE3E0xxxx followed by 0xE12FFF1E
+ *   Example: mov r0, #0 + bx lr (return 0 function)
+ *   Only detected when preceded by a return instruction (function boundary)
+ *
+ * Pattern 7: MCR/MRC (coprocessor access) when preceded by a return
+ *   Encoding: 0xEE....10 (MCR) or 0xEE....10 (MRC)
+ *   System register accessor functions (CP15, etc.)
+ *   Only detected when immediately following a return instruction
+ *
  * NOT detected (high false positive rate):
  *   - STR lr, [sp, #-4]! alone (appears in data as SRAM addresses 0xE52Dxxxx)
  *   - Thumb prologues (0xB5xx appears frequently in ARM literals)
+ *   - MOV/LDR after return without verification (could be data)
  *
  * Returns the number of function prologues found.
  */
@@ -339,7 +355,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 		bool isPrologue = false;
 
-		// Pattern 1 & 2: STMFD/STMDB/PUSH sp!, {..., lr}
+		// Pattern 1, 1b & 2: STMFD/STMDB/PUSH sp!, {..., lr}
 		// Encoding: cond 100 P U S W L Rn reglist
 		// STMFD sp! = 1001 0010 1101 xxxx = 0xE92Dxxxx
 		// Must have LR (bit 14) in register list
@@ -352,6 +368,12 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 			// This is the most common prologue pattern
 			bool hasCalleeSaved = (reglist & 0x0FF0) != 0;
 			if (regCount >= 3 && hasCalleeSaved)
+				isPrologue = true;
+
+			// Pattern 1b: 3+ registers with scratch only (r0-r3, ip)
+			// Common for wrapper/thunk functions: push {r0, r1, r2, lr}
+			// These save args before calling another function
+			if (regCount >= 3 && !hasCalleeSaved)
 				isPrologue = true;
 
 			// Pattern 2: Exactly 2 registers including lr
@@ -417,6 +439,55 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 				prevIsReturn = true;
 
 			// LDMFD sp!, {..., pc} = 0xE8BD8xxx (POP with pc)
+			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
+				prevIsReturn = true;
+
+			if (prevIsReturn)
+				isPrologue = true;
+		}
+
+		// Pattern 6: MOV/MVN Rd, #imm followed by BX LR (short return-value function)
+		// These are small functions that just return a constant value
+		// Very reliable as we verify both the MOV/MVN and the following BX LR
+		// Only detected when preceded by a return (function boundary)
+		if ((instr & 0x0FE00000) == 0x03A00000 || (instr & 0x0FE00000) == 0x03E00000)
+		{
+			// Check if preceded by a return
+			bool prevIsReturn = false;
+			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
+				prevIsReturn = true;
+			if (prevInstr == 0xE1A0F00E)
+				prevIsReturn = true;
+			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
+				prevIsReturn = true;
+
+			if (prevIsReturn && offset + 8 <= dataLen)
+			{
+				// Check if followed by BX LR
+				uint32_t nextInstr = 0;
+				memcpy(&nextInstr, data + offset + 4, sizeof(nextInstr));
+				if (endian == BigEndian)
+					nextInstr = Swap32(nextInstr);
+
+				// BX LR = 0xE12FFF1E (or conditional)
+				if ((nextInstr & 0x0FFFFFFF) == 0x012FFF1E)
+					isPrologue = true;
+			}
+		}
+
+		// Pattern 7: MCR/MRC (coprocessor access) when preceded by a return
+		// These are small system register accessor functions
+		// MCR: cond 1110 opc1 0 CRn Rt coproc opc2 1 CRm
+		// MRC: cond 1110 opc1 1 CRn Rt coproc opc2 1 CRm
+		// Mask: check for 0xEE......1. pattern
+		if ((instr & 0x0F000010) == 0x0E000010)
+		{
+			// Check if preceded by a return
+			bool prevIsReturn = false;
+			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
+				prevIsReturn = true;
+			if (prevInstr == 0xE1A0F00E)
+				prevIsReturn = true;
 			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
 				prevIsReturn = true;
 
