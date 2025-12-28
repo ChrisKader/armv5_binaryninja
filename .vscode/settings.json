@@ -1,0 +1,4 @@
+{
+  "cmake.sourceDirectory": "/Users/ck/dev/armv5_binaryninja/arch_armv5",
+  "python.analysis.exclude": ["**/node_modules", "**/large_data_dir", "**/.git", "binaryninja-api/**"]
+}

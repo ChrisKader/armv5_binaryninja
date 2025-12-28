@@ -1,0 +1,31 @@
+# Build artifacts
+.build/
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+**/Makefile
+!Makefile
+api/
+libarch_*
+arch_*.dll
+*.o
+*.a
+*.dylib
+
+# Test binaries
+debug
+test_thumb
+*.dSYM/
+
+# Test data
+data/*.bin
+bnlog
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc

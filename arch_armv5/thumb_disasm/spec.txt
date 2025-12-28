@@ -1,0 +1,559 @@
+//-----------------------------------------------------------------------------
+// ARMv5T Thumb instruction decoder
+// Based on ARMv7 thumb2_disasm spec.txt, filtered to ARMv4T/ARMv5T instructions
+//
+// Note: ARMv5T Thumb is primarily 16-bit, but BL/BLX use two consecutive
+// 16-bit halfwords that are decoded as a single 32-bit instruction.
+// The first halfword starts with 11110, second with 11111 (BL) or 11101 (BLX).
+//-----------------------------------------------------------------------------
+
+thumb_root:
+extract16 tmp.5
+on tmp
+11110 bl_blx_prefix
+11101 undefined32
+11111 undefined32
+xxxxx thumb16
+
+// Handler for BL/BLX prefix (first halfword = 11110)
+// Checks the second halfword to determine BL vs BLX vs undefined
+bl_blx_prefix:
+extract32 11110,xx.12,op.2,x.13
+on op
+11 bl
+10 blx_imm
+xx undefined32
+
+thumb16:
+extract16 Opcode.6
+on Opcode
+00xxxx shift_immediate_add_sub_mov_cmp
+010000 data_proc
+010001 spcl_data_branch_exch
+01001x load_lit_pool
+0101xx load_store_single_data
+011xxx load_store_single_data
+100xxx load_store_single_data
+10100x adr
+10101x add_sp_plus_immediate
+1011xx misc
+11000x stm
+11001x ldm
+1101xx cond_branch_superv_call
+11100x b
+
+//-----------------------------------------------------------------------------
+// thumb16, level 1
+//-----------------------------------------------------------------------------
+
+shift_immediate_add_sub_mov_cmp:
+extract16 00,Opcode.5,clue.3
+on Opcode,clue
+000xx,xxx lsl_immediate
+001xx,xxx lsr_immediate
+010xx,xxx asr_immediate
+01100,xxx add_register
+01101,xxx sub_register
+01110,xxx add_immediate
+01111,xxx sub_immediate
+100xx,xxx mov_immediate
+101xx,xxx cmp_immediate
+110xx,xxx add_immediate
+111xx,xxx sub_immediate
+00000,000 mov_register
+
+data_proc:
+extract16 010000,Opcode.4
+on Opcode
+0000 and_register
+0001 eor_register
+0010 lsl_register
+0011 lsr_register
+0100 asr_register
+0101 adc_register
+0110 sbc_register
+0111 ror_register
+1000 tst_register
+1001 rsb_immediate
+1010 cmp_register
+1011 cmn_register
+1100 orr_register
+1101 mul_register
+1110 bic_register
+1111 mvn_register
+
+spcl_data_branch_exch:
+extract16 010001,Opcode.4
+on Opcode
+0000 add_register
+0001 add_register
+001x add_register
+0100 cmp_register
+0101 cmp_register
+011x cmp_register
+1000 mov_register
+1001 mov_register
+101x mov_register
+110x bx
+111x blx
+
+load_store_single_data:
+extract16 opA.4,opB.3
+on opA,opB
+0101,000 str_register
+0101,001 strh_register
+0101,010 strb_register
+0101,011 ldrsb_register
+0101,100 ldr_register
+0101,101 ldrh_register
+0101,110 ldrb_register
+0101,111 ldrsh_register
+0110,0xx str_immediate
+0110,1xx ldr_immediate
+0111,0xx strb_immediate
+0111,1xx ldrb_immediate
+1000,0xx strh_immediate
+1000,1xx ldrh_immediate
+1001,0xx str_immediate
+1001,1xx ldr_immediate
+
+// misc section: ARMv5T only has ADD/SUB SP, PUSH, POP, BKPT
+// All other opcodes (SETEND, CPS, CBNZ/CBZ, SXT/UXT, REV*, IT) are ARMv6+
+misc:
+extract16 1011,opcode.7
+on opcode
+00000xx add_sp_plus_immediate
+00001xx sub_sp_minus_immediate
+010xxxx push
+110xxxx pop
+1110xxx bkpt
+xxxxxxx undefined
+
+cond_branch_superv_call:
+extract16 1101,Opcode.4
+on Opcode
+~111x b
+1110 udf
+1111 svc
+
+//-----------------------------------------------------------------------------
+// TERMINALS
+//-----------------------------------------------------------------------------
+
+adc_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADCS <Rdn>,<Rm>
+fmt ADC<c> <Rdn>,<Rm>
+extract16 010000,0101,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+add_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADDS <Rd>,<Rn>,#<imm3>
+fmt ADD<c> <Rd>,<Rn>,#<imm3>
+extract16 000,11,1,0,imm3.3,Rn.3,Rd.3
+pcode d = UInt(Rd); n = UInt(Rn); setflags = !InITBlock(); imm32 = ZeroExtend(imm3, 32);
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADDS <Rdn>,#<imm8>
+fmt ADD<c> <Rdn>,#<imm8>
+extract16 001,10,Rdn.3,imm8.8
+pcode d = UInt(Rdn); n = UInt(Rdn); setflags = !InITBlock(); imm32 = ZeroExtend(imm8, 32);
+
+add_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADDS <Rd>,<Rn>,<Rm>
+fmt ADD<c> <Rd>,<Rn>,<Rm>
+extract16 000,11,0,0,Rm.3,Rn.3,Rd.3
+pcode d = UInt(Rd); n = UInt(Rn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADD<c> <Rdn>,<Rm>
+extract16 010001,00,DN.1,Rm.4,Rdn.3
+pcode Rdn = UInt(DN:Rdn); d = UInt(DN:Rdn); n = d; m = UInt(Rm); setflags = FALSE; (shift_t, shift_n) = (SRType_LSL, 0); if d < 8 && m < 8 then UNPREDICTABLE; if n == 15 && m == 15 then UNPREDICTABLE; if d == 15 && InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+add_sp_plus_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADD<c> <Rd>,SP,#<imm32>
+extract16 1010,1,Rd.3,imm8.8
+pcode d = UInt(Rd); setflags = FALSE; imm32 = ZeroExtend(imm8:'00', 32);
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADD<c> SP,#<imm32>
+extract16 1011,0000,0,imm7.7
+pcode d = 13; setflags = FALSE; imm32 = ZeroExtend(imm7:'00', 32);
+
+adr:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ADR<c> <Rd>,#<imm32>
+extract16 1010,0,Rd.3,imm8.8
+pcode d = UInt(Rd); imm32 = ZeroExtend(imm8:'00', 32); add = TRUE;
+
+and_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ANDS <Rdn>,<Rm>
+fmt AND<c> <Rdn>,<Rm>
+extract16 010000,0000,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+asr_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ASRS <Rd>,<Rm>,#<shift_n>
+fmt ASR<c> <Rd>,<Rm>,#<shift_n>
+extract16 000,10,imm5.5,Rm.3,Rd.3
+pcode d = UInt(Rd); m = UInt(Rm); setflags = !InITBlock(); (-, shift_n) = DecodeImmShift('10', imm5);
+
+asr_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ASRS <Rdn>,<Rm>
+fmt ASR<c> <Rdn>,<Rm>
+extract16 010000,0100,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock();
+
+b:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt B<c> #<imm32>
+extract16 1101,cond.4,imm8.8
+pcode if cond == '1110' then UNDEFINED; if cond == '1111' then SEE SVC; imm32 = SignExtend(imm8:'0', 32); if InITBlock() then UNPREDICTABLE;
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt B<c> #<imm32>
+extract16 11100,imm11.11
+pcode imm32 = SignExtend(imm11:'0', 32); if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+bic_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt BICS <Rdn>,<Rm>
+fmt BIC<c> <Rdn>,<Rm>
+extract16 010000,1110,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+bkpt:
+Encoding T1 ARMv5T*, ARMv6*, ARMv7
+fmt BKPT #<imm8>
+extract16 1011,1110,imm8.8
+pcode imm32 = ZeroExtend(imm8, 32);
+
+bl:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt BL<c> #<imm32>
+extract32 11110,S.1,imm10.10,11,J1.1,1,J2.1,imm11.11
+pcode I1 = NOT(J1 EOR S); I2 = NOT(J2 EOR S); imm32 = SignExtend(S:I1:I2:imm10:imm11:'0', 32); toARM = FALSE; if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+blx_imm:
+Encoding T1 ARMv5T*, ARMv6*, ARMv7
+fmt BLX<c> #<imm32>
+extract32 11110,S.1,imm10H.10,11,J1.1,0,J2.1,imm10L.10,H.1
+pcode I1 = NOT(J1 EOR S); I2 = NOT(J2 EOR S); imm32 = SignExtend(S:I1:I2:imm10H:imm10L:H:'0', 32); toARM = TRUE; if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+blx:
+Encoding T1 ARMv5T*, ARMv6*, ARMv7
+fmt BLX<c> <Rm>
+extract16 010001,11,1,Rm.4,(0)(0)(0)
+pcode m = UInt(Rm); if m == 15 then UNPREDICTABLE; if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+bx:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt BX<c> <Rm>
+extract16 010001,11,0,Rm.4,(0)(0)(0)
+pcode m = UInt(Rm); if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+cmn_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt CMN<c> <Rn>,<Rm>
+extract16 010000,1011,Rm.3,Rn.3
+pcode n = UInt(Rn); m = UInt(Rm); (shift_t, shift_n) = (SRType_LSL, 0);
+
+cmp_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt CMP<c> <Rn>,#<imm8>
+extract16 001,01,Rn.3,imm8.8
+pcode n = UInt(Rn); imm32 = ZeroExtend(imm8, 32);
+
+cmp_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt CMP<c> <Rn>,<Rm>
+extract16 010000,1010,Rm.3,Rn.3
+pcode n = UInt(Rn); m = UInt(Rm); (shift_t, shift_n) = (SRType_LSL, 0);
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt CMP<c> <Rn>,<Rm>
+extract16 010001,01,N.1,Rm.4,Rn.3
+pcode n = UInt(N:Rn); m = UInt(Rm); (shift_t, shift_n) = (SRType_LSL, 0); if n < 8 && m < 8 then UNPREDICTABLE; if n == 15 || m == 15 then UNPREDICTABLE; Rn = UInt(N:Rn);
+
+eor_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt EORS <Rdn>,<Rm>
+fmt EOR<c> <Rdn>,<Rm>
+extract16 010000,0001,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+ldm:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDM<c> <Rn>!,<registers>
+fmt LDM<c> <Rn>,<registers>
+extract16 1100,1,Rn.3,register_list.8
+pcode n = UInt(Rn); registers = '00000000':register_list; wback = (registers<n> == '0'); if BitCount(registers) < 1 then UNPREDICTABLE;
+
+ldr_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDR<c> <Rt>,[<Rn>{,#<imm32>}]
+extract16 0110,1,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5:'00', 32); index = TRUE; add = TRUE; wback = FALSE;
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDR<c> <Rt>,[SP{,#<imm32>}]
+extract16 1001,1,Rt.3,imm8.8
+pcode t = UInt(Rt); n = 13; imm32 = ZeroExtend(imm8:'00', 32); index = TRUE; add = TRUE; wback = FALSE;
+
+ldr_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDR<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,100,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+ldrb_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRB<c> <Rt>,[<Rn>{,#<imm5>}]
+extract16 0111,1,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5, 32); index = TRUE; add = TRUE; wback = FALSE;
+
+ldrb_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRB<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,110,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+ldrh_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRH<c> <Rt>,[<Rn>{,#<imm32>}]
+extract16 1000,1,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5:'0', 32); index = TRUE; add = TRUE; wback = FALSE;
+
+ldrh_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRH<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,101,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+ldrsb_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRSB<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,011,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+ldrsh_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDRSH<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,111,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+load_lit_pool:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LDR<c> <Rt>,<label>
+extract16 01001,Rt.3,imm8.8
+pcode t = UInt(Rt); imm32 = ZeroExtend(imm8:'00', 32); add = TRUE; Rt = UInt(Rt);
+
+lsl_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LSLS <Rd>,<Rm>,#<shift_n>
+fmt LSL<c> <Rd>,<Rm>,#<shift_n>
+extract16 000,00,imm5.5,Rm.3,Rd.3
+pcode if imm5 == '00000' then SEE MOV (register); d = UInt(Rd); m = UInt(Rm); setflags = !InITBlock(); (-, shift_n) = DecodeImmShift('00', imm5);
+
+lsl_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LSLS <Rdn>,<Rm>
+fmt LSL<c> <Rdn>,<Rm>
+extract16 010000,0010,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock();
+
+lsr_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LSRS <Rd>,<Rm>,#<shift_n>
+fmt LSR<c> <Rd>,<Rm>,#<shift_n>
+extract16 000,01,imm5.5,Rm.3,Rd.3
+pcode d = UInt(Rd); m = UInt(Rm); setflags = !InITBlock(); (-, shift_n) = DecodeImmShift('01', imm5);
+
+lsr_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt LSRS <Rdn>,<Rm>
+fmt LSR<c> <Rdn>,<Rm>
+extract16 010000,0011,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock();
+
+mov_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt MOVS <Rd>,#<imm8>
+fmt MOV<c> <Rd>,#<imm8>
+extract16 001,00,Rd.3,imm8.8
+pcode d = UInt(Rd); setflags = !InITBlock(); imm32 = ZeroExtend(imm8, 32); carry = APSR.C;
+
+mov_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt MOV<c> <Rd>,<Rm>
+extract16 010001,10,D.1,Rm.4,Rd.3
+pcode d = UInt(D:Rd); m = UInt(Rm); setflags = FALSE; if d < 8 && m < 8 then UNPREDICTABLE; if d == 15 && InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt MOVS <Rd>,<Rm>
+extract16 000,00,00000,Rm.3,Rd.3
+pcode d = UInt(Rd); m = UInt(Rm); setflags = TRUE; if InITBlock() then UNPREDICTABLE;
+
+mul_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt MULS <Rdm>,<Rn>,<Rdm>
+fmt MUL<c> <Rdm>,<Rn>,<Rdm>
+extract16 010000,1101,Rn.3,Rdm.3
+pcode d = UInt(Rdm); n = UInt(Rn); m = UInt(Rdm); setflags = !InITBlock(); if ArchVersion() < 6 && d == n then UNPREDICTABLE;
+
+mvn_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt MVNS <Rd>,<Rm>
+fmt MVN<c> <Rd>,<Rm>
+extract16 010000,1111,Rm.3,Rd.3
+pcode d = UInt(Rd); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+orr_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt ORRS <Rdn>,<Rm>
+fmt ORR<c> <Rdn>,<Rm>
+extract16 010000,1100,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+pop:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt POP<c> <registers>
+extract16 1011,110,P.1,register_list.8
+pcode registers = P:'0000000':register_list; UnalignedAllowed = FALSE; if BitCount(registers) < 1 then UNPREDICTABLE; if registers<15> == '1' && InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+push:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt PUSH<c> <registers>
+extract16 1011,010,M.1,register_list.8
+pcode registers = '0':M:'000000':register_list; UnalignedAllowed = FALSE; if BitCount(registers) < 1 then UNPREDICTABLE;
+
+ror_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt RORS <Rdn>,<Rm>
+fmt ROR<c> <Rdn>,<Rm>
+extract16 010000,0111,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock();
+
+rsb_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt RSBS <Rd>,<Rn>,#0
+fmt RSB<c> <Rd>,<Rn>,#0
+extract16 010000,1001,Rn.3,Rd.3
+pcode d = UInt(Rd); n = UInt(Rn); setflags = !InITBlock(); imm32 = Zeros(32);
+
+sbc_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SBCS <Rdn>,<Rm>
+fmt SBC<c> <Rdn>,<Rm>
+extract16 010000,0110,Rm.3,Rdn.3
+pcode d = UInt(Rdn); n = UInt(Rdn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+stm:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STM<c> <Rn>!,<registers>
+extract16 1100,0,Rn.3,register_list.8
+pcode n = UInt(Rn); registers = '00000000':register_list; wback = TRUE; if BitCount(registers) < 1 then UNPREDICTABLE;
+
+str_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STR<c> <Rt>,[<Rn>{,#<imm32>}]
+extract16 0110,0,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5:'00', 32); index = TRUE; add = TRUE; wback = FALSE;
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STR<c> <Rt>,[SP{,#<imm32>}]
+extract16 1001,0,Rt.3,imm8.8
+pcode t = UInt(Rt); n = 13; imm32 = ZeroExtend(imm8:'00', 32); index = TRUE; add = TRUE; wback = FALSE;
+
+str_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STR<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,000,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+strb_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STRB<c> <Rt>,[<Rn>{,#<imm5>}]
+extract16 0111,0,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5, 32); index = TRUE; add = TRUE; wback = FALSE;
+
+strb_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STRB<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,010,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+strh_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STRH<c> <Rt>,[<Rn>{,#<imm32>}]
+extract16 1000,0,imm5.5,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); imm32 = ZeroExtend(imm5:'0', 32); index = TRUE; add = TRUE; wback = FALSE;
+
+strh_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt STRH<c> <Rt>,[<Rn>,<Rm>]
+extract16 0101,001,Rm.3,Rn.3,Rt.3
+pcode t = UInt(Rt); n = UInt(Rn); m = UInt(Rm); index = TRUE; add = TRUE; wback = FALSE; (shift_t, shift_n) = (SRType_LSL, 0);
+
+sub_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SUBS <Rd>,<Rn>,#<imm3>
+fmt SUB<c> <Rd>,<Rn>,#<imm3>
+extract16 000,11,1,1,imm3.3,Rn.3,Rd.3
+pcode d = UInt(Rd); n = UInt(Rn); setflags = !InITBlock(); imm32 = ZeroExtend(imm3, 32);
+Encoding T2 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SUBS <Rdn>,#<imm8>
+fmt SUB<c> <Rdn>,#<imm8>
+extract16 001,11,Rdn.3,imm8.8
+pcode d = UInt(Rdn); n = UInt(Rdn); setflags = !InITBlock(); imm32 = ZeroExtend(imm8, 32);
+
+sub_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SUBS <Rd>,<Rn>,<Rm>
+fmt SUB<c> <Rd>,<Rn>,<Rm>
+extract16 000,11,0,1,Rm.3,Rn.3,Rd.3
+pcode d = UInt(Rd); n = UInt(Rn); m = UInt(Rm); setflags = !InITBlock(); (shift_t, shift_n) = (SRType_LSL, 0);
+
+sub_sp_minus_immediate:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SUB<c> SP,#<imm32>
+extract16 1011,0000,1,imm7.7
+pcode d = 13; setflags = FALSE; imm32 = ZeroExtend(imm7:'00', 32);
+
+svc:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt SVC<c> #<imm8>
+extract16 1101,1111,imm8.8
+pcode imm32 = ZeroExtend(imm8, 32); if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+tst_register:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt TST<c> <Rn>,<Rm>
+extract16 010000,1000,Rm.3,Rn.3
+pcode n = UInt(Rn); m = UInt(Rm); (shift_t, shift_n) = (SRType_LSL, 0);
+
+udf:
+Encoding T1 ARMv4T, ARMv5T*, ARMv6*, ARMv7
+fmt UDF #<imm8>
+extract16 1101,1110,imm8.8
+pcode imm32 = ZeroExtend(imm8, 32);
+
+//-----------------------------------------------------------------------------
+// misc
+//-----------------------------------------------------------------------------
+
+undefined:
+Encoding T1 ARMv4T, ARMv5T, ARMv6, ARMv7
+fmt UNDEFINED
+extract16 (0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)
+pcode UNDEFINED;
+
+undefined32:
+Encoding T1 ARMv4T, ARMv5T, ARMv6, ARMv7
+fmt UNDEFINED
+extract32 (0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)
+pcode UNDEFINED;
+
+unpredictable:
+Encoding T1 ARMv4T, ARMv5T, ARMv6, ARMv7
+fmt UNPREDICTABLE
+extract16 (0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)(0)
+pcode UNPREDICTABLE;
