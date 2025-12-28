@@ -2290,15 +2290,16 @@ public:
         /*
          * Define the jump table data as an array of uint32_t.
          * Table starts at jumpAddr + 4 (after the ADD PC, PC, Rn instruction).
-         * Use a static set to track already-defined tables to avoid duplicates.
+         * Check if a data variable already exists to avoid redefining.
          * Also add data references from each table entry to its target address.
          */
-        static std::set<uint64_t> definedTables;
         uint64_t tableAddr = jumpAddr + 4;
         size_t tableSize = targets.size();
-        if (tableSize > 0 && definedTables.find(tableAddr) == definedTables.end())
+
+        /* Only define if no data variable exists yet at this address */
+        DataVariable existingVar;
+        if (tableSize > 0 && !view->GetDataVariableAtAddress(tableAddr, existingVar))
         {
-          definedTables.insert(tableAddr);
           Ref<Type> uint32Type = Type::IntegerType(4, false);
           Ref<Type> arrayType = Type::ArrayType(uint32Type, tableSize);
           view->DefineUserDataVariable(tableAddr, arrayType);
