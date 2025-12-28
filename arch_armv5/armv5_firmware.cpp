@@ -267,15 +267,34 @@ struct MemRegion {
  * This provides more accurate function detection than Binary Ninja's generic
  * linear sweep, which over-detects due to ARM's dense instruction encoding.
  *
- * Common ARM function prologues:
- *   STMFD sp!, {..., lr}  - encoding: 0xE92D4xxx (cond=AL, W=1, reglist includes lr)
- *   STMDB sp!, {..., lr}  - same encoding, different mnemonic
- *   PUSH {..., lr}        - same as STMFD
- *   STR lr, [sp, #-4]!    - encoding: 0xE52DE004 (single LR push)
- *   MOV ip, sp            - encoding: 0xE1A0C00D (APCS frame pointer setup)
+ * Detected ARM function prologues:
  *
- * Common Thumb function prologues:
- *   PUSH {..., lr}        - encoding: 0xB5xx (bit 8 = lr, bits 0-7 = r0-r7)
+ * Pattern 1: STMFD/PUSH sp!, {..., lr} with 3+ registers including callee-saved
+ *   Encoding: 0xE92D4xxx where reglist includes r4-r11
+ *   Example: push {r4, r5, lr} = 0xE92D4030
+ *
+ * Pattern 2: STMFD/PUSH sp!, {rX, lr} with 2 registers
+ *   Encoding: 0xE92D40xx where popcount(reglist) == 2
+ *   Example: push {r4, lr} = 0xE92D4010
+ *   Common for small leaf functions that only need one callee-saved register
+ *
+ * Pattern 3: MOV ip, sp followed by STMFD with fp and lr
+ *   Encoding: 0xE1A0C00D followed by 0xE92Dxxxx with bits 11 and 14 set
+ *   Classic APCS frame pointer setup prologue
+ *
+ * Pattern 4: STR lr, [sp, #-4]! followed by SUB sp, sp, #imm
+ *   Encoding: 0xE52DE004 followed by 0xE24DD0xx
+ *   Two-instruction prologue for stack frame allocation
+ *   Example: str lr, [sp, #-4]! + sub sp, sp, #0x2c
+ *
+ * Pattern 5: MRS Rx, CPSR (when preceded by a return instruction)
+ *   Encoding: 0xE10Fx000 (MRS Rd, CPSR)
+ *   Interrupt enable/disable utility functions
+ *   Only detected when immediately following BX LR, MOV PC LR, or POP {..., pc}
+ *
+ * NOT detected (high false positive rate):
+ *   - STR lr, [sp, #-4]! alone (appears in data as SRAM addresses 0xE52Dxxxx)
+ *   - Thumb prologues (0xB5xx appears frequently in ARM literals)
  *
  * Returns the number of function prologues found.
  */
@@ -291,8 +310,21 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
 
+	// Helper to add a function if not already added
+	auto addFunction = [&](uint64_t funcAddr) {
+		if (addedAddrs.find(funcAddr) == addedAddrs.end())
+		{
+			view->AddFunctionForAnalysis(plat, funcAddr);
+			addedAddrs.insert(funcAddr);
+			prologuesFound++;
+		}
+	};
+
 	logger->LogInfo("Prologue scan: Scanning for function prologues in %llu bytes",
 		(unsigned long long)(length - startOffset));
+
+	// Track the previous instruction for MRS detection
+	uint32_t prevInstr = 0;
 
 	// Scan for ARM prologues (4-byte aligned)
 	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
@@ -307,28 +339,29 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 		bool isPrologue = false;
 
-		// Pattern 1: STMFD/STMDB/PUSH sp!, {..., lr}
+		// Pattern 1 & 2: STMFD/STMDB/PUSH sp!, {..., lr}
 		// Encoding: cond 100 P U S W L Rn reglist
 		// STMFD sp! = 1001 0010 1101 xxxx = 0xE92Dxxxx
 		// Must have LR (bit 14) in register list
-		//
-		// To reduce false positives, we only accept "canonical" prologues:
-		// - Must push at least 3 registers (lr + 2 callee-saved)
-		// - Register list should include at least one of r4-r11 (callee-saved)
 		if ((instr & 0xFFFF0000) == 0xE92D0000 && (instr & 0x4000) != 0)
 		{
 			uint32_t reglist = instr & 0xFFFF;
 			int regCount = __builtin_popcount(reglist);
 
-			// Must have at least one callee-saved register (r4-r11)
+			// Pattern 1: 3+ registers with at least one callee-saved (r4-r11)
+			// This is the most common prologue pattern
 			bool hasCalleeSaved = (reglist & 0x0FF0) != 0;
-
-			// Canonical prologues push 3+ registers including callee-saved ones
 			if (regCount >= 3 && hasCalleeSaved)
+				isPrologue = true;
+
+			// Pattern 2: Exactly 2 registers including lr
+			// Common for small leaf functions: push {r4, lr}, push {r3, lr}, etc.
+			// Less restrictive - accepts any 2-register push with lr
+			if (regCount == 2)
 				isPrologue = true;
 		}
 
-		// Pattern 2: MOV ip, sp followed by STMFD with fp and lr
+		// Pattern 3: MOV ip, sp followed by STMFD with fp and lr
 		// This is the classic APCS prologue
 		// Very reliable as the two-instruction sequence is unlikely to appear in data
 		if (instr == 0xE1A0C00D)
@@ -347,22 +380,57 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 			}
 		}
 
-		// NOTE: We intentionally do NOT detect these patterns as they have higher
-		// false positive rates:
-		// - STR lr, [sp, #-4]! alone (too common in data)
-		// - SUB sp, sp, #imm followed by STR (can appear in loop bodies)
-		// - STMFD with only 2 registers (less reliable)
+		// Pattern 4: STR lr, [sp, #-4]! followed by SUB sp, sp, #imm
+		// Encoding: 0xE52DE004 followed by 0xE24DD0xx
+		// This two-instruction sequence is very reliable and won't match data
+		if (instr == 0xE52DE004)
+		{
+			if (offset + 8 <= dataLen)
+			{
+				uint32_t nextInstr = 0;
+				memcpy(&nextInstr, data + offset + 4, sizeof(nextInstr));
+				if (endian == BigEndian)
+					nextInstr = Swap32(nextInstr);
+
+				// SUB sp, sp, #imm = 0xE24DD0xx
+				if ((nextInstr & 0xFFFFF000) == 0xE24DD000)
+					isPrologue = true;
+			}
+		}
+
+		// Pattern 5: MRS Rx, CPSR when preceded by a return instruction
+		// These are small interrupt enable/disable utility functions
+		// Encoding: cond 0001 0 R 00 1111 Rd 0000 0000 0000
+		// MRS Rd, CPSR = 0xE10F0000 | (Rd << 12)
+		// Mask: 0x0FBF0FFF (ignore condition and Rd)
+		if ((instr & 0x0FBF0FFF) == 0x010F0000)
+		{
+			// Check if previous instruction was a return
+			bool prevIsReturn = false;
+
+			// BX LR = 0xE12FFF1E (or conditional variants)
+			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
+				prevIsReturn = true;
+
+			// MOV PC, LR = 0xE1A0F00E
+			if (prevInstr == 0xE1A0F00E)
+				prevIsReturn = true;
+
+			// LDMFD sp!, {..., pc} = 0xE8BD8xxx (POP with pc)
+			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
+				prevIsReturn = true;
+
+			if (prevIsReturn)
+				isPrologue = true;
+		}
 
 		if (isPrologue)
 		{
-			uint64_t funcAddr = imageBase + offset;
-			if (addedAddrs.find(funcAddr) == addedAddrs.end())
-			{
-				view->AddFunctionForAnalysis(plat, funcAddr);
-				addedAddrs.insert(funcAddr);
-				prologuesFound++;
-			}
+			addFunction(imageBase + offset);
 		}
+
+		// Remember this instruction for next iteration
+		prevInstr = instr;
 	}
 
 	// NOTE: Thumb prologue scanning is disabled for now.
