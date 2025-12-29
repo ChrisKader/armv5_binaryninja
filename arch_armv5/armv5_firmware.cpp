@@ -519,6 +519,147 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 }
 
 
+/*
+ * Scan for BL, BLX, and LDR PC call targets to discover additional functions.
+ *
+ * This complements prologue scanning by finding functions that are called
+ * but might not have recognizable prologues (e.g., hand-written assembly,
+ * optimized leaf functions, Thumb code).
+ *
+ * Detected patterns:
+ *
+ * Pattern 1: BL imm (ARM branch-and-link)
+ *   Encoding: cond 1011 imm24
+ *   Example: BL 0x1000 = 0xEBxxxxxx
+ *   The 24-bit signed offset is shifted left 2 and added to PC+8
+ *
+ * Pattern 2: BLX imm (ARM to Thumb call)
+ *   Encoding: 1111 101 H imm24
+ *   Example: BLX 0x1001 = 0xFAxxxxxx or 0xFBxxxxxx
+ *   Target has Thumb bit set (bit 0 = 1)
+ *
+ * Pattern 3: LDR PC, [PC, #imm] (indirect jump via literal pool)
+ *   Encoding: cond 0101 1001 1111 Rd imm12
+ *   Example: LDR PC, [PC, #0x10] = 0xE59FFxxx
+ *   Loads a function address from a nearby literal pool entry
+ *
+ * Returns the number of call targets found.
+ */
+static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
+	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
+	Ref<Platform> plat, Ref<Logger> logger)
+{
+	size_t targetsFound = 0;
+
+	// Track addresses we've already added to avoid duplicates
+	std::set<uint64_t> addedAddrs;
+
+	// Helper to add a function if not already added and target is valid
+	auto addFunction = [&](uint64_t funcAddr, const char* source) {
+		// Mask off Thumb bit for validation
+		uint64_t alignedAddr = funcAddr & ~1ULL;
+
+		// Must be within image bounds
+		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
+			return;
+
+		// Must be properly aligned (4-byte for ARM, 2-byte for Thumb)
+		bool isThumb = (funcAddr & 1) != 0;
+		if (isThumb && (alignedAddr & 1) != 0)
+			return;  // Thumb must be 2-byte aligned
+		if (!isThumb && (alignedAddr & 3) != 0)
+			return;  // ARM must be 4-byte aligned
+
+		if (addedAddrs.find(funcAddr) == addedAddrs.end())
+		{
+			view->AddFunctionForAnalysis(plat, funcAddr);
+			addedAddrs.insert(funcAddr);
+			targetsFound++;
+		}
+	};
+
+	// Scan for ARM call instructions (4-byte aligned)
+	for (uint64_t offset = 0; offset + 4 <= length; offset += 4)
+	{
+		uint32_t instr = 0;
+		if (offset + 4 <= dataLen)
+		{
+			memcpy(&instr, data + offset, sizeof(instr));
+			if (endian == BigEndian)
+				instr = Swap32(instr);
+		}
+
+		uint64_t instrAddr = imageBase + offset;
+
+		// Pattern 1: BL imm (ARM branch-and-link)
+		// Encoding: cond 1011 imm24 where cond != 1111
+		// Mask: 0x0F000000, value: 0x0B000000
+		if ((instr & 0x0F000000) == 0x0B000000 && (instr & 0xF0000000) != 0xF0000000)
+		{
+			// Extract 24-bit signed offset, shift left 2, add to PC+8
+			int32_t imm24 = instr & 0x00FFFFFF;
+			// Sign-extend from 24 bits
+			if (imm24 & 0x00800000)
+				imm24 |= 0xFF000000;
+			int32_t offset_bytes = imm24 << 2;
+			uint64_t target = instrAddr + 8 + offset_bytes;
+
+			addFunction(target, "BL");
+		}
+
+		// Pattern 2: BLX imm (ARM to Thumb call)
+		// Encoding: 1111 101 H imm24
+		// H bit (bit 24) adds 2 to the offset for Thumb alignment
+		if ((instr & 0xFE000000) == 0xFA000000)
+		{
+			int32_t imm24 = instr & 0x00FFFFFF;
+			if (imm24 & 0x00800000)
+				imm24 |= 0xFF000000;
+			int32_t offset_bytes = imm24 << 2;
+			// H bit adds 2 for Thumb halfword alignment
+			if (instr & 0x01000000)
+				offset_bytes += 2;
+			uint64_t target = instrAddr + 8 + offset_bytes;
+			// Set Thumb bit
+			target |= 1;
+
+			addFunction(target, "BLX");
+		}
+
+		// Pattern 3: LDR PC, [PC, #imm] (indirect jump via literal pool)
+		// Encoding: cond 0101 U001 1111 1111 imm12
+		// U bit (bit 23) indicates add/subtract
+		// Example: LDR PC, [PC, #0x10] = 0xE59FF010
+		if ((instr & 0x0F7FF000) == 0x051FF000)
+		{
+			uint32_t imm12 = instr & 0xFFF;
+			bool add = (instr & 0x00800000) != 0;
+			// PC reads as instrAddr + 8 in ARM mode
+			uint64_t litPoolAddr = add ? (instrAddr + 8 + imm12) : (instrAddr + 8 - imm12);
+
+			// Read the literal pool entry
+			if (litPoolAddr >= imageBase && litPoolAddr + 4 <= imageBase + length)
+			{
+				uint64_t litPoolOffset = litPoolAddr - imageBase;
+				if (litPoolOffset + 4 <= dataLen)
+				{
+					uint32_t target = 0;
+					memcpy(&target, data + litPoolOffset, sizeof(target));
+					if (endian == BigEndian)
+						target = Swap32(target);
+
+					// Add as function (preserving Thumb bit if present)
+					addFunction(target, "LDR PC");
+				}
+			}
+		}
+	}
+
+	logger->LogInfo("Call target scan: Found %zu call targets", targetsFound);
+	return targetsFound;
+}
+
+
 // Structure to hold discovered config array info
 struct MMUConfigArray {
 	uint64_t startAddr;    // Start address of array
@@ -1831,6 +1972,12 @@ bool Armv5FirmwareView::Init()
 		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
 		ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
 			m_arch, thumbArch, m_plat, m_logger);
+
+		// Scan for BL/BLX/LDR PC call targets to discover additional functions.
+		// This finds functions that are called but may not have recognizable prologues
+		// (e.g., optimized leaf functions, hand-written assembly, Thumb code).
+		ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+			m_plat, m_logger);
 
 		// NOTE: Exception handlers are named (irq_handler, fiq_handler, etc.) but we
 		// don't auto-apply the irq-handler calling convention. Users can apply it
