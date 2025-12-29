@@ -1876,7 +1876,7 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
 
             ConditionExecute(4, instr.cond, instr, il,
                 [rd, rm, rn, isAdd, isDouble](size_t addrSize, Instruction& instr, LowLevelILFunction& il) {
-                    LowLevelILLabel checkNegOvf, setNegOvf, noOverflow, done;
+                    LowLevelILLabel setPosMax, checkNegOvf, setNegMin, setNormal, done;
 
                     // temp0 = sign_extend_64(Rm)
                     il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0),
@@ -1885,7 +1885,7 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
                     // temp1 = sign_extend_64(Rn) or sign_extend_64(Rn * 2) with saturation
                     if (isDouble) {
                         // For QDADD/QDSUB: compute Rn * 2 in 64-bit, then saturate to 32-bit range
-                        LowLevelILLabel dblCheckNeg, dblSetNeg, dblNoOvf, dblDone;
+                        LowLevelILLabel dblSetPos, dblCheckNeg, dblSetNeg, dblDone;
 
                         il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1),
                             il.Mult(8, il.SignExtend(8, il.Register(4, rn)), il.Const(8, 2))));
@@ -1893,14 +1893,13 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
                         // Check positive overflow: temp1 > 0x7FFFFFFF
                         il.AddInstruction(il.If(
                             il.CompareSignedGreaterThan(8, il.Register(8, LLIL_TEMP(1)), il.Const(8, 0x7FFFFFFF)),
-                            dblCheckNeg, dblNoOvf));
+                            dblSetPos, dblCheckNeg));
 
-                        // Not positive overflow, check negative
-                        il.MarkLabel(dblCheckNeg);
+                        il.MarkLabel(dblSetPos);
                         il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1), il.Const(8, 0x7FFFFFFF)));
                         il.AddInstruction(il.Goto(dblDone));
 
-                        il.MarkLabel(dblNoOvf);
+                        il.MarkLabel(dblCheckNeg);
                         il.AddInstruction(il.If(
                             il.CompareSignedLessThan(8, il.Register(8, LLIL_TEMP(1)), il.Const(8, (int64_t)(int32_t)0x80000000)),
                             dblSetNeg, dblDone));
@@ -1923,31 +1922,33 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
                             il.Sub(8, il.Register(8, LLIL_TEMP(0)), il.Register(8, LLIL_TEMP(1)))));
                     }
 
-                    // Saturate final result
-                    // Check positive overflow: temp2 > 0x7FFFFFFF
+                    // Saturate final result: check positive overflow first
                     il.AddInstruction(il.If(
                         il.CompareSignedGreaterThan(8, il.Register(8, LLIL_TEMP(2)), il.Const(8, 0x7FFFFFFF)),
-                        checkNegOvf, noOverflow));
+                        setPosMax, checkNegOvf));
 
-                    // Positive overflow path - but we jumped wrong way, fix labels
-                    il.MarkLabel(checkNegOvf);
+                    // Positive overflow: Rd = 0x7FFFFFFF
+                    il.MarkLabel(setPosMax);
                     il.AddInstruction(il.SetRegister(4, rd, il.Const(4, 0x7FFFFFFF)));
                     il.AddInstruction(il.Goto(done));
 
                     // Check negative overflow
-                    il.MarkLabel(noOverflow);
+                    il.MarkLabel(checkNegOvf);
                     il.AddInstruction(il.If(
                         il.CompareSignedLessThan(8, il.Register(8, LLIL_TEMP(2)), il.Const(8, (int64_t)(int32_t)0x80000000)),
-                        setNegOvf, done));
+                        setNegMin, setNormal));
 
-                    il.MarkLabel(setNegOvf);
+                    // Negative overflow: Rd = 0x80000000
+                    il.MarkLabel(setNegMin);
                     il.AddInstruction(il.SetRegister(4, rd, il.Const(4, 0x80000000)));
                     il.AddInstruction(il.Goto(done));
 
                     // No overflow: Rd = low32(temp2)
-                    il.MarkLabel(done);
+                    il.MarkLabel(setNormal);
                     il.AddInstruction(il.SetRegister(4, rd,
                         il.LowPart(4, il.Register(8, LLIL_TEMP(2)))));
+
+                    il.MarkLabel(done);
                 });
 
             return true;
@@ -2054,40 +2055,115 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
             }
             return true;
 
-        /* CDP - coprocessor data processing (no ARM register transfer) */
+        /* CDP - coprocessor data processing (no ARM register transfer)
+         * Operands: coproc, opc1, CRd, CRn, CRm, opc2 */
         case ARMV5_CDP:
-            ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_CDP, {}));
+            {
+                auto params = {
+                    il.Const(1, instr.operands[0].reg),  /* coproc */
+                    il.Const(1, instr.operands[1].imm),  /* opc1 */
+                    il.Const(1, instr.operands[2].reg),  /* CRd */
+                    il.Const(1, instr.operands[3].reg),  /* CRn */
+                    il.Const(1, instr.operands[4].reg),  /* CRm */
+                    il.Const(1, instr.operands[5].imm),  /* opc2 */
+                };
+                ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_CDP, params));
+            }
             return true;
 
-        /* LDC/STC - coprocessor load/store */
+        /* LDC/STC - coprocessor load/store
+         * Operands: coproc, CRd, [Rn, #imm] */
         case ARMV5_LDC:
-            ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_LDC, {}));
+            {
+                ExprId address = GetMemoryAddress(il, instr, 2, addr, false);
+                auto params = {
+                    il.Const(1, instr.operands[0].reg),  /* coproc */
+                    il.Const(1, instr.operands[1].reg),  /* CRd */
+                    address,                              /* memory address */
+                };
+                ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_LDC, params));
+            }
             return true;
         case ARMV5_STC:
-            ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_STC, {}));
+            {
+                ExprId address = GetMemoryAddress(il, instr, 2, addr, false);
+                auto params = {
+                    il.Const(1, instr.operands[0].reg),  /* coproc */
+                    il.Const(1, instr.operands[1].reg),  /* CRd */
+                    address,                              /* memory address */
+                };
+                ConditionExecute(il, instr.cond, il.Intrinsic({}, ARMV5_INTRIN_STC, params));
+            }
             return true;
 
-        /* MCRR/MRRC - two-word coprocessor transfers */
+        /* MCRR - two-word coprocessor transfer (ARM to coprocessor)
+         * Operands: coproc, opc1, Rt, Rt2, CRm */
         case ARMV5_MCRR:
-            ConditionExecute(il, instr.cond,
-                il.Intrinsic({}, ARMV5_INTRIN_COPROC_SENDTWOWORDS, {}));
-            return true;
-        case ARMV5_MRRC:
-            ConditionExecute(il, instr.cond,
-                il.Intrinsic({}, ARMV5_INTRIN_COPROC_GETTWOWORDS, {}));
+            {
+                auto params = {
+                    il.Const(1, instr.operands[0].reg),  /* coproc */
+                    il.Const(1, instr.operands[1].imm),  /* opc1 */
+                    ILREG(2),                             /* Rt (lower word) */
+                    ILREG(3),                             /* Rt2 (upper word) */
+                    il.Const(1, instr.operands[4].reg),  /* CRm */
+                };
+                ConditionExecute(il, instr.cond,
+                    il.Intrinsic({}, ARMV5_INTRIN_COPROC_SENDTWOWORDS, params));
+            }
             return true;
 
-        /* Swap - deprecated but supported */
+        /* MRRC - two-word coprocessor transfer (coprocessor to ARM)
+         * Operands: coproc, opc1, Rt, Rt2, CRm */
+        case ARMV5_MRRC:
+            {
+                auto params = {
+                    il.Const(1, instr.operands[0].reg),  /* coproc */
+                    il.Const(1, instr.operands[1].imm),  /* opc1 */
+                    il.Const(1, instr.operands[4].reg),  /* CRm */
+                };
+                ConditionExecute(il, instr.cond,
+                    il.Intrinsic(
+                        {
+                            RegisterOrFlag::Register(RegisterToIndex(instr.operands[2].reg)),
+                            RegisterOrFlag::Register(RegisterToIndex(instr.operands[3].reg))
+                        },
+                        ARMV5_INTRIN_COPROC_GETTWOWORDS, params));
+            }
+            return true;
+
+        /* Swap - deprecated but supported
+         * SWP{B}{cond} Rd, Rm, [Rn]
+         * Atomically: temp = [Rn]; [Rn] = Rm; Rd = temp
+         *
+         * Like armv7, we lift this using native Load/Store for dataflow visibility.
+         * Use a temp register to handle the case where Rd == Rm.
+         */
         case ARMV5_SWP:
-        case ARMV5_SWPB: {
+        case ARMV5_SWPB:
+        {
             size_t size = (instr.operation == ARMV5_SWPB) ? 1 : 4;
-            ExprId address = GetMemoryAddress(il, instr, 2, addr, false);
-            ExprId temp = il.Load(size, address);
-            ConditionExecute(il, instr.cond, il.Store(size, address,
-                size == 1 ? il.LowPart(1, ILREG(1)) : ILREG(1)));
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    size == 1 ? il.ZeroExtend(4, temp) : temp));
+            uint32_t rd = RegisterToIndex(instr.operands[0].reg);
+            uint32_t rm = RegisterToIndex(instr.operands[1].reg);
+
+            ConditionExecute(4, instr.cond, instr, il,
+                [size, rd, rm](size_t addrSize, Instruction& instr, LowLevelILFunction& il) {
+                    ExprId address = il.Register(4, RegisterToIndex(instr.operands[2].reg));
+
+                    // temp0 = [Rn] (load old value)
+                    il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0),
+                        size == 1
+                            ? il.ZeroExtend(4, il.Load(size, address))
+                            : il.Load(size, address)));
+
+                    // [Rn] = Rm (store new value)
+                    il.AddInstruction(il.Store(size, address,
+                        size == 1
+                            ? il.LowPart(1, il.Register(4, rm))
+                            : il.Register(4, rm)));
+
+                    // Rd = temp0 (write old value to destination)
+                    il.AddInstruction(il.SetRegister(4, rd, il.Register(4, LLIL_TEMP(0))));
+                });
             return true;
         }
 
