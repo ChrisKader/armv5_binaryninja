@@ -519,13 +519,211 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 }
 
 
+// Structure to hold discovered config array info
+struct MMUConfigArray {
+	uint64_t startAddr;    // Start address of array
+	uint64_t endAddr;      // End address of array
+	bool isIdentity;       // true = 4-byte identity entries, false = 8-byte VA->PA entries
+	uint64_t litPoolAddr1; // Address of start pointer in literal pool
+	uint64_t litPoolAddr2; // Address of end pointer in literal pool
+};
+
+// Structure to hold ROM-to-SRAM copy info for reading initialized data
+struct RomToSramCopy {
+	uint64_t romSrc;       // Source address in ROM
+	uint64_t sramDst;      // Destination address in SRAM
+	uint64_t sramEnd;      // End of SRAM destination region
+	bool valid;            // Whether a valid copy was found
+};
+
+// Find ROM-to-SRAM copy operation that initializes config arrays
+// Looks for pattern: ldrlo rx, [ry], #4 / strlo rx, [rz], #4 (copy loop)
+// Returns info about the copy or {.valid = false} if not found
+static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data,
+	uint64_t dataLen, BNEndianness endian, uint64_t length, uint64_t aliasBase, Ref<Logger> logger)
+{
+	RomToSramCopy result = {0, 0, 0, false};
+
+	if (aliasBase == 0)
+		return result;
+
+	// Scan for the characteristic LDRLO/STRLO copy loop pattern
+	// ARM encoding for LDRLO Rx, [Ry], #4 (post-indexed, unsigned immediate):
+	//   cond=0011 (LO/CC) 01 I=0 P=0 U=1 B=0 W=0 L=1 Rn Rd imm12=4
+	//   Example: LDRLO r3, [r0], #4 = 0x34903004
+	//   Mask 0x0FF00FFF (ignore cond, Rn, Rd), value 0x04900004
+	// ARM encoding for STRLO:
+	//   cond=0011 01 I=0 P=0 U=1 B=0 W=0 L=0 Rn Rd imm12=4
+	//   Example: STRLO r3, [r1], #4 = 0x34813004
+	//   Mask 0x0FF00FFF, value 0x04800004
+
+	for (uint64_t offset = 0; offset + 8 <= length; offset += 4)
+	{
+		uint32_t instr1 = 0, instr2 = 0;
+		ReadU32At(reader, data, dataLen, endian, offset, instr1);
+		ReadU32At(reader, data, dataLen, endian, offset + 4, instr2);
+
+		// Check for LDRLO followed by STRLO (or vice versa)
+		bool isLdrLo1 = (instr1 & 0x0FF00FFF) == 0x04900004 && (instr1 & 0xF0000000) == 0x30000000;
+		bool isStrLo1 = (instr1 & 0x0FF00FFF) == 0x04800004 && (instr1 & 0xF0000000) == 0x30000000;
+		bool isLdrLo2 = (instr2 & 0x0FF00FFF) == 0x04900004 && (instr2 & 0xF0000000) == 0x30000000;
+		bool isStrLo2 = (instr2 & 0x0FF00FFF) == 0x04800004 && (instr2 & 0xF0000000) == 0x30000000;
+
+		if ((isLdrLo1 && isStrLo2) || (isStrLo1 && isLdrLo2))
+		{
+			logger->LogInfo("MMU: Found copy loop at file offset 0x%llx (LDRLO/STRLO pattern)",
+				(unsigned long long)offset);
+
+			// Scan backwards to find literal pool loads that set up the copy
+			// We're looking for LDR instructions that load:
+			// 1. ROM source address (small value within file)
+			// 2. SRAM destination address (matches alias base)
+			// 3. SRAM end address (matches alias base)
+
+			std::vector<std::pair<uint64_t, uint32_t>> literalRefs;
+
+			// Scan up to 64 instructions back
+			for (int i = 1; i <= 64 && offset >= (uint64_t)(i * 4); i++)
+			{
+				uint32_t prevInstr = 0;
+				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr);
+
+				// LDR Rd, [PC, #imm]: 0x051F0000 (sub) or 0x059F0000 (add)
+				if ((prevInstr & 0x0F7F0000) == 0x051F0000)
+				{
+					uint32_t imm12 = prevInstr & 0xFFF;
+					bool add = (prevInstr & 0x00800000) != 0;
+					uint64_t pcVal = (offset - (i * 4)) + 8;
+					uint64_t litAddr = add ? (pcVal + imm12) : (pcVal - imm12);
+
+					if (litAddr + 4 <= length)
+					{
+						uint32_t value = 0;
+						ReadU32At(reader, data, dataLen, endian, litAddr, value);
+						literalRefs.push_back({litAddr, value});
+					}
+				}
+			}
+
+			// Categorize the literal values
+			// The copy pattern typically loads: ROM source, SRAM start, SRAM end
+			// in consecutive literal pool entries. We look for the ROM address
+			// and then the SRAM addresses that are loaded closest to it.
+			uint64_t romSrc = 0;
+			uint64_t romSrcLitAddr = 0;
+			std::vector<std::pair<uint64_t, uint64_t>> sramAddrsWithLitAddr;  // (sram_addr, lit_pool_addr)
+
+			for (const auto& ref : literalRefs)
+			{
+				uint64_t litAddr = ref.first;
+				uint32_t val = ref.second;
+
+				// ROM address: within file bounds, but not too small
+				if (val < length && val > 0x1000)
+				{
+					romSrc = val;
+					romSrcLitAddr = litAddr;
+				}
+				// SRAM address: matches our alias base
+				else if ((val & 0xFF000000) == aliasBase)
+				{
+					sramAddrsWithLitAddr.push_back({val, litAddr});
+				}
+			}
+
+			if (romSrc != 0 && sramAddrsWithLitAddr.size() >= 2)
+			{
+				// Find the SRAM addresses that are in consecutive literal pool entries
+				// closest to the ROM source (they form: ROM, SRAM_start, SRAM_end)
+				// The literal pool entries may be loaded in any order, so we check both directions
+				uint64_t sramDst = 0, sramEnd = 0;
+
+				for (size_t i = 0; i + 1 < sramAddrsWithLitAddr.size(); i++)
+				{
+					uint64_t addr1 = sramAddrsWithLitAddr[i].first;
+					uint64_t lit1 = sramAddrsWithLitAddr[i].second;
+					uint64_t addr2 = sramAddrsWithLitAddr[i + 1].first;
+					uint64_t lit2 = sramAddrsWithLitAddr[i + 1].second;
+
+					// Check if these are consecutive literal pool entries (either direction)
+					int64_t litDiff = (int64_t)lit2 - (int64_t)lit1;
+					if (litDiff != 4 && litDiff != -4)
+						continue;
+
+					// Determine which is start (smaller addr) and which is end (larger addr)
+					uint64_t startAddr = (addr1 < addr2) ? addr1 : addr2;
+					uint64_t endAddr = (addr1 < addr2) ? addr2 : addr1;
+					uint64_t size = endAddr - startAddr;
+
+					// Check for reasonable copy size (256 bytes to 64KB)
+					if (size >= 0x100 && size <= 0x10000)
+					{
+						// Use this pair
+						sramDst = startAddr;
+						sramEnd = endAddr;
+						break;  // Found a valid pair, stop searching
+					}
+				}
+
+				if (sramDst != 0 && sramEnd != 0)
+				{
+					result.romSrc = romSrc;
+					result.sramDst = sramDst;
+					result.sramEnd = sramEnd;
+					result.valid = true;
+
+					logger->LogInfo("MMU: ROM-to-SRAM copy found:");
+					logger->LogInfo("MMU:   ROM source:  0x%08llx", (unsigned long long)romSrc);
+					logger->LogInfo("MMU:   SRAM dest:   0x%08llx - 0x%08llx",
+						(unsigned long long)sramDst, (unsigned long long)sramEnd);
+					logger->LogInfo("MMU:   Size:        %llu bytes", (unsigned long long)(sramEnd - sramDst));
+
+					return result;
+				}
+			}
+		}
+	}
+
+	return result;
+}
+
+// Read u32, using ROM copy data for SRAM addresses if available
+static bool ReadU32Smart(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
+	BNEndianness endian, uint64_t addr, uint64_t aliasBase, const RomToSramCopy& romCopy, uint32_t& out)
+{
+	// Check if this is an SRAM address that falls within the ROM copy range
+	if (romCopy.valid && aliasBase != 0 &&
+		(addr & 0xFF000000) == aliasBase &&
+		addr >= romCopy.sramDst && addr < romCopy.sramEnd)
+	{
+		// Calculate the corresponding ROM address
+		uint64_t offsetInSram = addr - romCopy.sramDst;
+		uint64_t romAddr = romCopy.romSrc + offsetInSram;
+
+		// Read from ROM instead
+		return ReadU32At(reader, data, dataLen, endian, romAddr, out);
+	}
+
+	// For addresses within the file, read directly
+	// Handle aliased addresses by stripping the high byte
+	uint64_t readAddr = addr;
+	if (aliasBase != 0 && (addr & 0xFF000000) == aliasBase)
+	{
+		readAddr = addr & 0x00FFFFFF;
+	}
+
+	return ReadU32At(reader, data, dataLen, endian, readAddr, out);
+}
+
 // Analyze MMU configuration to discover memory regions
 // Looks for MCR p15, 0, Rx, c2, c0, 0 (write to TTBR) and parses the translation table
+// When translation table is uninitialized, discovers config arrays through static analysis
 static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length, Ref<Logger> logger)
 {
 	uint64_t ttbrValue = 0;
 	uint64_t ttbrInstrAddr = 0;
+	uint64_t mmuSetupFuncStart = 0;
 
 	// Scan for MCR p15, 0, Rx, c2, c0, 0 instruction
 	// Encoding: cond 1110 opc1[3] 0 CRn[4] Rt[4] coproc[4] opc2[3] 1 CRm[4]
@@ -547,12 +745,25 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 				(unsigned long long)ttbrInstrAddr, (unsigned long long)offset, rt);
 
 			// Try to trace back to find the value loaded into Rt
+			// Also look for function prologue to identify the MMU setup function boundaries
 			// Look for LDR Rt, [PC, #imm] or MOV Rt, #imm patterns
 			// Search up to 128 instructions back (covers typical MMU setup functions)
 			for (int i = 1; i <= 128 && offset >= (uint64_t)(i * 4); i++)
 			{
 				uint32_t prevInstr = 0;
 				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr);
+
+				// Check for function prologue (STMFD sp!, {..., lr})
+				// This helps us identify the start of the MMU setup function
+				if ((prevInstr & 0xFFFF0000) == 0xE92D0000 && (prevInstr & 0x4000) != 0)
+				{
+					if (mmuSetupFuncStart == 0)
+					{
+						mmuSetupFuncStart = offset - (i * 4);
+						logger->LogInfo("MMU: Found MMU setup function prologue at file offset 0x%llx",
+							(unsigned long long)mmuSetupFuncStart);
+					}
+				}
 
 				// LDR Rt, [PC, #imm] - check for both add and sub variants
 				// Encoding: cond 01 I P U 0 W 1 Rn Rd imm12
@@ -617,30 +828,40 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 	uint64_t ttbrBase = ttbrValue & ~0x3FFFULL;  // 16KB alignment
 
 	// Check if translation table is within our file
-	// Handle common physical address alias patterns:
-	// - 0xa4xxxxxx is often a physical alias of 0x00xxxxxx (uncached view of internal RAM)
-	// - This is common on ARM926EJ-S and similar embedded processors
+	// Handle physical address alias patterns dynamically:
+	// - If TTBR has high bits set but low bits point within our file, it's an alias
+	// - We discover the alias base from the TTBR value itself (e.g., 0xA4xxxxxx -> 0xA4000000)
 	uint64_t ttbrFileOffset = 0;
 	bool ttbrInFile = false;
 	uint64_t ttbrVirtBase = ttbrBase;  // Virtual address for symbols
+	uint64_t discoveredAliasBase = 0;  // Discovered physical address alias base (if any)
 
 	if (ttbrBase >= imageBase && ttbrBase < imageBase + length)
 	{
 		ttbrFileOffset = ttbrBase - imageBase;
 		ttbrInFile = true;
 	}
-	else if ((ttbrBase & 0xFF000000) == 0xA4000000)
+	else
 	{
-		// Physical address alias: 0xa4xxxxxx -> 0x00xxxxxx
-		uint64_t aliasedAddr = ttbrBase & 0x00FFFFFF;
-		logger->LogInfo("MMU: TTBR 0x%llx appears to be physical alias of 0x%llx",
-			(unsigned long long)ttbrBase, (unsigned long long)aliasedAddr);
+		// Check if TTBR is a physical address alias
+		// Pattern: TTBR has high bits set, but low 24 bits are within file
+		// This handles various aliasing schemes (0xA4xxxxxx, 0x80xxxxxx, etc.)
+		uint64_t ttbrLowBits = ttbrBase & 0x00FFFFFF;
+		uint64_t ttbrHighBits = ttbrBase & 0xFF000000;
 
-		if (aliasedAddr >= imageBase && aliasedAddr < imageBase + length)
+		if (ttbrHighBits != 0 && ttbrLowBits < length)
 		{
-			ttbrFileOffset = aliasedAddr - imageBase;
+			uint64_t aliasedAddr = imageBase + ttbrLowBits;
+			logger->LogInfo("MMU: TTBR 0x%llx appears to be physical alias of 0x%llx",
+				(unsigned long long)ttbrBase, (unsigned long long)aliasedAddr);
+
+			ttbrFileOffset = ttbrLowBits;
 			ttbrInFile = true;
-			ttbrVirtBase = imageBase + ttbrFileOffset;  // Use virtual address for symbols
+			ttbrVirtBase = aliasedAddr;  // Use virtual address for symbols
+			discoveredAliasBase = ttbrHighBits;  // Remember the alias base for later use
+
+			logger->LogInfo("MMU: Discovered physical alias base: 0x%llx",
+				(unsigned long long)discoveredAliasBase);
 		}
 	}
 
@@ -768,38 +989,47 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 
 	if (regions.empty())
 	{
-		logger->LogInfo("MMU: Translation table is uninitialized (all fault/0x0FF59FF0 entries)");
-		logger->LogInfo("MMU: Analyzing MMU setup code to extract memory regions...");
+		logger->LogInfo("MMU: Translation table is uninitialized (all fault entries)");
+		logger->LogInfo("MMU: Discovering config arrays from MMU setup code...");
 
-		// The translation table is empty - it gets populated at runtime.
-		// From code analysis (see MMU.md):
+		// The translation table is empty - it gets populated at runtime from config arrays.
+		// We need to find these arrays by analyzing the MMU setup function.
 		//
-		// Phase 1: Entire 4GB filled with descriptor 0xXXX00032:
-		//   - Strongly-ordered device memory
-		//   - Execute-Never (XN=1)
-		//   - No access (AP=0)
-		//   - This is the "default deny" - everything inaccessible
+		// Pattern: The function loads pairs of pointers (array start, array end) from
+		// the literal pool, then loops through the entries to populate the translation table.
 		//
-		// Phase 2: Specific regions overridden from config tables:
-		//   - 0x00000c12: MMIO (Strongly-ordered, XN=1, AP=3 full access)
-		//   - Other descriptors loaded from RAM tables at runtime
+		// Array types:
+		// - Identity arrays (4-byte entries): VA only, PA = VA
+		// - VA->PA arrays (8-byte entries): VA and PTE descriptor
 		//
-		// Known physical address aliasing:
-		//   - 0xA4xxxxxx -> 0x00xxxxxx (uncached view of internal RAM)
+		// We detect the array type by examining the first entry.
 
-		// Scan for MOV instructions that set descriptor templates
-		// to understand what memory types are configured
-		bool foundMMIODescriptor = false;
+		// Find ROM-to-SRAM copy operation for reading initialized config array data
+		// The config arrays are stored in SRAM addresses but the binary contains ROM data
+		// that gets copied to SRAM at boot. We need to read from the ROM source.
+		RomToSramCopy romCopy = FindRomToSramCopy(reader, data, dataLen, endian, length,
+			discoveredAliasBase, logger);
 
-		// Look for the 0x00000c12 descriptor (MMIO with full access)
-		// Limit scan to avoid excessive processing time
-		uint64_t scanLimit = (length > 0x20000) ? 0x20000 : length;
-		for (uint64_t off = 0; off + 4 <= scanLimit; off += 4)
+		// Collect all literal pool references in the MMU setup function area
+		// Structure: {literalPoolAddr, value}
+		std::vector<std::pair<uint64_t, uint32_t>> literalRefs;
+
+		// Scan a reasonable range around the TTBR instruction
+		// Use mmuSetupFuncStart if found, otherwise scan from TTBR-512 to TTBR+256
+		uint64_t ttbrFileOffset = ttbrInstrAddr - imageBase;
+		uint64_t scanStart = (mmuSetupFuncStart != 0) ? mmuSetupFuncStart :
+			((ttbrFileOffset > 512) ? (ttbrFileOffset - 512) : 0);
+		uint64_t scanEnd = (ttbrFileOffset + 512 < length) ? (ttbrFileOffset + 512) : length;
+
+		logger->LogInfo("MMU: Scanning for literal pool refs from 0x%llx to 0x%llx",
+			(unsigned long long)scanStart, (unsigned long long)scanEnd);
+
+		for (uint64_t off = scanStart; off + 4 <= scanEnd; off += 4)
 		{
 			uint32_t instr = 0;
 			ReadU32At(reader, data, dataLen, endian, off, instr);
 
-			// LDR Rd, [PC, #imm]: look for descriptor loads
+			// LDR Rd, [PC, #imm]: collect literal pool references
 			if ((instr & 0x0F7F0000) == 0x051F0000)
 			{
 				uint32_t imm12 = instr & 0xFFF;
@@ -807,67 +1037,318 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 				uint64_t pcVal = off + 8;
 				uint64_t litAddr = add ? (pcVal + imm12) : (pcVal - imm12);
 
-				// Ensure we can read 4 bytes from litAddr
 				if (litAddr + 4 <= length)
 				{
 					uint32_t value = 0;
 					ReadU32At(reader, data, dataLen, endian, litAddr, value);
-
-					// Check for 0x00000c12 (MMIO descriptor)
-					if (value == 0x00000c12)
-					{
-						foundMMIODescriptor = true;
-						logger->LogInfo("MMU: Found MMIO descriptor 0x00000c12 at 0x%llx",
-							(unsigned long long)litAddr);
-						break;  // Found what we need, stop scanning
-					}
+					literalRefs.push_back({litAddr, value});
 				}
 			}
 		}
 
-		// Create memory regions based on analysis
-		// The ROM region (0x00000000) is already covered by our main segment
+		logger->LogInfo("MMU: Found %zu literal pool references", literalRefs.size());
 
-		// MMIO/Peripheral region - common on ARM926EJ-S
-		// Based on descriptor 0x00000c12: Strongly-ordered, XN=1, AP=3
-		if (foundMMIODescriptor)
+		// Find config arrays: look for pairs of consecutive literal pool entries
+		// where the values look like array bounds (addr1 < addr2, reasonable size)
+		std::vector<MMUConfigArray> configArrays;
+
+		for (size_t i = 0; i + 1 < literalRefs.size(); i++)
 		{
-			// Standard ARM peripheral ranges
-			regions.push_back({0x40000000, 0x40000000, 0x10000000,
-				true, true, false, false, false, "Peripherals"});
+			uint64_t litAddr1 = literalRefs[i].first;
+			uint64_t litAddr2 = literalRefs[i + 1].first;
+			uint32_t val1 = literalRefs[i].second;
+			uint32_t val2 = literalRefs[i + 1].second;
 
-			logger->LogInfo("MMU: Added peripheral region 0x40000000-0x4FFFFFFF");
+			// Check if these are consecutive literal pool entries (4 bytes apart)
+			if (litAddr2 - litAddr1 != 4)
+				continue;
+
+			// Check if values look like array bounds
+			// Must be ordered (start < end) with reasonable size (< 0x1000 bytes)
+			if (val1 >= val2)
+				continue;
+
+			uint32_t arraySize = val2 - val1;
+			if (arraySize == 0 || arraySize > 0x1000)
+				continue;
+
+			// Validate that the array start address is within our file or ROM copy range
+			// Handle physical address aliases using the discovered alias base
+			bool arrayAccessible = false;
+
+			// Check if array is in ROM copy range (preferred - has initialized data)
+			if (romCopy.valid && discoveredAliasBase != 0 &&
+				(val1 & 0xFF000000) == discoveredAliasBase &&
+				val1 >= romCopy.sramDst && val2 <= romCopy.sramEnd)
+			{
+				arrayAccessible = true;
+				logger->LogInfo("MMU: Config array at 0x%08x is in ROM copy range", val1);
+			}
+			else
+			{
+				// Fall back to checking if array is directly in file
+				uint64_t arrayFileOffset = val1;
+				if (discoveredAliasBase != 0 && (val1 & 0xFF000000) == discoveredAliasBase)
+					arrayFileOffset = val1 & 0x00FFFFFF;
+
+				if (arrayFileOffset >= imageBase && arrayFileOffset < imageBase + length)
+					arrayAccessible = true;
+				else if (arrayFileOffset < length)
+					arrayAccessible = true;
+			}
+
+			if (!arrayAccessible)
+				continue;  // Array not accessible
+
+			// Read first few entries using ReadU32Smart to get data from ROM if needed
+			uint32_t firstEntry = 0, secondEntry = 0, thirdEntry = 0;
+			ReadU32Smart(reader, data, dataLen, endian, val1, discoveredAliasBase, romCopy, firstEntry);
+			ReadU32Smart(reader, data, dataLen, endian, val1 + 4, discoveredAliasBase, romCopy, secondEntry);
+			ReadU32Smart(reader, data, dataLen, endian, val1 + 8, discoveredAliasBase, romCopy, thirdEntry);
+
+			// Check if array is uninitialized (all entries are the same value like 0x0ff59ff0)
+			// This indicates the array is populated at runtime, not in the binary
+			if (firstEntry == secondEntry && secondEntry == thirdEntry)
+			{
+				// All entries are the same - likely uninitialized
+				// Skip this array unless entries look like valid descriptors
+				uint32_t descType = firstEntry & 0x3;
+				if (descType != 0x2 && descType != 0x1)  // Not a valid section or page table descriptor
+				{
+					logger->LogInfo("MMU: Skipping uninitialized array at 0x%08x (all entries = 0x%08x)",
+						val1, firstEntry);
+					continue;
+				}
+			}
+
+			// Determine array type based on first entry
+			// Identity arrays have entries that look like 0xXX000000 (1MB aligned) or
+			// have low bits that look like section descriptors (0x..00012, 0x..00c12, etc.)
+			// VA->PA arrays have the VA in the first word
+			bool isIdentity = false;
+
+			// Check if first entry looks like a section base + descriptor bits
+			// Section base is in [31:20], descriptor bits in [19:0]
+			uint32_t sectionBase = firstEntry & 0xFFF00000;
+			uint32_t descBits = firstEntry & 0x000FFFFF;
+
+			// Identity entries typically have descriptor bits like 0x00012 (cached) or 0x00c12 (device)
+			// or just section base with minimal flags
+			if ((descBits & 0x00003) == 0x02 ||  // Section descriptor type
+			    (descBits & 0xFFFFF) < 0x100 ||  // Very low flags (likely just base)
+			    (firstEntry & 0x000FFFFF) == 0)   // Just the section base
+			{
+				isIdentity = true;
+			}
+
+			// For identity arrays, entry count = size / 4
+			// For VA->PA arrays, entry count = size / 8
+			size_t entrySize = isIdentity ? 4 : 8;
+			size_t entryCount = arraySize / entrySize;
+
+			if (entryCount == 0 || entryCount > 256)
+				continue;  // Unreasonable entry count
+
+			logger->LogInfo("MMU: Found config array at 0x%08x-0x%08x (%s, %zu entries)",
+				val1, val2, isIdentity ? "identity" : "VA->PA", entryCount);
+
+			configArrays.push_back({val1, val2, isIdentity, litAddr1, litAddr2});
+
+			// Parse the array entries and create memory regions
+			// Use the original SRAM addresses (val1, val2) with ReadU32Smart to read from ROM
+			for (size_t j = 0; j < entryCount; j++)
+			{
+				uint64_t entryAddr = val1 + (j * entrySize);
+				if (entryAddr + entrySize > val2)
+					break;
+
+				uint32_t entry1 = 0, entry2 = 0;
+				ReadU32Smart(reader, data, dataLen, endian, entryAddr, discoveredAliasBase, romCopy, entry1);
+				if (!isIdentity)
+					ReadU32Smart(reader, data, dataLen, endian, entryAddr + 4, discoveredAliasBase, romCopy, entry2);
+
+				uint64_t virtAddr, physAddr;
+				uint32_t descriptor;
+
+				if (isIdentity)
+				{
+					// Identity: entry is VA (with possible descriptor bits)
+					virtAddr = entry1 & 0xFFF00000;
+					physAddr = virtAddr;  // Identity mapping
+					descriptor = entry1 & 0x000FFFFF;
+				}
+				else
+				{
+					// VA->PA: first word is VA, second is PTE descriptor
+					virtAddr = entry1 & 0xFFF00000;
+					physAddr = entry2 & 0xFFF00000;
+					descriptor = entry2 & 0x000FFFFF;
+				}
+
+				// Decode descriptor bits
+				bool cacheable = (descriptor >> 3) & 0x1;
+				bool bufferable = (descriptor >> 2) & 0x1;
+				bool executable = !((descriptor >> 4) & 0x1);  // XN bit
+				uint32_t ap = (descriptor >> 10) & 0x3;
+				bool readable = (ap != 0);
+				bool writable = (ap == 0x3);
+
+				const char* regionType = "unknown";
+				if (cacheable && bufferable)
+					regionType = "RAM (cached)";
+				else if (!cacheable && !bufferable)
+					regionType = "MMIO";
+				else if (!cacheable && bufferable)
+					regionType = "RAM (write-combine)";
+				else
+					regionType = "RAM (uncached)";
+
+				// Check if this region can be merged with the previous one
+				bool merged = false;
+				if (!regions.empty())
+				{
+					MemRegion& last = regions.back();
+					if (last.virtBase + last.size == virtAddr &&
+					    last.physBase + last.size == physAddr &&
+					    last.cacheable == cacheable &&
+					    last.bufferable == bufferable &&
+					    last.executable == executable &&
+					    last.readable == readable &&
+					    last.writable == writable)
+					{
+						last.size += 0x100000;  // Extend by 1MB
+						merged = true;
+					}
+				}
+
+				if (!merged)
+				{
+					regions.push_back({virtAddr, physAddr, 0x100000,
+						readable, writable, executable, cacheable, bufferable, regionType});
+				}
+			}
 		}
 
-		// Physical address alias region (uncached view of internal RAM)
-		// This is confirmed by the TTBR value 0xA4034000 -> 0x00034000
-		regions.push_back({0xA4000000, 0x00000000, 0x01000000,
-			true, true, true, false, false, "Uncached alias"});
+		if (configArrays.empty() || regions.empty())
+		{
+			logger->LogInfo("MMU: Config arrays uninitialized in binary, searching literal pool for alias base");
 
-		logger->LogInfo("MMU: Added uncached alias region 0xA4000000-0xA4FFFFFF");
+			// The config arrays are populated at runtime, but we can find the alias base
+			// by searching the literal pool for a 1MB-aligned value that matches the
+			// TTBR's high byte pattern. For example:
+			// - TTBR = 0xA4034000 -> look for 0xA4000000 in literal pool
+			// - This is the uncached RAM alias base that gets ORed with addresses
 
-		logger->LogInfo("MMU: Created %zu memory regions from code analysis", regions.size());
+			uint64_t ttbrHighByte = ttbrValue & 0xFF000000;
+			uint64_t foundAliasBase = 0;
+
+			// Search the literal pool for the alias base (e.g., 0xA4000000)
+			for (const auto& ref : literalRefs)
+			{
+				uint32_t val = ref.second;
+				// Look for 1MB-aligned value matching TTBR high byte
+				if ((val & 0xFF000000) == ttbrHighByte && (val & 0x00FFFFFF) == 0)
+				{
+					foundAliasBase = val;
+					logger->LogInfo("MMU: Found alias base 0x%08x in literal pool at 0x%llx",
+						val, (unsigned long long)ref.first);
+					break;
+				}
+			}
+
+			// If we found the alias base, or can infer it from TTBR
+			if (foundAliasBase != 0 || discoveredAliasBase != 0)
+			{
+				uint64_t aliasBase = foundAliasBase ? foundAliasBase : discoveredAliasBase;
+				uint64_t ttbrOffset = ttbrValue & 0x00FFFFFF;
+
+				// Infer minimum RAM size from TTBR offset + 16KB translation table
+				uint64_t minRamSize = ttbrOffset + 0x4000;
+				// Round up to 1MB boundary
+				uint64_t ramSize = ((minRamSize + 0xFFFFF) & ~0xFFFFFULL);
+
+				logger->LogInfo("MMU: Alias base 0x%llx -> 0x%llx (size 0x%llx)",
+					(unsigned long long)aliasBase,
+					(unsigned long long)imageBase, (unsigned long long)ramSize);
+
+				// Add the physical alias region
+				regions.push_back({aliasBase, imageBase, ramSize,
+					true, true, true, false, false, "Physical alias"});
+			}
+
+			logger->LogInfo("MMU: Inferred %zu memory regions from literal pool analysis", regions.size());
+		}
+		else
+		{
+			logger->LogInfo("MMU: Discovered %zu config arrays, extracted %zu memory regions",
+				configArrays.size(), regions.size());
+		}
 	}
 	else
 	{
 		logger->LogInfo("MMU: Found %zu memory regions from translation table", regions.size());
 	}
 
-	// Log what we found but don't create segments for now
-	// Creating segments without backing data was causing crashes
-	logger->LogInfo("MMU: Analysis complete. Found %zu memory regions:", regions.size());
+	// Deduplicate regions by virtual address (keep first occurrence)
+	std::vector<MemRegion> uniqueRegions;
+	std::set<uint64_t> seenVA;
 	for (const auto& region : regions)
 	{
 		if (region.size == 0)
 			continue;
+		if (seenVA.find(region.virtBase) == seenVA.end())
+		{
+			seenVA.insert(region.virtBase);
+			uniqueRegions.push_back(region);
+		}
+	}
 
-		logger->LogInfo("MMU:   0x%08llx-0x%08llx (%s) %s%s%s",
+	// Sort by virtual address
+	std::sort(uniqueRegions.begin(), uniqueRegions.end(),
+		[](const MemRegion& a, const MemRegion& b) { return a.virtBase < b.virtBase; });
+
+	// Log what we found but don't create segments for now
+	// Creating segments without backing data was causing crashes
+	logger->LogInfo("MMU: Analysis complete. Found %zu memory regions:", uniqueRegions.size());
+	logger->LogInfo("MMU:   %-21s  %-6s %-13s %-3s  %6s", "Address Range", "Type", "Cache", "Prm", "Size");
+	logger->LogInfo("MMU:   %-21s  %-6s %-13s %-3s  %6s", "---------------------", "------", "-------------", "---", "------");
+	for (const auto& region : uniqueRegions)
+	{
+		// Format size as human-readable
+		char sizeStr[16];
+		uint64_t sz = region.size;
+		if (sz >= 0x100000 && (sz % 0x100000) == 0)
+			snprintf(sizeStr, sizeof(sizeStr), "%lluMB", (unsigned long long)(sz / 0x100000));
+		else if (sz >= 0x400 && (sz % 0x400) == 0)
+			snprintf(sizeStr, sizeof(sizeStr), "%lluKB", (unsigned long long)(sz / 0x400));
+		else
+			snprintf(sizeStr, sizeof(sizeStr), "%lluB", (unsigned long long)sz);
+
+		// Determine base type (RAM or MMIO) from the type string
+		const char* baseType = "RAM";
+		if (region.type && (strstr(region.type, "MMIO") || strstr(region.type, "Device")))
+			baseType = "MMIO";
+
+		// Determine cache policy from C and B bits
+		const char* cachePolicy = "uncached";
+		if (region.cacheable && region.bufferable)
+			cachePolicy = "write-back";
+		else if (region.cacheable && !region.bufferable)
+			cachePolicy = "write-through";
+		else if (!region.cacheable && region.bufferable)
+			cachePolicy = "write-combine";
+		// else uncached (C=0, B=0)
+
+		logger->LogInfo("MMU:   0x%08llx-0x%08llx  %-6s %-13s %s%s%s  %6s (0x%llx)",
 			(unsigned long long)region.virtBase,
 			(unsigned long long)(region.virtBase + region.size - 1),
-			region.type ? region.type : "unknown",
+			baseType,
+			cachePolicy,
 			region.readable ? "R" : "-",
 			region.writable ? "W" : "-",
-			region.executable ? "X" : "-");
+			region.executable ? "X" : "-",
+			sizeStr,
+			(unsigned long long)region.size);
 	}
 
 	// TODO: Creating segments for MMIO regions without file backing causes crashes
