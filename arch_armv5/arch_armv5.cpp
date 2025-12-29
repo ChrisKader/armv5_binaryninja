@@ -959,9 +959,19 @@ public:
     return 4;
   }
 
+  virtual size_t GetMaxInstructionLength() const override
+  {
+    return 4;  // ARM instructions are always 4 bytes
+  }
+
   virtual size_t GetOpcodeDisplayLength() const override
   {
     return 4;
+  }
+
+  virtual std::vector<uint32_t> GetSystemRegisters() override
+  {
+    return {REG_CPSR, REG_SPSR, REG_FPSCR};
   }
 
   /*
