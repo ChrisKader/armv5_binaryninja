@@ -607,40 +607,44 @@ bool GetLowLevelILForThumbInstruction(Architecture* arch, LowLevelILFunction& il
 		}
 		break;
 	// Note: CBNZ and CBZ are ARMv6T2+ (Thumb-2) - removed for ARMv5
+	/* CLZ - Count Leading Zeros
+	 * Lifted as a loop using native LLIL operations (no intrinsic).
+	 * This allows WARP and other analysis passes to properly track values.
+	 *
+	 *   temp0 = 0 (counter)
+	 *   temp1 = Rm (input)
+	 * loop:
+	 *   if (temp1 != 0) then { temp1 >>= 1; temp0++; goto loop; }
+	 *   Rd = 32 - temp0
+	 */
 	case armv5::ARMV5_CLZ:
-		if (true) {
-			il.AddInstruction(
-				il.Intrinsic(
-					{RegisterOrFlag::Register(GetRegisterOperand(instr, 0))},
-					ARMV5_INTRIN_CLZ,
-					{ReadILOperand(il, instr, 1)}));
-			break;
-		}
-		else
 		{
-			LowLevelILLabel loopStart,
-					loopBody,
-					loopExit;
-			//Count leading zeros
-			//Based on the non-thumb CLZ lifter
-			//
-			// TEMP0 = 0
-			// TEMP1 = op2.reg
-			// while (TEMP1 != 0)
-			// 		TEMP1 = TEMP1 >> 1
-			// 		TEMP0 = TEMP0 + 1
-			// op1.reg = 32 - TEMP0
+			LowLevelILLabel loopStart, loopBody, loopExit;
+
+			// temp0 = 0 (bit counter)
 			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0), il.Const(4, 0)));
+			// temp1 = Rm (working copy)
 			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(1), ReadILOperand(il, instr, 1)));
-			il.AddInstruction(il.Goto(loopStart));
+
+			// Loop start
 			il.MarkLabel(loopStart);
-			il.AddInstruction(il.If(il.CompareNotEqual(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 0)), loopBody, loopExit));
+			// if (temp1 != 0) goto loopBody else loopExit
+			il.AddInstruction(il.If(
+				il.CompareNotEqual(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 0)),
+				loopBody, loopExit));
+
+			// Loop body: shift right and increment counter
 			il.MarkLabel(loopBody);
-			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(1), il.LogicalShiftRight(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 1))));
-			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0), il.Add(4, il.Register(4, LLIL_TEMP(0)), il.Const(4, 1))));
+			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(1),
+				il.LogicalShiftRight(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 1))));
+			il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0),
+				il.Add(4, il.Register(4, LLIL_TEMP(0)), il.Const(4, 1))));
 			il.AddInstruction(il.Goto(loopStart));
+
+			// Loop done: Rd = 32 - temp0
 			il.MarkLabel(loopExit);
-			il.AddInstruction(WriteILOperand(il, instr, 0, il.Sub(4, il.Const(4, 32), il.Register(4, LLIL_TEMP(0)))));
+			il.AddInstruction(WriteILOperand(il, instr, 0,
+				il.Sub(4, il.Const(4, 32), il.Register(4, LLIL_TEMP(0)))));
 			break;
 		}
 	case armv5::ARMV5_CMP:

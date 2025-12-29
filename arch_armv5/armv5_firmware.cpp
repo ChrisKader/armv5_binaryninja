@@ -125,48 +125,14 @@ static uint64_t DetectImageBaseFromVectorTable(BinaryView* data)
 		return 0;
 
 	const uint32_t* words = (const uint32_t*)buf.GetData();
-	uint32_t firstInstr = words[0];
 
-	// Check for LDR PC, [PC, #imm] pattern
-	if ((firstInstr & 0xFFFFF000) != 0xE59FF000)
-		return 0;
+	// Scan all 8 vectors for LDR PC, [PC, #imm] patterns with absolute addresses.
+	// Some binaries (like U-Boot) use B (branch) for reset vector but LDR PC for others.
+	// We need at least one LDR PC vector with an absolute address to detect the base.
+	uint64_t minHandlerAddr = UINT64_MAX;
+	int ldrPcCount = 0;
 
-	// Read the reset handler address (vector 0 - most reliable)
-	uint32_t vecOffset = firstInstr & 0xFFF;
-	uint64_t ptrAddr = 8 + vecOffset;  // PC + 8 + offset
-
-	if (ptrAddr + 4 > length)
-		return 0;
-
-	DataBuffer ptrBuf = data->ReadBuffer(ptrAddr, 4);
-	if (ptrBuf.GetLength() < 4)
-		return 0;
-
-	uint32_t resetHandlerAddr = *(const uint32_t*)ptrBuf.GetData();
-	resetHandlerAddr &= ~1u;  // Mask off Thumb bit
-
-	// If the handler address is within the file length, it's already file-relative
-	if (resetHandlerAddr < length)
-		return 0;
-
-	// The handler address is absolute. We need to find where in the file
-	// this handler's code actually lives.
-	//
-	// Strategy: The vector table pointer area ends around 0x20-0x3F.
-	// Code typically starts at 0x40 or later. Look for a function prologue
-	// (PUSH, STMFD, etc.) starting from 0x40 and assume that's where
-	// the lowest handler begins.
-	//
-	// A simpler approach: if all handler addresses share a common high portion,
-	// that's the image base. For example:
-	//   0x11217480, 0x1121bf10, 0x1121bf4c -> common prefix 0x11200000
-	//
-	// We'll find the minimum handler address and see how far into the file
-	// it could reasonably be, then calculate the base.
-
-	// Collect all handler addresses (only those that are absolute, i.e., >= file length)
-	uint64_t minHandlerAddr = resetHandlerAddr;
-	for (int i = 1; i < 8; i++)
+	for (int i = 0; i < 8; i++)
 	{
 		uint32_t vecInstr = words[i];
 		if ((vecInstr & 0xFFFFF000) == 0xE59FF000)
@@ -182,12 +148,20 @@ static uint64_t DetectImageBaseFromVectorTable(BinaryView* data)
 					addr &= ~1u;
 					// Only consider addresses that are absolute (>= file length)
 					// Skip file-relative addresses like 0x40
-					if (addr >= length && addr < minHandlerAddr)
-						minHandlerAddr = addr;
+					if (addr >= length)
+					{
+						ldrPcCount++;
+						if (addr < minHandlerAddr)
+							minHandlerAddr = addr;
+					}
 				}
 			}
 		}
 	}
+
+	// Need at least one LDR PC vector with an absolute address
+	if (ldrPcCount == 0 || minHandlerAddr == UINT64_MAX)
+		return 0;
 
 	// The minimum handler address tells us the earliest code location.
 	// The image base is: handlerAddr - (file offset of that handler)

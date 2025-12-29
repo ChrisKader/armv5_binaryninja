@@ -1791,13 +1791,50 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
         case ARMV5_POP:
             return LiftLoadStoreMultiple(arch, il, instr, addr, false);
 
-        /* CLZ */
+        /* CLZ - Count Leading Zeros
+         * Lifted as a loop like the official ARM architecture:
+         *   temp0 = 0 (counter)
+         *   temp1 = Rm (input)
+         * loop:
+         *   if (temp1 != 0) then { temp1 >>= 1; temp0++; goto loop; }
+         *   Rd = 32 - temp0
+         */
         case ARMV5_CLZ:
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Intrinsic({RegisterOrFlag::Register(RegisterToIndex(instr.operands[0].reg))},
-                        ARMV5_INTRIN_CLZ, {ILREG(1)})));
+        {
+            uint32_t rd = RegisterToIndex(instr.operands[0].reg);
+            uint32_t rm = RegisterToIndex(instr.operands[1].reg);
+
+            ConditionExecute(4, instr.cond, instr, il,
+                [rd, rm](size_t addrSize, Instruction& instr, LowLevelILFunction& il) {
+                    LowLevelILLabel loopStart, loopBody, loopDone;
+
+                    // temp0 = 0 (bit counter)
+                    il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0), il.Const(4, 0)));
+                    // temp1 = Rm (working copy)
+                    il.AddInstruction(il.SetRegister(4, LLIL_TEMP(1), il.Register(4, rm)));
+
+                    // Loop start
+                    il.MarkLabel(loopStart);
+                    // if (temp1 != 0) goto loopBody else loopDone
+                    il.AddInstruction(il.If(
+                        il.CompareNotEqual(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 0)),
+                        loopBody, loopDone));
+
+                    // Loop body: shift right and increment counter
+                    il.MarkLabel(loopBody);
+                    il.AddInstruction(il.SetRegister(4, LLIL_TEMP(1),
+                        il.LogicalShiftRight(4, il.Register(4, LLIL_TEMP(1)), il.Const(4, 1))));
+                    il.AddInstruction(il.SetRegister(4, LLIL_TEMP(0),
+                        il.Add(4, il.Register(4, LLIL_TEMP(0)), il.Const(4, 1))));
+                    il.AddInstruction(il.Goto(loopStart));
+
+                    // Loop done: Rd = 32 - temp0
+                    il.MarkLabel(loopDone);
+                    il.AddInstruction(il.SetRegister(4, rd,
+                        il.Sub(4, il.Const(4, 32), il.Register(4, LLIL_TEMP(0)))));
+                });
             return true;
+        }
 
         /* Software interrupt */
         case ARMV5_SWI:
@@ -1816,23 +1853,103 @@ bool GetLowLevelILForArmInstruction(Architecture* arch, uint64_t addr,
             il.AddInstruction(il.Nop());
             return true;
 
-        /* DSP saturating arithmetic - use intrinsics */
+        /* DSP saturating arithmetic - lifted as native LLIL with saturation logic
+         *
+         * QADD:   Rd = saturate(Rm + Rn)
+         * QSUB:   Rd = saturate(Rm - Rn)
+         * QDADD:  Rd = saturate(Rm + saturate(Rn * 2))
+         * QDSUB:  Rd = saturate(Rm - saturate(Rn * 2))
+         *
+         * Signed 32-bit saturation clamps to [0x80000000, 0x7FFFFFFF].
+         * We use 64-bit arithmetic to detect overflow, then clamp.
+         */
         case ARMV5_QADD:
         case ARMV5_QSUB:
         case ARMV5_QDADD:
-        case ARMV5_QDSUB: {
-            uint32_t intrinsic;
-            switch (instr.operation) {
-                case ARMV5_QADD: intrinsic = ARMV5_INTRIN_QADD; break;
-                case ARMV5_QSUB: intrinsic = ARMV5_INTRIN_QSUB; break;
-                case ARMV5_QDADD: intrinsic = ARMV5_INTRIN_QDADD; break;
-                case ARMV5_QDSUB: intrinsic = ARMV5_INTRIN_QDSUB; break;
-                default: intrinsic = ARMV5_INTRIN_QADD; break;
-            }
-            ConditionExecute(il, instr.cond,
-                il.SetRegister(4, RegisterToIndex(instr.operands[0].reg),
-                    il.Intrinsic({RegisterOrFlag::Register(RegisterToIndex(instr.operands[0].reg))},
-                        intrinsic, {ILREG(1), ILREG(2)})));
+        case ARMV5_QDSUB:
+        {
+            uint32_t rd = RegisterToIndex(instr.operands[0].reg);
+            uint32_t rm = RegisterToIndex(instr.operands[1].reg);
+            uint32_t rn = RegisterToIndex(instr.operands[2].reg);
+            bool isAdd = (instr.operation == ARMV5_QADD || instr.operation == ARMV5_QDADD);
+            bool isDouble = (instr.operation == ARMV5_QDADD || instr.operation == ARMV5_QDSUB);
+
+            ConditionExecute(4, instr.cond, instr, il,
+                [rd, rm, rn, isAdd, isDouble](size_t addrSize, Instruction& instr, LowLevelILFunction& il) {
+                    LowLevelILLabel checkNegOvf, setNegOvf, noOverflow, done;
+
+                    // temp0 = sign_extend_64(Rm)
+                    il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0),
+                        il.SignExtend(8, il.Register(4, rm))));
+
+                    // temp1 = sign_extend_64(Rn) or sign_extend_64(Rn * 2) with saturation
+                    if (isDouble) {
+                        // For QDADD/QDSUB: compute Rn * 2 in 64-bit, then saturate to 32-bit range
+                        LowLevelILLabel dblCheckNeg, dblSetNeg, dblNoOvf, dblDone;
+
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1),
+                            il.Mult(8, il.SignExtend(8, il.Register(4, rn)), il.Const(8, 2))));
+
+                        // Check positive overflow: temp1 > 0x7FFFFFFF
+                        il.AddInstruction(il.If(
+                            il.CompareSignedGreaterThan(8, il.Register(8, LLIL_TEMP(1)), il.Const(8, 0x7FFFFFFF)),
+                            dblCheckNeg, dblNoOvf));
+
+                        // Not positive overflow, check negative
+                        il.MarkLabel(dblCheckNeg);
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1), il.Const(8, 0x7FFFFFFF)));
+                        il.AddInstruction(il.Goto(dblDone));
+
+                        il.MarkLabel(dblNoOvf);
+                        il.AddInstruction(il.If(
+                            il.CompareSignedLessThan(8, il.Register(8, LLIL_TEMP(1)), il.Const(8, (int64_t)(int32_t)0x80000000)),
+                            dblSetNeg, dblDone));
+
+                        il.MarkLabel(dblSetNeg);
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1), il.Const(8, (int64_t)(int32_t)0x80000000)));
+
+                        il.MarkLabel(dblDone);
+                    } else {
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(1),
+                            il.SignExtend(8, il.Register(4, rn))));
+                    }
+
+                    // temp2 = temp0 +/- temp1 (64-bit result)
+                    if (isAdd) {
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(2),
+                            il.Add(8, il.Register(8, LLIL_TEMP(0)), il.Register(8, LLIL_TEMP(1)))));
+                    } else {
+                        il.AddInstruction(il.SetRegister(8, LLIL_TEMP(2),
+                            il.Sub(8, il.Register(8, LLIL_TEMP(0)), il.Register(8, LLIL_TEMP(1)))));
+                    }
+
+                    // Saturate final result
+                    // Check positive overflow: temp2 > 0x7FFFFFFF
+                    il.AddInstruction(il.If(
+                        il.CompareSignedGreaterThan(8, il.Register(8, LLIL_TEMP(2)), il.Const(8, 0x7FFFFFFF)),
+                        checkNegOvf, noOverflow));
+
+                    // Positive overflow path - but we jumped wrong way, fix labels
+                    il.MarkLabel(checkNegOvf);
+                    il.AddInstruction(il.SetRegister(4, rd, il.Const(4, 0x7FFFFFFF)));
+                    il.AddInstruction(il.Goto(done));
+
+                    // Check negative overflow
+                    il.MarkLabel(noOverflow);
+                    il.AddInstruction(il.If(
+                        il.CompareSignedLessThan(8, il.Register(8, LLIL_TEMP(2)), il.Const(8, (int64_t)(int32_t)0x80000000)),
+                        setNegOvf, done));
+
+                    il.MarkLabel(setNegOvf);
+                    il.AddInstruction(il.SetRegister(4, rd, il.Const(4, 0x80000000)));
+                    il.AddInstruction(il.Goto(done));
+
+                    // No overflow: Rd = low32(temp2)
+                    il.MarkLabel(done);
+                    il.AddInstruction(il.SetRegister(4, rd,
+                        il.LowPart(4, il.Register(8, LLIL_TEMP(2)))));
+                });
+
             return true;
         }
 
