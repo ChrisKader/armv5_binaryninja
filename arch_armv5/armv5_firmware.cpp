@@ -530,24 +530,22 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 
 	// Helper to add a function if not already added and target is valid
 	auto addFunction = [&](uint64_t funcAddr, const char* source) {
-		// Mask off Thumb bit for validation
-		uint64_t alignedAddr = funcAddr & ~1ULL;
+		// For ARM mode, addresses must be 4-byte aligned.
+		// Strip any Thumb bit and reject misaligned addresses.
+		uint64_t alignedAddr = funcAddr & ~3ULL;
 
 		// Must be within image bounds
 		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
 			return;
 
-		// Must be properly aligned (4-byte for ARM, 2-byte for Thumb)
-		bool isThumb = (funcAddr & 1) != 0;
-		if (isThumb && (alignedAddr & 1) != 0)
-			return;  // Thumb must be 2-byte aligned
-		if (!isThumb && (alignedAddr & 3) != 0)
-			return;  // ARM must be 4-byte aligned
+		// Reject misaligned addresses - these cause slow analysis
+		if (funcAddr & 3)
+			return;
 
-		if (addedAddrs.find(funcAddr) == addedAddrs.end())
+		if (addedAddrs.find(alignedAddr) == addedAddrs.end())
 		{
-			view->AddFunctionForAnalysis(plat, funcAddr);
-			addedAddrs.insert(funcAddr);
+			view->AddFunctionForAnalysis(plat, alignedAddr);
+			addedAddrs.insert(alignedAddr);
 			targetsFound++;
 		}
 	};
