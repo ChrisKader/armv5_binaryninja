@@ -43,6 +43,14 @@ LLIL_ARM_TESTS = [
 
     # NOP (mov r0, r0) - optimized to empty by BN since we decode as ARMV5_NOP
     (b'\x00\x00\xa0\xe1', ''),
+
+    # Branch instructions
+    # bx lr -> return
+    (b'\x1e\xff\x2f\xe1', 'LLIL_RET(LLIL_REG(lr))'),
+    # bx r0 -> tailcall(r0)
+    (b'\x10\xff\x2f\xe1', 'LLIL_TAILCALL(LLIL_REG(r0))'),
+    # blx r0 -> call(r0)
+    (b'\x30\xff\x2f\xe1', 'LLIL_CALL(LLIL_REG(r0))'),
 ]
 
 # Instructions that should be rejected as likely data (IsLikelyData returns true)
@@ -130,6 +138,108 @@ def test_llil_arm(data, expected, binaryninja_module):
     """Test ARM mode LLIL lifting."""
     actual = instr_to_il(data, 'armv5', binaryninja_module)
     assert actual == expected, f"LLIL mismatch for {data.hex()}: expected '{expected}', got '{actual}'"
+
+
+@pytest.mark.requires_binaryninja
+def test_conditional_bx_sequence(binaryninja_module):
+    """Test conditional BX with fallthrough - a known crash case for malformed LLIL.
+
+    Code: CMP r0,#0; BXEQ lr; ADD r0,r0,#1; BX lr
+    This forces a conditional early-return with fallthrough.
+
+    The crash happens during CFG rebuilding when:
+    - A conditional BX creates a block that "returns but also falls through"
+    - BN tries to reanalyze and the malformed CFG causes infinite recursion
+
+    This test explicitly triggers reanalysis to catch the crash.
+    """
+    # CMP r0,#0; BXEQ lr; ADD r0,r0,#1; BX lr
+    code = bytes.fromhex('000050e3' '1eff2f01' '010080e2' '1eff2fe1')
+
+    arch = binaryninja_module.Architecture['armv5']
+    bv = binaryninja_module.binaryview.BinaryView.new(code)
+    bv.add_function(0, plat=arch.standalone_platform)
+
+    assert len(bv.functions) == 1, "Function should be created"
+    func = bv.functions[0]
+
+    # First analysis pass
+    bv.update_analysis_and_wait()
+
+    # Collect LLIL before reanalysis
+    all_il_before = []
+    for block in func.low_level_il:
+        for il in block:
+            all_il_before.append(str(il))
+
+    # Force reanalysis - this is where malformed LLIL crashes
+    func.reanalyze()
+    bv.update_analysis_and_wait()
+
+    # Collect LLIL after reanalysis
+    all_il_after = []
+    for block in func.low_level_il:
+        for il in block:
+            all_il_after.append(str(il))
+
+    # Verify we have the expected structure:
+    # - A conditional (if flag:z)
+    # - Two return paths (conditional and unconditional)
+    il_text = '; '.join(all_il_after)
+    assert 'if (flag:z)' in il_text, f"Expected conditional on z flag, got: {il_text}"
+    assert il_text.count('jump(lr)') == 2, f"Expected 2 returns, got: {il_text}"
+
+    # LLIL should be stable across reanalysis
+    assert all_il_before == all_il_after, "LLIL changed after reanalysis"
+
+
+@pytest.mark.requires_binaryninja
+def test_conditional_pc_write_sequence(binaryninja_module):
+    """Test conditional PC write (MOV PC, LR) - tests SetRegisterOrBranch with PC.
+
+    Code: CMP r0,#0; MOVEQ pc,lr; ADD r0,r0,#1; BX lr
+    This is a data-processing instruction writing PC conditionally.
+
+    This hits ConditionExecuteSetRegisterOrBranch() and if PC writes
+    aren't treated as terminators, BN will crash during reanalysis.
+    """
+    # CMP r0,#0; MOVEQ pc,lr; ADD r0,r0,#1; BX lr
+    code = bytes.fromhex('000050e3' '0ef0a001' '010080e2' '1eff2fe1')
+
+    arch = binaryninja_module.Architecture['armv5']
+    bv = binaryninja_module.binaryview.BinaryView.new(code)
+    bv.add_function(0, plat=arch.standalone_platform)
+
+    assert len(bv.functions) == 1, "Function should be created"
+    func = bv.functions[0]
+
+    # First analysis pass
+    bv.update_analysis_and_wait()
+
+    # Collect LLIL before reanalysis
+    all_il_before = []
+    for block in func.low_level_il:
+        for il in block:
+            all_il_before.append(str(il))
+
+    # Force reanalysis - this is where malformed LLIL crashes
+    func.reanalyze()
+    bv.update_analysis_and_wait()
+
+    # Collect LLIL after reanalysis
+    all_il_after = []
+    for block in func.low_level_il:
+        for il in block:
+            all_il_after.append(str(il))
+
+    # Verify we have the expected structure:
+    # - A conditional (if flag:z)
+    # - Two paths that end execution (jump to lr)
+    il_text = '; '.join(all_il_after)
+    assert 'if (flag:z)' in il_text, f"Expected conditional on z flag, got: {il_text}"
+
+    # LLIL should be stable across reanalysis
+    assert all_il_before == all_il_after, "LLIL changed after reanalysis"
 
 
 @pytest.mark.parametrize("data,expected", LLIL_LIKELY_DATA_TESTS)

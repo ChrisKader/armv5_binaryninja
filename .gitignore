@@ -29,3 +29,5 @@ bnlog
 __pycache__/
 .pytest_cache/
 *.pyc
+
+ISSUES.md
