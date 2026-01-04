@@ -557,16 +557,21 @@ static ExprId GetMemoryAddress(LowLevelILFunction &il, const Instruction &instr,
             switch (op.shift)
             {
             case SHIFT_LSL:
-                offset = il.ShiftLeft(4, offset, il.Const(4, op.imm));
+                offset = il.ShiftLeft(4, offset, il.Const(1, op.imm));
                 break;
             case SHIFT_LSR:
-                offset = il.LogicalShiftRight(4, offset, il.Const(4, op.imm));
+                offset = il.LogicalShiftRight(4, offset, il.Const(1, op.imm));
                 break;
             case SHIFT_ASR:
-                offset = il.ArithShiftRight(4, offset, il.Const(4, op.imm));
+                offset = il.ArithShiftRight(4, offset, il.Const(1, op.imm));
                 break;
             case SHIFT_ROR:
-                offset = il.RotateRight(4, offset, il.Const(4, op.imm));
+                offset = il.RotateRight(4, offset, il.Const(1, op.imm));
+                break;
+            case SHIFT_RRX:
+                offset = il.Or(4,
+                               il.LogicalShiftRight(4, offset, il.Const(1, 1)),
+                               il.ShiftLeft(4, il.Flag(IL_FLAG_C), il.Const(1, 31)));
                 break;
             default:
                 break;
@@ -805,11 +810,9 @@ bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
     {
     case ARMV5_B:
     {
-        bool isUnconditional = (instr.cond == COND_AL);
-
         ConditionalJump(arch, il, instr.cond, addrSize, instr.operands[0].imm);
 
-        return isUnconditional ? false : true;
+        return true;
     }
 
     case ARMV5_BL:
@@ -851,8 +854,7 @@ bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
                              il.TailCall(ReadRegisterOrPointer(il, rm, addr)));
         }
 
-        /* Unconditional: no fallthrough. Conditional: fallthrough on false path */
-        return !IsUnconditional(instr.cond);
+        return true;
     }
 
     default:

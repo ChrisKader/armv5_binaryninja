@@ -11,6 +11,7 @@
 #include <map>
 #include <cstring>
 
+#include <cstdint>
 using namespace std;
 using namespace BinaryNinja;
 
@@ -243,9 +244,9 @@ struct MemRegion {
  *
  * Detected ARM function prologues:
  *
- * Pattern 1: STMFD/PUSH sp!, {..., lr} with 3+ registers including callee-saved
- *   Encoding: 0xE92D4xxx where reglist includes r4-r11
- *   Example: push {r4, r5, lr} = 0xE92D4030
+ * Pattern 1: STMFD/PUSH sp!, {..., lr} with 2+ registers including lr
+ *   Encoding: 0xE92D4xxx where reglist includes lr
+ *   Example: push {r4, lr} = 0xE92D4010
  *
  * Pattern 1b: STMFD/PUSH sp!, {r0-r3, ip, lr} with 3+ scratch registers only
  *   Encoding: 0xE92D4xxx where reglist has 3+ regs but no r4-r11
@@ -254,7 +255,6 @@ struct MemRegion {
  *
  * Pattern 2: STMFD/PUSH sp!, {rX, lr} with 2 registers
  *   Encoding: 0xE92D40xx where popcount(reglist) == 2
- *   Example: push {r4, lr} = 0xE92D4010
  *   Common for small leaf functions that only need one callee-saved register
  *
  * Pattern 3: MOV ip, sp followed by STMFD with fp and lr
@@ -263,28 +263,26 @@ struct MemRegion {
  *
  * Pattern 4: STR lr, [sp, #-4]! followed by SUB sp, sp, #imm
  *   Encoding: 0xE52DE004 followed by 0xE24DD0xx
- *   Two-instruction prologue for stack frame allocation
- *   Example: str lr, [sp, #-4]! + sub sp, sp, #0x2c
+ *   Common for small leaf functions and for stack frame allocation
  *
- * Pattern 5: MRS Rx, CPSR (when preceded by a return instruction)
+ * Pattern 5: MRS Rx, CPSR (when preceded by a boundary instruction)
  *   Encoding: 0xE10Fx000 (MRS Rd, CPSR)
  *   Interrupt enable/disable utility functions
- *   Only detected when immediately following BX LR, MOV PC LR, or POP {..., pc}
+ *   Only detected when immediately following a return or unconditional branch
  *
  * Pattern 6: MOV/MVN Rd, #imm followed by BX LR (short return-value function)
  *   Encoding: 0xE3A0xxxx or 0xE3E0xxxx followed by 0xE12FFF1E
  *   Example: mov r0, #0 + bx lr (return 0 function)
- *   Only detected when preceded by a return instruction (function boundary)
+ *   Only detected when preceded by a boundary instruction
  *
- * Pattern 7: MCR/MRC (coprocessor access) when preceded by a return
+ * Pattern 7: MCR/MRC (coprocessor access) when preceded by a boundary instruction
  *   Encoding: 0xEE....10 (MCR) or 0xEE....10 (MRC)
  *   System register accessor functions (CP15, etc.)
- *   Only detected when immediately following a return instruction
+ *   Only detected when immediately following a boundary instruction
  *
  * NOT detected (high false positive rate):
- *   - STR lr, [sp, #-4]! alone (appears in data as SRAM addresses 0xE52Dxxxx)
+ *   - Single-instruction stack adjustments or literal loads
  *   - Thumb prologues (0xB5xx appears frequently in ARM literals)
- *   - MOV/LDR after return without verification (could be data)
  *
  * Returns the number of function prologues found.
  */
@@ -304,6 +302,8 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	auto addFunction = [&](uint64_t funcAddr) {
 		if (addedAddrs.find(funcAddr) == addedAddrs.end())
 		{
+			if (!view->GetAnalysisFunctionsContainingAddress(funcAddr).empty())
+				return;
 			view->AddFunctionForAnalysis(plat, funcAddr);
 			addedAddrs.insert(funcAddr);
 			prologuesFound++;
@@ -313,7 +313,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	logger->LogInfo("Prologue scan: Scanning for function prologues in %llu bytes",
 		(unsigned long long)(length - startOffset));
 
-	// Track the previous instruction for MRS detection
+	// Track the previous instruction for boundary-based patterns
 	uint32_t prevInstr = 0;
 
 	// Scan for ARM prologues (4-byte aligned)
@@ -329,7 +329,50 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 		bool isPrologue = false;
 
-		// Pattern 1, 1b & 2: STMFD/STMDB/PUSH sp!, {..., lr}
+		auto isReturnInstr = [](uint32_t ins) -> bool {
+			// BX Rn = 0xE12FFF1x (BX LR = 0xE12FFF1E)
+			if ((ins & 0x0FFFFFF0) == 0x012FFF10)
+				return true;
+			// MOV PC, LR = 0xE1A0F00E
+			if (ins == 0xE1A0F00E)
+				return true;
+			// LDMFD sp!, {..., pc} = 0xE8BD8xxx (POP with pc)
+			if ((ins & 0xFFFF0000) == 0xE8BD0000 && (ins & 0x8000))
+				return true;
+			// LDMFD Rn!, {..., pc} = 0xE8B.8xxx (more general POP with pc)
+			if ((ins & 0x0FFF0000) == 0x08B00000 && (ins & 0x8000))
+				return true;
+			return false;
+		};
+
+		auto isBoundaryInstr = [&](uint32_t ins) -> bool {
+			if (isReturnInstr(ins))
+				return true;
+			// Unconditional B = 0xEAxxxxxx
+			if ((ins & 0xFF000000) == 0xEA000000)
+				return true;
+			return false;
+		};
+
+		auto isValidArmInstruction = [&](uint32_t ins, uint64_t addr) -> bool {
+			armv5::Instruction decoded;
+			memset(&decoded, 0, sizeof(decoded));
+			return armv5::armv5_decompose(ins, &decoded, (uint32_t)addr, 0) == 0;
+		};
+
+		bool prevIsBoundary = isBoundaryInstr(prevInstr);
+		if (!prevIsBoundary && offset >= 4)
+		{
+			uint32_t prevWord = prevInstr;
+			if (prevWord == 0 || prevWord == 0xFFFFFFFF)
+				prevIsBoundary = true;
+			else if (!isValidArmInstruction(prevWord, offset - 4))
+				prevIsBoundary = true;
+		}
+		if (offset == startOffset)
+			prevIsBoundary = true;
+
+		// Pattern 1: STMFD/STMDB/PUSH sp!, {..., lr} with 2+ registers
 		// Encoding: cond 100 P U S W L Rn reglist
 		// STMFD sp! = 1001 0010 1101 xxxx = 0xE92Dxxxx
 		// Must have LR (bit 14) in register list
@@ -337,23 +380,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		{
 			uint32_t reglist = instr & 0xFFFF;
 			int regCount = __builtin_popcount(reglist);
-
-			// Pattern 1: 3+ registers with at least one callee-saved (r4-r11)
-			// This is the most common prologue pattern
-			bool hasCalleeSaved = (reglist & 0x0FF0) != 0;
-			if (regCount >= 3 && hasCalleeSaved)
-				isPrologue = true;
-
-			// Pattern 1b: 3+ registers with scratch only (r0-r3, ip)
-			// Common for wrapper/thunk functions: push {r0, r1, r2, lr}
-			// These save args before calling another function
-			if (regCount >= 3 && !hasCalleeSaved)
-				isPrologue = true;
-
-			// Pattern 2: Exactly 2 registers including lr
-			// Common for small leaf functions: push {r4, lr}, push {r3, lr}, etc.
-			// Less restrictive - accepts any 2-register push with lr
-			if (regCount == 2)
+			if (regCount >= 2 && prevIsBoundary)
 				isPrologue = true;
 		}
 
@@ -378,7 +405,6 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 		// Pattern 4: STR lr, [sp, #-4]! followed by SUB sp, sp, #imm
 		// Encoding: 0xE52DE004 followed by 0xE24DD0xx
-		// This two-instruction sequence is very reliable and won't match data
 		if (instr == 0xE52DE004)
 		{
 			if (offset + 8 <= dataLen)
@@ -388,7 +414,6 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 				if (endian == BigEndian)
 					nextInstr = Swap32(nextInstr);
 
-				// SUB sp, sp, #imm = 0xE24DD0xx
 				if ((nextInstr & 0xFFFFF000) == 0xE24DD000)
 					isPrologue = true;
 			}
@@ -401,22 +426,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Mask: 0x0FBF0FFF (ignore condition and Rd)
 		if ((instr & 0x0FBF0FFF) == 0x010F0000)
 		{
-			// Check if previous instruction was a return
-			bool prevIsReturn = false;
-
-			// BX LR = 0xE12FFF1E (or conditional variants)
-			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
-				prevIsReturn = true;
-
-			// MOV PC, LR = 0xE1A0F00E
-			if (prevInstr == 0xE1A0F00E)
-				prevIsReturn = true;
-
-			// LDMFD sp!, {..., pc} = 0xE8BD8xxx (POP with pc)
-			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
-				prevIsReturn = true;
-
-			if (prevIsReturn)
+			if (prevIsBoundary)
 				isPrologue = true;
 		}
 
@@ -426,16 +436,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Only detected when preceded by a return (function boundary)
 		if ((instr & 0x0FE00000) == 0x03A00000 || (instr & 0x0FE00000) == 0x03E00000)
 		{
-			// Check if preceded by a return
-			bool prevIsReturn = false;
-			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
-				prevIsReturn = true;
-			if (prevInstr == 0xE1A0F00E)
-				prevIsReturn = true;
-			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
-				prevIsReturn = true;
-
-			if (prevIsReturn && offset + 8 <= dataLen)
+			if (prevIsBoundary && offset + 8 <= dataLen)
 			{
 				// Check if followed by BX LR
 				uint32_t nextInstr = 0;
@@ -456,16 +457,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Mask: check for 0xEE......1. pattern
 		if ((instr & 0x0F000010) == 0x0E000010)
 		{
-			// Check if preceded by a return
-			bool prevIsReturn = false;
-			if ((prevInstr & 0x0FFFFFFF) == 0x012FFF1E)
-				prevIsReturn = true;
-			if (prevInstr == 0xE1A0F00E)
-				prevIsReturn = true;
-			if ((prevInstr & 0xFFFF0000) == 0xE8BD0000 && (prevInstr & 0x8000))
-				prevIsReturn = true;
-
-			if (prevIsReturn)
+			if (prevIsBoundary)
 				isPrologue = true;
 		}
 
@@ -538,9 +530,54 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
 			return;
 
+		// Only add functions in code semantics
+		if (!view->IsOffsetCodeSemantics(alignedAddr))
+			return;
+
+		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
+			return;
+
 		// Reject misaligned addresses - these cause slow analysis
 		if (funcAddr & 3)
 			return;
+
+		// Validate target looks like valid ARM code
+		uint64_t offset = alignedAddr - imageBase;
+		if (offset + 4 <= dataLen)
+		{
+			uint32_t targetInstr = 0;
+			memcpy(&targetInstr, data + offset, sizeof(targetInstr));
+			if (endian == BigEndian)
+				targetInstr = Swap32(targetInstr);
+
+			// Skip if target is all zeros (BSS/uninitialized data)
+			if (targetInstr == 0)
+				return;
+
+			// Skip if target is all 0xFF (erased flash)
+			if (targetInstr == 0xFFFFFFFF)
+				return;
+
+			// In ARMv5, condition code 0b1111 (0xFxxxxxxx) is mostly undefined
+			// except for a few specific encodings. Most valid ARM code uses
+			// condition codes 0x0-0xE. Skip obvious non-code.
+			uint32_t cond = (targetInstr >> 28) & 0xF;
+			if (cond == 0xF)
+			{
+				// Only a few 0xF instructions are valid in ARMv5:
+				// - BLX imm (0xFAxxxxxx, 0xFBxxxxxx)
+				// - PLD (0xF55FF000 pattern)
+				// Most other 0xFxxxxxxx patterns are undefined
+				uint32_t op = (targetInstr >> 24) & 0xFF;
+				if (op != 0xFA && op != 0xFB)
+					return;  // Likely data, not code
+			}
+
+			// Additional heuristic: very unlikely instruction patterns
+			// ANDEQ r0, r0, r0 with random high bits often indicates data
+			if ((targetInstr & 0x0FFFFFFF) == 0x00000000 && cond != 0xE)
+				return;
+		}
 
 		if (addedAddrs.find(alignedAddr) == addedAddrs.end())
 		{
@@ -550,8 +587,41 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		}
 	};
 
+	// Helper to check if an instruction looks like valid ARM code
+	// Returns true if the instruction has a valid condition code and
+	// doesn't match common literal pool patterns
+	auto isLikelyCode = [&](uint32_t instr) -> bool {
+		uint32_t cond = (instr >> 28) & 0xF;
+
+		// Condition 0xF is mostly undefined in ARMv5
+		if (cond == 0xF)
+		{
+			uint32_t op = (instr >> 24) & 0xFF;
+			if (op != 0xFA && op != 0xFB)  // Only BLX is valid
+				return false;
+		}
+
+		// All zeros or all ones is data
+		if (instr == 0 || instr == 0xFFFFFFFF)
+			return false;
+
+		// Check for address-like patterns (literal pool entries)
+		uint32_t highByte = (instr >> 24) & 0xFF;
+		if ((highByte == 0x10 || highByte == 0x11 || highByte == 0x12 ||
+		     highByte == 0x13 || highByte == 0xA4) && (instr & 0x3) == 0)
+			return false;  // Likely an aligned address
+
+		return true;
+	};
+
+	// Track previous instruction for context checking
+	uint32_t prevInstr = 0;
+
+	// Skip vector table and pointer table regions
+	uint64_t startOffset = 0x40;
+
 	// Scan for ARM call instructions (4-byte aligned)
-	for (uint64_t offset = 0; offset + 4 <= length; offset += 4)
+	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
 	{
 		uint32_t instr = 0;
 		if (offset + 4 <= dataLen)
@@ -568,35 +638,28 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		// Mask: 0x0F000000, value: 0x0B000000
 		if ((instr & 0x0F000000) == 0x0B000000 && (instr & 0xF0000000) != 0xF0000000)
 		{
-			// Extract 24-bit signed offset, shift left 2, add to PC+8
-			int32_t imm24 = instr & 0x00FFFFFF;
-			// Sign-extend from 24 bits
-			if (imm24 & 0x00800000)
-				imm24 |= 0xFF000000;
-			int32_t offset_bytes = imm24 << 2;
-			uint64_t target = instrAddr + 8 + offset_bytes;
+			// Only trust BL if the previous instruction also looks like code
+			// This filters out BL-like patterns in literal pools
+			if (offset >= 4 && isLikelyCode(prevInstr))
+			{
+				// Extract 24-bit signed offset, shift left 2, add to PC+8
+				int32_t imm24 = instr & 0x00FFFFFF;
+				// Sign-extend from 24 bits
+				if (imm24 & 0x00800000)
+					imm24 |= 0xFF000000;
+				int32_t offset_bytes = imm24 << 2;
+				uint64_t target = instrAddr + 8 + offset_bytes;
 
-			addFunction(target, "BL");
+				addFunction(target, "BL");
+			}
 		}
 
 		// Pattern 2: BLX imm (ARM to Thumb call)
 		// Encoding: 1111 101 H imm24
 		// H bit (bit 24) adds 2 to the offset for Thumb alignment
-		if ((instr & 0xFE000000) == 0xFA000000)
-		{
-			int32_t imm24 = instr & 0x00FFFFFF;
-			if (imm24 & 0x00800000)
-				imm24 |= 0xFF000000;
-			int32_t offset_bytes = imm24 << 2;
-			// H bit adds 2 for Thumb halfword alignment
-			if (instr & 0x01000000)
-				offset_bytes += 2;
-			uint64_t target = instrAddr + 8 + offset_bytes;
-			// Set Thumb bit
-			target |= 1;
-
-			addFunction(target, "BLX");
-		}
+		// NOTE: For ARMv5 firmware with no Thumb code, we skip BLX entirely
+		// since it shouldn't exist in pure ARM binaries
+		// if ((instr & 0xFE000000) == 0xFA000000) { ... }
 
 		// Pattern 3: LDR PC, [PC, #imm] (indirect jump via literal pool)
 		// Encoding: cond 0101 U001 1111 1111 imm12
@@ -604,30 +667,128 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		// Example: LDR PC, [PC, #0x10] = 0xE59FF010
 		if ((instr & 0x0F7FF000) == 0x051FF000)
 		{
-			uint32_t imm12 = instr & 0xFFF;
-			bool add = (instr & 0x00800000) != 0;
-			// PC reads as instrAddr + 8 in ARM mode
-			uint64_t litPoolAddr = add ? (instrAddr + 8 + imm12) : (instrAddr + 8 - imm12);
-
-			// Read the literal pool entry
-			if (litPoolAddr >= imageBase && litPoolAddr + 4 <= imageBase + length)
+			// Only trust LDR PC if preceded by valid code
+			if (offset >= 4 && isLikelyCode(prevInstr))
 			{
-				uint64_t litPoolOffset = litPoolAddr - imageBase;
-				if (litPoolOffset + 4 <= dataLen)
-				{
-					uint32_t target = 0;
-					memcpy(&target, data + litPoolOffset, sizeof(target));
-					if (endian == BigEndian)
-						target = Swap32(target);
+				uint32_t imm12 = instr & 0xFFF;
+				bool add = (instr & 0x00800000) != 0;
+				// PC reads as instrAddr + 8 in ARM mode
+				uint64_t litPoolAddr = add ? (instrAddr + 8 + imm12) : (instrAddr + 8 - imm12);
 
-					// Add as function (preserving Thumb bit if present)
-					addFunction(target, "LDR PC");
+				// Read the literal pool entry
+				if (litPoolAddr >= imageBase && litPoolAddr + 4 <= imageBase + length)
+				{
+					uint64_t litPoolOffset = litPoolAddr - imageBase;
+					if (litPoolOffset + 4 <= dataLen)
+					{
+						uint32_t target = 0;
+						memcpy(&target, data + litPoolOffset, sizeof(target));
+						if (endian == BigEndian)
+							target = Swap32(target);
+
+						// Add as function (preserving Thumb bit if present)
+						addFunction(target, "LDR PC");
+					}
 				}
 			}
 		}
+
+		// Remember this instruction for next iteration
+		prevInstr = instr;
 	}
 
 	logger->LogInfo("Call target scan: Found %zu call targets", targetsFound);
+	return targetsFound;
+}
+
+/*
+ * Scan for 32-bit pointers that reference executable code and add them as functions.
+ *
+ * This discovers entry points that are only referenced from data (e.g. tables),
+ * which is common in firmware and boot ROMs.
+ *
+ * Returns the number of pointer targets found.
+ */
+static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
+	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
+	Ref<Platform> plat, Ref<Logger> logger)
+{
+	size_t targetsFound = 0;
+	std::set<uint64_t> addedAddrs;
+
+	uint64_t imageEnd = imageBase + length;
+	uint8_t minHigh = (uint8_t)(imageBase >> 24);
+	uint8_t maxHigh = (uint8_t)((imageEnd - 1) >> 24);
+
+	auto addFunction = [&](uint64_t funcAddr) {
+		uint64_t alignedAddr = funcAddr & ~3ULL;
+		if (alignedAddr < imageBase || alignedAddr >= imageEnd)
+			return;
+		if (!view->IsOffsetCodeSemantics(alignedAddr))
+			return;
+		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
+			return;
+		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
+			return;
+		view->AddFunctionForAnalysis(plat, alignedAddr);
+		addedAddrs.insert(alignedAddr);
+		targetsFound++;
+	};
+
+	auto isValidTarget = [&](uint64_t targetAddr) -> bool {
+		if (targetAddr < imageBase || targetAddr + 4 > imageEnd)
+			return false;
+		uint64_t targetOffset = targetAddr - imageBase;
+		if (targetOffset + 4 > dataLen)
+			return false;
+		uint32_t targetInstr = 0;
+		memcpy(&targetInstr, data + targetOffset, sizeof(targetInstr));
+		if (endian == BigEndian)
+			targetInstr = Swap32(targetInstr);
+		if (targetInstr == 0 || targetInstr == 0xFFFFFFFF)
+			return false;
+		uint32_t cond = (targetInstr >> 28) & 0xF;
+		if (cond == 0xF)
+		{
+			uint32_t op = (targetInstr >> 24) & 0xFF;
+			if (op != 0xFA && op != 0xFB)
+				return false;
+		}
+		armv5::Instruction decoded;
+		memset(&decoded, 0, sizeof(decoded));
+		return armv5::armv5_decompose(targetInstr, &decoded, (uint32_t)targetOffset, 0) == 0;
+	};
+
+	// Skip vector table area; those entries are handled explicitly.
+	uint64_t startOffset = 0x40;
+	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
+	{
+		uint64_t locationAddr = imageBase + offset;
+		if (view->IsOffsetCodeSemantics(locationAddr))
+			continue;
+
+		uint32_t value = 0;
+		if (offset + 4 <= dataLen)
+		{
+			memcpy(&value, data + offset, sizeof(value));
+			if (endian == BigEndian)
+				value = Swap32(value);
+		}
+		if (value == 0 || value == 0xFFFFFFFF)
+			continue;
+		if ((value & 3) != 0)
+			continue;
+		if (value < imageBase || value >= imageEnd)
+			continue;
+		uint8_t high = (uint8_t)(value >> 24);
+		if (high < minHigh || high > maxHigh)
+			continue;
+
+		if (isValidTarget(value))
+			addFunction(value);
+	}
+
+	logger->LogInfo("Pointer target scan: Found %zu pointer targets", targetsFound);
 	return targetsFound;
 }
 
@@ -1936,14 +2097,15 @@ bool Armv5FirmwareView::Init()
 		// Analyze MMU configuration to discover memory regions
 		AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
 
-		// Scan for reliable function prologues to seed recursive descent analysis.
-		// This uses conservative patterns to minimize false positives:
-		// - STMFD with 3+ registers including callee-saved regs
-		// - MOV ip, sp + STMFD (APCS prologue)
-		// These high-confidence entry points are then expanded via call graph traversal.
+		// Scan for common function entry patterns to seed recursive descent analysis.
+		// These entry points are then expanded via call graph traversal.
 		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
 		ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
 			m_arch, thumbArch, m_plat, m_logger);
+
+		// Scan for pointer targets in data that reference executable code.
+		ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+			m_plat, m_logger);
 
 		// Scan for BL/BLX/LDR PC call targets to discover additional functions.
 		// This finds functions that are called but may not have recognizable prologues
@@ -2043,6 +2205,22 @@ bool Armv5FirmwareViewType::IsTypeValidForData(BinaryView* data)
 	const uint32_t* code = (const uint32_t*)codeBuf.GetData();
 	size_t numWords = scanSize / 4;
 
+// Build a cheap heuristic for "pointer-looking" words by learning the high byte(s)
+// used in the vector pointer table (0x20-0x3F). Those entries are addresses, not instructions.
+bool pointerHighByte[256] = {false};
+if (numWords >= (0x40 / 4))
+{
+	for (size_t j = (0x20 / 4); j < (0x40 / 4) && j < numWords; j++)
+	{
+		uint32_t w = code[j];
+		if (w == 0)
+			continue;
+		// Most pointers are word-aligned; use that to avoid learning noise from constants.
+		if ((w & 0x3) == 0)
+			pointerHighByte[(uint8_t)(w >> 24)] = true;
+	}
+}
+
 	int validInstructions = 0;
 	int unknownInstructions = 0;
 
@@ -2059,10 +2237,10 @@ bool Armv5FirmwareViewType::IsTypeValidForData(BinaryView* data)
 		if (instr == 0 || (instr & 0xFFFF0000) == 0)
 			continue;
 
-		// Skip values that look like addresses (pointers in literal pools)
-		// Common patterns: 0x10xxxxxx, 0x00xxxxxx (within typical firmware range)
-		if ((instr & 0xFF000000) == 0x10000000 || (instr & 0xFFF00000) == 0x00000000)
-			continue;
+		// Skip values that look like addresses (pointers in literal pools).
+// Rather than hard-coding an address range, use the high-byte(s) we observed in the vector pointer table.
+if (pointerHighByte[(uint8_t)(instr >> 24)])
+	continue;
 
 		// Try to decode with our ARMv5 disassembler (little endian)
 		armv5::Instruction decoded;

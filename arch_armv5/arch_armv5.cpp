@@ -11,7 +11,11 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <exception>
+#include <map>
+#include <queue>
+#include <set>
 
 #include "binaryninjaapi.h"
 #include "lowlevelilinstruction.h"
@@ -39,6 +43,13 @@ using namespace std;
   case orig:                        \
   case opposite:                    \
     return (candidate == orig) || (candidate == opposite)
+
+static bool GetNextFunctionAfterAddress(Ref<BinaryView> data, Ref<Platform> platform, uint64_t address, Ref<Function>& nextFunc)
+{
+  uint64_t nextFuncAddr = data->GetNextFunctionStartAfterAddress(address);
+  nextFunc = data->GetAnalysisFunction(platform, nextFuncAddr);
+  return nextFunc != nullptr;
+}
 
 static bool IsRelatedCondition(Condition orig, Condition candidate)
 {
@@ -596,6 +607,49 @@ protected:
 
     switch (instr.operation)
     {
+    case ARMV5_BL:
+      if (UNCONDITIONAL(instr.cond) && (instr.operands[0].cls == LABEL))
+      {
+        result.AddBranch(CallDestination, instr.operands[0].imm, this);
+      }
+      break;
+    case ARMV5_BLX:
+      result.archTransitionByTargetAddr = true;
+      if(UNCONDITIONAL(instr.cond))
+      {
+        if (instr.operands[0].cls == LABEL)
+        {
+          /* BLX with immediate always switches to Thumb */
+          result.AddBranch(CallDestination, instr.operands[0].imm, m_thumbArch);
+        }
+        else if (instr.operands[0].cls == REG && instr.operands[0].reg == REG_LR)
+        {
+          result.AddBranch(FunctionReturn);
+          /* if (instr.operands[0].reg == REG_LR)
+          {
+            result.AddBranch(FunctionReturn);
+          }
+          else
+          {
+            result.AddBranch(CallDestination, 0);
+          } */
+        }
+      }
+      break;
+    case ARMV5_BX:
+      if (UNCONDITIONAL(instr.cond))
+      {
+        result.archTransitionByTargetAddr = true;
+        if (instr.operands[0].reg == REG_LR)
+          result.AddBranch(FunctionReturn);
+        else
+          result.AddBranch(UnresolvedBranch);
+      }
+      else if (instr.operands[0].reg == REG_LR)
+      {
+        result.AddBranch(FalseBranch, addr + 4, this);
+      }
+      break;
     case ARMV5_B:
       if (UNCONDITIONAL(instr.cond))
       {
@@ -604,51 +658,6 @@ protected:
       else
       {
         result.AddBranch(TrueBranch, instr.operands[0].imm, this);
-        result.AddBranch(FalseBranch, addr + 4, this);
-      }
-      break;
-
-    case ARMV5_BL:
-      if (instr.operands[0].cls == LABEL)
-      {
-        result.AddBranch(CallDestination, instr.operands[0].imm, this);
-      }
-      break;
-
-    case ARMV5_BLX:
-      result.archTransitionByTargetAddr = true;
-      if (instr.operands[0].cls == LABEL)
-      {
-        /* BLX with immediate always switches to Thumb */
-        result.AddBranch(CallDestination, instr.operands[0].imm, m_thumbArch);
-      }
-      else if (instr.operands[0].cls == REG)
-      {
-        if (instr.operands[0].reg == REG_LR)
-        {
-          result.AddBranch(FunctionReturn);
-        }
-        else
-        {
-          /* Register BLX - target arch determined by address bit 0 */
-          result.AddBranch(CallDestination, 0);
-        }
-      }
-      break;
-
-    case ARMV5_BX:
-      result.archTransitionByTargetAddr = true;
-      if (instr.operands[0].reg == REG_LR)
-      {
-        result.AddBranch(FunctionReturn);
-      }
-      else
-      {
-        result.AddBranch(UnresolvedBranch);
-      }
-      /* Conditional BX can fall through */
-      if (CONDITIONAL(instr.cond))
-      {
         result.AddBranch(FalseBranch, addr + 4, this);
       }
       break;
@@ -672,8 +681,33 @@ protected:
     case ARMV5_LDMIB:
     case ARMV5_LDMDA:
     case ARMV5_LDMDB:
+      /* Match ARMv7 behavior for PC in register list */
+      if (UNCONDITIONAL(instr.cond))
+      {
+        for (int i = 0; i < MAX_OPERANDS; i++)
+        {
+          if (instr.operands[i].cls == NONE)
+            break;
+          if (instr.operands[i].cls == REG_LIST)
+          {
+            uint32_t regList = instr.operands[i].imm;
+            if (regList == (1U << REG_PC))
+            {
+              result.archTransitionByTargetAddr = true;
+              result.AddBranch(UnresolvedBranch);
+            }
+            else if (regList & (1U << REG_PC))
+            {
+              result.AddBranch(FunctionReturn);
+            }
+            break;
+          }
+        }
+      }
+      break;
+
     case ARMV5_POP:
-      /* Check for PC in register list */
+      /* POP with PC in list is a return (matches ARMv7) */
       for (int i = 0; i < MAX_OPERANDS; i++)
       {
         if (instr.operands[i].cls == NONE)
@@ -681,15 +715,11 @@ protected:
         if (instr.operands[i].cls == REG_LIST)
         {
           uint32_t regList = instr.operands[i].imm;
-          if (regList & (1 << REG_PC))
+          if (regList & (1U << REG_PC))
           {
-            result.archTransitionByTargetAddr = true;
             result.AddBranch(FunctionReturn);
-            /* Conditional POP PC can fall through */
             if (CONDITIONAL(instr.cond))
-            {
               result.AddBranch(FalseBranch, addr + 4, this);
-            }
           }
           break;
         }
@@ -831,8 +861,10 @@ protected:
     if (disassembled == 1)
     {
       len = 4;
-      return GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
-    }
+      bool ok = GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
+    if (!ok)
+      il.AddInstruction(il.Unimplemented());
+    return true;}
 
     LowLevelILLabel doneLabel;
     LowLevelILLabel condLabels[2];
@@ -1367,19 +1399,25 @@ public:
 
   virtual bool GetInstructionInfo(const uint8_t *data, uint64_t addr, size_t maxLen, InstructionInfo &result) override
   {
+    if (maxLen < 4)
+      return false;
     Instruction instr;
     if (!Disassemble(data, addr, maxLen, instr))
       return false;
 
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
     if (instr.operation == ARMV5_UNDEFINED || instr.operation == ARMV5_UDF ||
-        instr.operation == ARMV5_UNPREDICTABLE)
-      return false;
+      instr.operation == ARMV5_UNPREDICTABLE)
+  {
+    return false;
+  }
 
     /* Check for patterns that are likely data, not code */
     uint32_t instrWord = *(const uint32_t*)data;
     if (IsLikelyData(instrWord, instr))
-      return false;
+  {
+    return false;
+  }
 
     SetInstructionInfoForInstruction(addr, instr, result);
     return true;
@@ -1717,13 +1755,22 @@ public:
     if (!Disassemble(data, addr, len, instr))
     {
       il.AddInstruction(il.Undefined());
-      len = 4;
-      return false;
+    len = 4;
+    return false;
     }
 
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
     if (instr.operation == ARMV5_UNDEFINED || instr.operation == ARMV5_UDF ||
         instr.operation == ARMV5_UNPREDICTABLE)
+    {
+      il.AddInstruction(il.Undefined());
+    len = 4;
+    return false;
+    }
+
+    /* Treat likely data as invalid instructions */
+    uint32_t instrWord = *(const uint32_t*)data;
+    if (IsLikelyData(instrWord, instr))
     {
       il.AddInstruction(il.Undefined());
       len = 4;
@@ -1735,8 +1782,10 @@ public:
       return GetCoalescedLowLevelIL(data, addr, len, il, instr);
 
     len = 4;
-    return GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
-  }
+    bool ok = GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
+    if (!ok)
+      il.AddInstruction(il.Unimplemented());
+    return true;}
 
   virtual string GetIntrinsicName(uint32_t intrinsic) override
   {
@@ -1985,7 +2034,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-      return false;
+    return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -1993,7 +2042,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-      return false;
+    return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -2001,7 +2050,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-      return false;
+    return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -2009,7 +2058,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-      return false;
+    return false;
     return (instr.operation == ARMV5_BL) || (instr.operation == ARMV5_BLX);
   }
 
@@ -2017,7 +2066,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-      return false;
+    return false;
     return (instr.operation == ARMV5_BL) || (instr.operation == ARMV5_BLX);
   }
 
@@ -2160,6 +2209,7 @@ public:
     uint64_t tableBase = 0;
     uint32_t maxCases = 0;
     bool foundTable = false;
+    bool hasCmp = false;
 
     /* Scan up to 16 instructions backward */
     for (int i = 1; i <= 16; i++)
@@ -2189,6 +2239,7 @@ public:
          * CMP Rx, #N followed by BGE/BPL means valid cases are 0..N-1 (N entries)
          * The comparison value is the first invalid case, so maxCases = imm */
         maxCases = (uint32_t)scanInstr.operands[1].imm;
+        hasCmp = true;
         if (maxCases == 0)
           maxCases = 1; /* Ensure at least 1 entry */
       }
@@ -2201,14 +2252,17 @@ public:
       return false;
 
     /* Default to reasonable max if no CMP found */
-    if (maxCases == 0 || maxCases > 256)
-      maxCases = 32;
+    if (maxCases == 0)
+      maxCases = 16;
+    else if (maxCases > 256)
+      maxCases = 256;
 
     /* PC at the ADD instruction + 8 (pipeline) */
     uint64_t pcValue = jumpAddr + 8;
 
     /* Read the jump table and compute targets */
     uint32_t validEntries = 0;
+    bool requireExecutable = view->IsOffsetExecutable(jumpAddr);
     for (uint32_t i = 0; i < maxCases; i++)
     {
       uint64_t entryAddr = tableBase + (i * 4);
@@ -2216,119 +2270,890 @@ public:
       if (entryData.GetLength() < 4)
         break;
 
-      uint32_t offset = *(uint32_t *)entryData.GetData();
+      int32_t offset = *(int32_t *)entryData.GetData();
 
       /* Sanity check: offset should be reasonable */
-      if (offset > 0x100000)
+      if ((offset > 0x100000) || (offset < -0x100000))
+        break;
+      if ((offset & 0x3) != 0)
         break;
 
-      uint64_t target = pcValue + offset;
+      uint64_t target = pcValue + (int64_t)offset;
+      uint64_t targetAddr = target;
+      Ref<Architecture> targetArch = GetAssociatedArchitectureByAddress(targetAddr);
 
-      if (!view->IsValidOffset(target))
+      if (!view->IsValidOffset(targetAddr))
+        break;
+      if (requireExecutable && !view->IsOffsetExecutable(targetAddr))
         break;
 
-      targets.push_back({this, target});
+      targets.push_back({targetArch, targetAddr});
       validEntries++;
+    }
+
+    if (validEntries == 0)
+      return false;
+    if (!hasCmp && validEntries < 2)
+      return false;
+    return true;
+  }
+
+  bool DetectLdrPcJumpTable(BinaryView *view, uint64_t jumpAddr,
+                            vector<pair<Ref<Architecture>, uint64_t>> &targets)
+  {
+    DataBuffer data = view->ReadBuffer(jumpAddr, 4);
+    if (data.GetLength() < 4)
+      return false;
+
+    Instruction instr;
+    if (!Disassemble((const uint8_t *)data.GetData(), jumpAddr, 4, instr))
+      return false;
+
+    if (instr.operation != ARMV5_LDR)
+      return false;
+    if (instr.operands[0].cls != REG || instr.operands[0].reg != REG_PC)
+      return false;
+
+    const InstructionOperand &memOp = instr.operands[1];
+    if (memOp.cls != MEM_IMM)
+      return false;
+    if (memOp.reg != REG_PC)
+      return false;
+    if (!memOp.flags.offsetRegUsed || memOp.offset == REG_INVALID)
+      return false;
+    if (!memOp.flags.add)
+      return false;
+    if (memOp.shift != SHIFT_LSL || memOp.imm != 2)
+      return false;
+
+    uint64_t tableBase = jumpAddr + 8;
+    const uint32_t maxEntries = 256;
+
+    bool requireExecutable = view->IsOffsetExecutable(jumpAddr);
+    for (uint32_t i = 0; i < maxEntries; i++)
+    {
+      uint64_t entryAddr = tableBase + (i * 4);
+      DataBuffer entryData = view->ReadBuffer(entryAddr, 4);
+      if (entryData.GetLength() < 4)
+        break;
+
+      uint32_t targetRaw = *(uint32_t *)entryData.GetData();
+      uint64_t targetAddr = targetRaw;
+      Ref<Architecture> targetArch = GetAssociatedArchitectureByAddress(targetAddr);
+      if (!view->IsValidOffset(targetAddr))
+        break;
+      if (requireExecutable && !view->IsOffsetExecutable(targetAddr))
+        break;
+
+      targets.push_back({targetArch, targetAddr});
     }
 
     return !targets.empty();
   }
 
+  bool DetectLdrPcLiteralTarget(BinaryView *view, uint64_t jumpAddr,
+                                vector<pair<Ref<Architecture>, uint64_t>> &targets)
+  {
+    DataBuffer data = view->ReadBuffer(jumpAddr, 4);
+    if (data.GetLength() < 4)
+      return false;
+
+    Instruction instr;
+    if (!Disassemble((const uint8_t *)data.GetData(), jumpAddr, 4, instr))
+      return false;
+
+    if (instr.operation != ARMV5_LDR)
+      return false;
+    if (instr.operands[0].cls != REG || instr.operands[0].reg != REG_PC)
+      return false;
+
+    const InstructionOperand &memOp = instr.operands[1];
+    if (memOp.cls != MEM_IMM)
+      return false;
+    if (memOp.reg != REG_PC)
+      return false;
+    if (memOp.flags.offsetRegUsed)
+      return false;
+
+    uint64_t literalAddr = jumpAddr + 8;
+    if (memOp.flags.add)
+      literalAddr += memOp.imm;
+    else
+      literalAddr -= memOp.imm;
+
+    DataBuffer entryData = view->ReadBuffer(literalAddr, 4);
+    if (entryData.GetLength() < 4)
+      return false;
+
+    uint32_t targetRaw = *(uint32_t *)entryData.GetData();
+    uint64_t targetAddr = targetRaw;
+    Ref<Architecture> targetArch = GetAssociatedArchitectureByAddress(targetAddr);
+    if (!view->IsValidOffset(targetAddr))
+      return false;
+    if (view->IsOffsetExecutable(jumpAddr) && !view->IsOffsetExecutable(targetAddr))
+      return false;
+
+    targets.push_back({targetArch, targetAddr});
+    return true;
+  }
+
+  bool IsReturnThunk(BinaryView *view, uint64_t addr)
+  {
+    const uint32_t maxInstrs = 6;
+    for (uint32_t i = 0; i < maxInstrs; i++)
+    {
+      uint64_t cur = addr + (i * 4);
+      DataBuffer data = view->ReadBuffer(cur, 4);
+      if (data.GetLength() < 4)
+        return false;
+
+      uint32_t word = *(const uint32_t *)data.GetData();
+      if (word == 0xE1A00000) // NOP
+        continue;
+
+      Instruction instr;
+      if (!Disassemble((const uint8_t *)data.GetData(), cur, 4, instr))
+        return false;
+
+      if (UNCONDITIONAL(instr.cond))
+      {
+        if (instr.operation == ARMV5_BX &&
+            instr.operands[0].cls == REG && instr.operands[0].reg == REG_LR)
+          return true;
+
+        if (instr.operation == ARMV5_MOV &&
+            instr.operands[0].cls == REG && instr.operands[0].reg == REG_PC &&
+            instr.operands[1].cls == REG && instr.operands[1].reg == REG_LR)
+          return true;
+
+        if (instr.operation == ARMV5_POP || instr.operation == ARMV5_LDM ||
+            instr.operation == ARMV5_LDMIA || instr.operation == ARMV5_LDMIB ||
+            instr.operation == ARMV5_LDMDA || instr.operation == ARMV5_LDMDB)
+        {
+          for (int op = 0; op < MAX_OPERANDS; op++)
+          {
+            if (instr.operands[op].cls == NONE)
+              break;
+            if (instr.operands[op].cls == REG_LIST &&
+                (instr.operands[op].imm & (1U << REG_PC)))
+              return true;
+          }
+        }
+      }
+
+      return false;
+    }
+
+    return false;
+  }
+
+  bool IsPaddingStart(BinaryView *view, uint64_t addr)
+  {
+    // Conservative padding detection for raw blobs:
+    // - Require a run of NOPs/zeros.
+    // - Require context: a preceding terminator/branch OR a following prologue.
+    // - Never suppress if there's a direct call target into the gap.
+    if (!view->GetCallers(addr).empty())
+      return false;
+
+    auto isPadWord = [](uint32_t word) {
+      return (word == 0xE1A00000) || (word == 0x00000000);
+    };
+
+    const uint32_t maxPad = 16;
+    const uint32_t minPad = 8;
+    uint32_t padCount = 0;
+    bool hasNonPad = false;
+    uint32_t firstNonPadWord = 0;
+    Instruction firstNonPadInstr{};
+
+    for (uint32_t i = 0; i < maxPad; i++)
+    {
+      uint64_t cur = addr + (i * 4);
+      DataBuffer data = view->ReadBuffer(cur, 4);
+      if (data.GetLength() < 4)
+        return false;
+
+      uint32_t word = *(const uint32_t *)data.GetData();
+      if (isPadWord(word))
+      {
+        padCount++;
+        continue;
+      }
+
+      if (!Disassemble((const uint8_t *)data.GetData(), cur, 4, firstNonPadInstr))
+        return false;
+      firstNonPadWord = word;
+      hasNonPad = true;
+      break;
+    }
+
+    if (padCount < minPad)
+      return false;
+
+    bool prevIsTerminator = false;
+    if (addr >= 4)
+    {
+      DataBuffer prevData = view->ReadBuffer(addr - 4, 4);
+      if (prevData.GetLength() == 4)
+      {
+        uint32_t prevWord = *(const uint32_t *)prevData.GetData();
+        if (IsFunctionEpilogue(prevWord))
+          prevIsTerminator = true;
+
+        Instruction prevInstr;
+        if (!prevIsTerminator &&
+            Disassemble((const uint8_t *)prevData.GetData(), addr - 4, 4, prevInstr))
+        {
+          if (prevInstr.operation == ARMV5_B && UNCONDITIONAL(prevInstr.cond))
+            prevIsTerminator = true;
+        }
+      }
+    }
+
+    bool nextIsPrologue = false;
+    if (hasNonPad)
+    {
+      if (IsFunctionPrologue(firstNonPadWord))
+        nextIsPrologue = true;
+    }
+
+    // If we can't anchor the gap to a terminator or the next prologue, don't suppress it.
+    if (!prevIsTerminator && !nextIsPrologue)
+      return false;
+
+    return true;
+  }
+
   virtual void AnalyzeBasicBlocks(Function *function, BasicBlockAnalysisContext &context) override
   {
-    auto view = function->GetView();
+    auto data = function->GetView();
+    queue<ArchAndAddr> blocksToProcess;
+    map<ArchAndAddr, Ref<BasicBlock>> instrBlocks;
+    set<ArchAndAddr> seenBlocks;
 
-    /*
-     * Run default analysis first to establish the function's basic blocks.
-     * Then we'll post-process to handle switch tables within this function.
-     */
-    DefaultAnalyzeBasicBlocks(function, context);
+    bool guidedAnalysisMode = context.GetGuidedAnalysisMode();
+    bool triggerGuidedOnInvalidInstruction = context.GetTriggerGuidedOnInvalidInstruction();
+    bool translateTailCalls = context.GetTranslateTailCalls();
+    bool disallowBranchToString = context.GetDisallowBranchToString();
 
-    /*
-     * Now scan the function's EXISTING blocks for switch tables.
-     * This ensures we only process switch tables that are actually within
-     * this function, not switch tables from other functions that happen
-     * to be nearby in memory.
-     */
-    set<uint64_t> processedJumps;
+    auto &indirectBranches = context.GetIndirectBranches();
+    auto &indirectNoReturnCalls = context.GetIndirectNoReturnCalls();
 
-    for (auto block : function->GetBasicBlocks())
+    auto &contextualFunctionReturns = context.GetContextualReturns();
+
+    auto &directRefs = context.GetDirectCodeReferences();
+    auto &directNoReturnCalls = context.GetDirectNoReturnCalls();
+    auto &haltedDisassemblyAddresses = context.GetHaltedDisassemblyAddresses();
+    auto &inlinedUnresolvedIndirectBranches = context.GetInlinedUnresolvedIndirectBranches();
+
+    bool hasInvalidInstructions = false;
+    set<ArchAndAddr> guidedSourceBlockTargets;
+    auto guidedSourceBlocks = function->GetGuidedSourceBlocks();
+    set<ArchAndAddr> guidedSourceBlocksSet;
+    for (const auto &block : guidedSourceBlocks)
+      guidedSourceBlocksSet.insert(block);
+
+    BNStringReference strRef;
+    auto targetExceedsByteLimit = [](const BNStringReference &strRef)
     {
-      uint64_t blockStart = block->GetStart();
-      uint64_t blockEnd = block->GetEnd();
+      size_t byteLimit = 8;
+      if (strRef.type == Utf16String)
+        byteLimit *= 2;
+      else if (strRef.type == Utf32String)
+        byteLimit *= 4;
+      return (strRef.length >= byteLimit);
+    };
 
-      for (uint64_t addr = blockStart; addr < blockEnd; addr += 4)
+    Ref<Platform> funcPlatform = function->GetPlatform();
+    auto start = function->GetStart();
+    blocksToProcess.emplace(funcPlatform->GetArchitecture(), start);
+    seenBlocks.emplace(funcPlatform->GetArchitecture(), start);
+
+    bool validateExecutable = data->IsOffsetExecutable(start);
+
+    bool fastValidate = false;
+    uint64_t fastEndAddr = 0;
+    uint64_t fastStartAddr = UINT64_MAX;
+    if (validateExecutable)
+    {
+      for (auto &sec : data->GetSectionsAt(start))
       {
-        DataBuffer data = view->ReadBuffer(addr, 4);
-        if (data.GetLength() < 4)
+        if (sec->GetSemantics() == ReadOnlyDataSectionSemantics)
+          continue;
+        if (sec->GetSemantics() == ReadWriteDataSectionSemantics)
+          continue;
+        if (!data->IsOffsetBackedByFile(sec->GetStart()))
+          continue;
+        if (!data->IsOffsetExecutable(sec->GetStart()))
+          continue;
+        if (fastStartAddr > sec->GetStart())
+          fastStartAddr = sec->GetStart();
+        if (fastEndAddr < (sec->GetEnd() - 1))
+        {
+          fastEndAddr = sec->GetEnd() - 1;
+          Ref<Segment> segment = data->GetSegmentAt(fastEndAddr);
+          if (segment)
+            fastEndAddr = (std::min)(fastEndAddr, segment->GetDataEnd() - 1);
+        }
+        fastValidate = true;
+        break;
+      }
+    }
+
+    uint64_t totalSize = 0;
+    uint64_t maxSize = context.GetMaxFunctionSize();
+    bool maxSizeReached = false;
+
+    while (blocksToProcess.size() != 0)
+    {
+      if (data->AnalysisIsAborted())
+        return;
+
+      ArchAndAddr location = blocksToProcess.front();
+      ArchAndAddr instructionGroupStart = location;
+      blocksToProcess.pop();
+
+      bool isGuidedSourceBlock = guidedSourceBlocksSet.count(location) ? true : false;
+
+      Ref<BasicBlock> block = context.CreateBasicBlock(location.arch, location.address);
+
+      if ((location.address == function->GetStart()) && IsPaddingStart(data, location.address))
+      {
+        // Avoid creating functions on alignment padding between real function bodies.
+        string text = fmt::format("Padding/alignment at {:#x}", location.address);
+        function->CreateAutoAddressTag(location.arch, location.address, "Padding", text, true);
+        context.Finalize();
+        return;
+      }
+
+      Ref<Function> nextFunc;
+      bool hasNextFunc = GetNextFunctionAfterAddress(data, funcPlatform, location.address, nextFunc);
+      uint64_t nextFuncAddr = (hasNextFunc && nextFunc) ? nextFunc->GetStart() : 0;
+      set<Ref<Function>> calledFunctions;
+
+      uint8_t delaySlotCount = 0;
+      bool delayInstructionEndsBlock = false;
+
+      while (true)
+      {
+        if (data->AnalysisIsAborted())
+          return;
+
+        if (!delaySlotCount)
+        {
+          auto blockIter = instrBlocks.find(location);
+          if (blockIter != instrBlocks.end())
+          {
+            Ref<BasicBlock> targetBlock = blockIter->second;
+            if (targetBlock->GetStart() == location.address)
+            {
+              block->AddPendingOutgoingEdge(UnconditionalBranch, location.address, nullptr,
+                                            (block->GetStart() != location.address));
+              break;
+            }
+            else
+            {
+              Ref<BasicBlock> splitBlock = context.CreateBasicBlock(location.arch, location.address);
+              size_t instrDataLen;
+              const uint8_t *instrData = targetBlock->GetInstructionData(location.address, &instrDataLen);
+              splitBlock->AddInstructionData(instrData, instrDataLen);
+              splitBlock->SetFallThroughToFunction(targetBlock->IsFallThroughToFunction());
+              splitBlock->SetUndeterminedOutgoingEdges(targetBlock->HasUndeterminedOutgoingEdges());
+              splitBlock->SetCanExit(targetBlock->CanExit());
+              splitBlock->SetEnd(targetBlock->GetEnd());
+
+              targetBlock->SetFallThroughToFunction(false);
+              targetBlock->SetUndeterminedOutgoingEdges(false);
+              targetBlock->SetCanExit(true);
+              targetBlock->SetEnd(location.address);
+
+              for (size_t j = location.address; j < splitBlock->GetEnd(); j++)
+              {
+                auto k = instrBlocks.find(ArchAndAddr(location.arch, j));
+                if ((k != instrBlocks.end()) && (k->second == targetBlock))
+                  k->second = splitBlock;
+              }
+
+              for (auto &k : targetBlock->GetPendingOutgoingEdges())
+                splitBlock->AddPendingOutgoingEdge(k.type, k.target, k.arch, k.fallThrough);
+              targetBlock->ClearPendingOutgoingEdges();
+              targetBlock->AddPendingOutgoingEdge(UnconditionalBranch, location.address, nullptr, true);
+
+              seenBlocks.insert(location);
+              context.AddFunctionBasicBlock(splitBlock);
+
+              block->AddPendingOutgoingEdge(UnconditionalBranch, location.address);
+              break;
+            }
+          }
+        }
+
+        uint8_t opcode[BN_MAX_INSTRUCTION_LENGTH];
+        size_t maxLen = data->Read(opcode, location.address, location.arch->GetMaxInstructionLength());
+        if (maxLen == 0)
+        {
+          string text = fmt::format("Could not read instruction at {:#x}", location.address);
+          function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
+          if (location.arch->GetInstructionAlignment() == 0)
+            location.address++;
+          else
+            location.address += location.arch->GetInstructionAlignment();
+          block->SetHasInvalidInstructions(true);
+          break;
+        }
+
+        InstructionInfo info;
+        info.delaySlots = delaySlotCount;
+        if (!location.arch->GetInstructionInfo(opcode, location.address, maxLen, info))
+        {
+          string text = fmt::format("Could not get instruction info at {:#x}", location.address);
+          function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
+          if (location.arch->GetInstructionAlignment() == 0)
+            location.address++;
+          else
+            location.address += location.arch->GetInstructionAlignment();
+          block->SetHasInvalidInstructions(true);
+          break;
+        }
+
+        if ((info.length == 0) || (info.length > maxLen))
+        {
+          string text = fmt::format("Instruction of invalid length at {:#x}", location.address);
+          function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
+          if (location.arch->GetInstructionAlignment() == 0)
+            location.address++;
+          else
+            location.address += location.arch->GetInstructionAlignment();
+          block->SetHasInvalidInstructions(true);
+          break;
+        }
+
+        uint64_t instrEnd = location.address + info.length - 1;
+        bool slowPath = !fastValidate || (instrEnd < fastStartAddr) || (instrEnd > fastEndAddr);
+        if (slowPath &&
+            ((!data->IsOffsetCodeSemantics(instrEnd) && data->IsOffsetCodeSemantics(location.address)) ||
+             (!data->IsOffsetBackedByFile(instrEnd) && data->IsOffsetBackedByFile(location.address))))
+        {
+          string text = fmt::format("Instruction at {:#x} straddles a non-code section", location.address);
+          function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
+          if (location.arch->GetInstructionAlignment() == 0)
+            location.address++;
+          else
+            location.address += location.arch->GetInstructionAlignment();
+          block->SetHasInvalidInstructions(true);
+          break;
+        }
+
+        bool endsBlock = false;
+        ArchAndAddr target;
+        map<ArchAndAddr, set<ArchAndAddr>>::const_iterator indirectBranchIter, endIter;
+        if (!delaySlotCount)
+        {
+          instrBlocks[location] = block;
+          instructionGroupStart = location;
+
+          for (size_t i = 0; i < info.branchCount; i++)
+          {
+            bool fastPath;
+
+            auto handleAsFallback = [&]()
+            {
+              endsBlock = true;
+
+              if (info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch)
+              {
+                Ref<LowLevelILFunction> ilFunc = new LowLevelILFunction(location.arch, nullptr);
+                ilFunc->SetCurrentAddress(location.arch, location.address);
+                location.arch->GetInstructionLowLevelIL(opcode, location.address, maxLen, *ilFunc);
+                for (size_t idx = 0; idx < ilFunc->GetInstructionCount(); idx++)
+                {
+                  if ((*ilFunc)[idx].operation == LLIL_CALL)
+                  {
+                    endsBlock = false;
+                    break;
+                  }
+                }
+              }
+
+              set<ArchAndAddr> resolvedTargets;
+              indirectBranchIter = indirectBranches.find(location);
+              endIter = indirectBranches.end();
+              if (indirectBranchIter != endIter)
+              {
+                for (auto &branch : indirectBranchIter->second)
+                  resolvedTargets.insert(branch);
+              }
+              else if (info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch)
+              {
+                vector<pair<Ref<Architecture>, uint64_t>> jumpTableTargets;
+                DetectSwitchTable(data, location.address, jumpTableTargets);
+                DetectLdrPcJumpTable(data, location.address, jumpTableTargets);
+                DetectLdrPcLiteralTarget(data, location.address, jumpTableTargets);
+                for (auto &branch : jumpTableTargets)
+                {
+                  Ref<Architecture> targetArch = branch.first ? branch.first : location.arch;
+                  resolvedTargets.emplace(targetArch, branch.second);
+                }
+              }
+
+              if (!resolvedTargets.empty())
+              {
+                for (auto &branch : resolvedTargets)
+                {
+                  directRefs[branch.address].emplace(location);
+                  Ref<Platform> targetPlatform = funcPlatform;
+                  if (branch.arch != function->GetArchitecture())
+                    targetPlatform = funcPlatform->GetRelatedPlatform(branch.arch);
+
+                  if (translateTailCalls && targetPlatform &&
+                      data->GetAnalysisFunction(targetPlatform, branch.address))
+                    continue;
+
+                  if (isGuidedSourceBlock)
+                    guidedSourceBlockTargets.insert(branch);
+
+                  block->AddPendingOutgoingEdge(IndirectBranch, branch.address, branch.arch);
+                  if (seenBlocks.count(branch) == 0)
+                  {
+                    blocksToProcess.push(branch);
+                    seenBlocks.insert(branch);
+                  }
+                }
+              }
+              else if (info.branchType[i] == ExceptionBranch)
+              {
+                block->SetCanExit(false);
+              }
+              else if (info.branchType[i] == FunctionReturn && function->CanReturn().GetValue())
+              {
+                auto it = contextualFunctionReturns.find(location);
+                if (it != contextualFunctionReturns.end())
+                {
+                  endsBlock = it->second;
+                }
+                else
+                {
+                  Ref<LowLevelILFunction> ilFunc = new LowLevelILFunction(location.arch, nullptr);
+                  ilFunc->SetCurrentAddress(location.arch, location.address);
+                  location.arch->GetInstructionLowLevelIL(opcode, location.address, maxLen, *ilFunc);
+                  if (ilFunc->GetInstructionCount() && ((*ilFunc)[0].operation == LLIL_CALL))
+                    contextualFunctionReturns[location] = false;
+                  else
+                    contextualFunctionReturns[location] = true;
+                  endsBlock = contextualFunctionReturns[location];
+                }
+              }
+              else
+              {
+                block->SetUndeterminedOutgoingEdges(true);
+              }
+            };
+
+            switch (info.branchType[i])
+            {
+            case UnconditionalBranch:
+            case TrueBranch:
+            case FalseBranch:
+              endsBlock = true;
+              if (data->IsOffsetExternSemantics(info.branchTarget[i]))
+              {
+                DataVariable dataVar;
+                if (data->GetDataVariableAtAddress(info.branchTarget[i], dataVar) &&
+                    (dataVar.address == info.branchTarget[i]) && dataVar.type.GetValue() &&
+                    (dataVar.type->GetClass() == FunctionTypeClass))
+                {
+                  directRefs[info.branchTarget[i]].emplace(location);
+                  if (!dataVar.type->CanReturn())
+                  {
+                    directNoReturnCalls.insert(location);
+                    endsBlock = true;
+                    block->SetCanExit(false);
+                  }
+                }
+                break;
+              }
+
+              if (data->IsValidOffset(info.branchTarget[i]) && IsReturnThunk(data, info.branchTarget[i]))
+              {
+                endsBlock = true;
+                block->SetCanExit(true);
+                break;
+              }
+
+              fastPath = fastValidate && (info.branchTarget[i] >= fastStartAddr) &&
+                         (info.branchTarget[i] <= fastEndAddr);
+              if (fastPath ||
+                  (data->IsValidOffset(info.branchTarget[i]) &&
+                   data->IsOffsetBackedByFile(info.branchTarget[i]) &&
+                   ((!validateExecutable) || data->IsOffsetExecutable(info.branchTarget[i]))))
+              {
+                target = ArchAndAddr(info.branchArch[i] ? new CoreArchitecture(info.branchArch[i]) : location.arch,
+                                     info.branchTarget[i]);
+
+                if (data->ShouldSkipTargetAnalysis(location, function, instrEnd, target))
+                  break;
+
+                Ref<Platform> targetPlatform = funcPlatform;
+                if (target.arch != funcPlatform->GetArchitecture())
+                  targetPlatform = funcPlatform->GetRelatedPlatform(target.arch);
+
+                directRefs[info.branchTarget[i]].insert(location);
+
+                if (translateTailCalls && (info.branchType[i] == UnconditionalBranch) &&
+                    (target.address < function->GetStart()))
+                {
+                  Ref<Function> forcedFunc = data->AddFunctionForAnalysis(targetPlatform, target.address, true);
+                  if (forcedFunc)
+                  {
+                    context.AddTempOutgoingReference(forcedFunc);
+                    calledFunctions.insert(forcedFunc);
+                    if (!forcedFunc->CanReturn() && !forcedFunc->IsInlinedDuringAnalysis().GetValue())
+                    {
+                      directNoReturnCalls.insert(location);
+                      endsBlock = true;
+                      block->SetCanExit(false);
+                    }
+                    break;
+                  }
+                }
+
+                auto otherFunc = function->GetCalleeForAnalysis(targetPlatform, target.address, true);
+                if (translateTailCalls && targetPlatform && otherFunc && (otherFunc->GetStart() != function->GetStart()))
+                {
+                  calledFunctions.insert(otherFunc);
+                  if (info.branchType[i] == UnconditionalBranch)
+                  {
+                    if (!otherFunc->CanReturn() && !otherFunc->IsInlinedDuringAnalysis().GetValue())
+                    {
+                      directNoReturnCalls.insert(location);
+                      endsBlock = true;
+                      block->SetCanExit(false);
+                    }
+                    break;
+                  }
+                }
+                else if (disallowBranchToString && data->GetStringAtAddress(target.address, strRef) &&
+                         targetExceedsByteLimit(strRef))
+                {
+                  BNLogInfo("Not adding branch target from 0x%" PRIx64 " to string at 0x%" PRIx64 " length:%zu",
+                            location.address, target.address, strRef.length);
+                  break;
+                }
+                else
+                {
+                  if (isGuidedSourceBlock)
+                    guidedSourceBlockTargets.insert(target);
+
+                  block->AddPendingOutgoingEdge(info.branchType[i], target.address, target.arch);
+                  if (seenBlocks.count(target) == 0)
+                  {
+                    blocksToProcess.push(target);
+                    seenBlocks.insert(target);
+                  }
+                }
+              }
+              break;
+
+            case CallDestination:
+              if (data->IsOffsetExternSemantics(info.branchTarget[i]))
+              {
+                DataVariable dataVar;
+                if (data->GetDataVariableAtAddress(info.branchTarget[i], dataVar) &&
+                    (dataVar.address == info.branchTarget[i]) && dataVar.type.GetValue() &&
+                    (dataVar.type->GetClass() == FunctionTypeClass))
+                {
+                  directRefs[info.branchTarget[i]].emplace(location);
+                  if (!dataVar.type->CanReturn())
+                  {
+                    directNoReturnCalls.insert(location);
+                    endsBlock = true;
+                    block->SetCanExit(false);
+                  }
+                }
+                break;
+              }
+
+              fastPath = fastValidate && (info.branchTarget[i] >= fastStartAddr) &&
+                         (info.branchTarget[i] <= fastEndAddr);
+              if (fastPath ||
+                  (data->IsValidOffset(info.branchTarget[i]) && data->IsOffsetBackedByFile(info.branchTarget[i]) &&
+                   ((!validateExecutable) || data->IsOffsetExecutable(info.branchTarget[i]))))
+              {
+                target = ArchAndAddr(info.branchArch[i] ? new CoreArchitecture(info.branchArch[i]) : location.arch,
+                                     info.branchTarget[i]);
+
+                if (!fastPath && !data->IsOffsetCodeSemantics(target.address) &&
+                    data->IsOffsetCodeSemantics(location.address))
+                {
+                  string message = fmt::format("Non-code call target {:#x}", target.address);
+                  function->CreateAutoAddressTag(target.arch, location.address, "Non-code Branch", message, true);
+                  break;
+                }
+
+                Ref<Platform> platform = funcPlatform;
+                if (target.arch != platform->GetArchitecture())
+                {
+                  platform = funcPlatform->GetRelatedPlatform(target.arch);
+                  if (!platform)
+                    platform = funcPlatform;
+                }
+
+                if (data->ShouldSkipTargetAnalysis(location, function, instrEnd, target))
+                  break;
+
+                Ref<Function> func = data->AddFunctionForAnalysis(platform, target.address, true);
+                if (!func)
+                {
+                  if (!data->IsOffsetBackedByFile(target.address))
+                    BNLogError("Function at 0x%" PRIx64 " failed to add target not backed by file.",
+                               function->GetStart());
+                  break;
+                }
+
+                context.AddTempOutgoingReference(func);
+                calledFunctions.emplace(func);
+                directRefs[target.address].emplace(location);
+                if (!func->CanReturn())
+                {
+                  if (func->IsInlinedDuringAnalysis().GetValue() && func->HasUnresolvedIndirectBranches())
+                  {
+                    auto unresolved = func->GetUnresolvedIndirectBranches();
+                    if (unresolved.size() == 1)
+                    {
+                      inlinedUnresolvedIndirectBranches[location] = *unresolved.begin();
+                      handleAsFallback();
+                      break;
+                    }
+                  }
+
+                  directNoReturnCalls.insert(location);
+                  endsBlock = true;
+                  block->SetCanExit(false);
+                }
+              }
+              break;
+
+            case SystemCall:
+              break;
+
+            default:
+              handleAsFallback();
+              break;
+            }
+          }
+        }
+
+        if (indirectNoReturnCalls.count(location))
+        {
+          size_t instrLength = info.length;
+          if (info.delaySlots)
+          {
+            InstructionInfo delayInfo;
+            delayInfo.delaySlots = info.delaySlots;
+            size_t archMax = location.arch->GetMaxInstructionLength();
+            uint8_t delayOpcode[BN_MAX_INSTRUCTION_LENGTH];
+            do
+            {
+              delayInfo.delaySlots--;
+              if (!location.arch->GetInstructionInfo(delayOpcode, location.address + instrLength,
+                                                     archMax - instrLength, delayInfo))
+                break;
+              instrLength += delayInfo.length;
+            } while (delayInfo.delaySlots && (instrLength < archMax));
+          }
+
+          Ref<LowLevelILFunction> ilFunc = new LowLevelILFunction(location.arch, nullptr);
+          ilFunc->SetCurrentAddress(location.arch, location.address);
+          location.arch->GetInstructionLowLevelIL(opcode, location.address, maxLen, *ilFunc);
+          if (!(ilFunc->GetInstructionCount() && ((*ilFunc)[0].operation == LLIL_IF)))
+          {
+            endsBlock = true;
+            block->SetCanExit(false);
+          }
+        }
+
+        location.address += info.length;
+        block->AddInstructionData(opcode, info.length);
+
+        if (endsBlock && !info.delaySlots)
           break;
 
-        Instruction instr;
-        if (!Disassemble((const uint8_t *)data.GetData(), addr, 4, instr))
-          continue;
+        totalSize += info.length;
+        auto analysisSkipOverride = context.GetAnalysisSkipOverride();
+        if (analysisSkipOverride == NeverSkipFunctionAnalysis)
+          maxSize = 0;
+        else if (!maxSize && (analysisSkipOverride == AlwaysSkipFunctionAnalysis))
+          maxSize = context.GetMaxFunctionSize();
 
-        /* Check for ADD PC, PC, Rn (switch jump) */
-        if (instr.operation == ARMV5_ADD &&
-            instr.operands[0].cls == REG && instr.operands[0].reg == REG_PC &&
-            instr.operands[1].cls == REG && instr.operands[1].reg == REG_PC)
+        if (maxSize && (totalSize > maxSize))
         {
-          vector<pair<Ref<Architecture>, uint64_t>> targets;
-          if (DetectSwitchTable(view, addr, targets))
+          maxSizeReached = true;
+          break;
+        }
+
+        if (delaySlotCount)
+        {
+          delaySlotCount--;
+          if (!delaySlotCount && delayInstructionEndsBlock)
+            break;
+        }
+        else
+        {
+          delaySlotCount = info.delaySlots;
+          delayInstructionEndsBlock = endsBlock;
+        }
+
+        if (block->CanExit() && translateTailCalls && !delaySlotCount && hasNextFunc &&
+            (location.address == nextFuncAddr))
+        {
+          if (calledFunctions.count(nextFunc) == 0)
           {
-            processedJumps.insert(addr);
+            block->SetFallThroughToFunction(true);
+            if (!nextFunc->CanReturn())
+            {
+              directNoReturnCalls.insert(instructionGroupStart);
+              block->SetCanExit(false);
+            }
+            break;
           }
+          hasNextFunc = GetNextFunctionAfterAddress(data, funcPlatform, location.address, nextFunc);
+          nextFuncAddr = (hasNextFunc && nextFunc) ? nextFunc->GetStart() : 0;
         }
       }
-    }
 
-    /*
-     * For each detected switch table within this function, set up indirect
-     * branches and create basic blocks for the targets.
-     */
-    for (uint64_t jumpAddr : processedJumps)
-    {
-      vector<pair<Ref<Architecture>, uint64_t>> targets;
-      if (DetectSwitchTable(view, jumpAddr, targets))
+      if (location.address != block->GetStart())
       {
-        vector<ArchAndAddr> branches;
-        for (auto &t : targets)
+        block->SetEnd(location.address);
+        context.AddFunctionBasicBlock(block);
+      }
+
+      if (maxSizeReached)
+        break;
+
+      if (triggerGuidedOnInvalidInstruction && block->HasInvalidInstructions())
+        hasInvalidInstructions = true;
+
+      if (guidedAnalysisMode || hasInvalidInstructions || guidedSourceBlocksSet.size())
+      {
+        queue<ArchAndAddr> guidedBlocksToProcess;
+        while (!blocksToProcess.empty())
         {
-          branches.push_back(ArchAndAddr(t.first, t.second));
+          auto i = blocksToProcess.front();
+          blocksToProcess.pop();
+          if (guidedSourceBlockTargets.count(i))
+            guidedBlocksToProcess.emplace(i);
+          else
+            haltedDisassemblyAddresses.emplace(i);
         }
-        function->SetAutoIndirectBranches(this, jumpAddr, branches);
-
-        /*
-         * Define the jump table data as an array of uint32_t.
-         * Table starts at jumpAddr + 4 (after the ADD PC, PC, Rn instruction).
-         * Check if a data variable already exists to avoid redefining.
-         * Also add data references from each table entry to its target address.
-         */
-        uint64_t tableAddr = jumpAddr + 4;
-        size_t tableSize = targets.size();
-
-        /* Only define if no data variable exists yet at this address */
-        DataVariable existingVar;
-        if (tableSize > 0 && !view->GetDataVariableAtAddress(tableAddr, existingVar))
-        {
-          Ref<Type> uint32Type = Type::IntegerType(4, false);
-          Ref<Type> arrayType = Type::ArrayType(uint32Type, tableSize);
-          view->DefineUserDataVariable(tableAddr, arrayType);
-
-          /* Add data references and comments for each table entry */
-          for (size_t i = 0; i < targets.size(); i++)
-          {
-            uint64_t entryAddr = tableAddr + (i * 4);
-            uint64_t targetAddr = targets[i].second;
-            view->AddUserDataReference(entryAddr, targetAddr);
-
-            /* Add comment showing resolved target address */
-            char comment[32];
-            snprintf(comment, sizeof(comment), "-> 0x%llx", (unsigned long long)targetAddr);
-            view->SetCommentForAddress(entryAddr, comment);
-          }
-        }
+        blocksToProcess = guidedBlocksToProcess;
       }
     }
+
+    if (maxSizeReached)
+      context.SetMaxSizeReached(true);
+
+    context.Finalize();
   }
 };
 
@@ -2546,7 +3371,7 @@ string ArmCommonArchitecture::GetRegisterName(uint32_t reg)
     return get_register_name((enum Register)reg);
   }
 
-  LogError("Unknown Register: %x - Please report this as a bug.\n", reg);
+  //LogError("Unknown Register: %x - Please report this as a bug.\n", reg);
   return "unknown";
 }
 

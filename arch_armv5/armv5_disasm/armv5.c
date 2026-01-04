@@ -290,10 +290,19 @@ const char* get_condition(enum Condition cond) {
     return "??";
 }
 
-const char* get_register_name(enum Register reg) {
-    if (reg < REG_INVALID)
+const char *get_register_name(enum Register reg)
+{
+    if ((unsigned)reg < REG_INVALID)
         return registerString[reg];
-    return "???";
+
+    // BN temporary/SSA register IDs come through here.
+    // Use a small rotating buffer so it’s safe even with multiple calls per line.
+    static char buf[8][16];
+    static int idx = 0;
+    idx = (idx + 1) & 7;
+
+    snprintf(buf[idx], sizeof(buf[idx]), "tmp_%u", (unsigned)reg);
+    return buf[idx];
 }
 
 const char* get_shift(enum Shift shift) {
