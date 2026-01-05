@@ -23,6 +23,7 @@ namespace BinaryNinja
 		Ref<Logger> m_logger;
 		Ref<AnalysisCompletionEvent> m_postAnalysisScanEvent;
 		bool m_postAnalysisScansDone;
+		std::set<uint64_t> m_seededFunctions;
 
 		virtual uint64_t PerformGetEntryPoint() const override;
 		virtual bool PerformIsExecutable() const override { return true; }

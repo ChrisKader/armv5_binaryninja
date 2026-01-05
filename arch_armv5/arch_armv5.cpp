@@ -2989,8 +2989,6 @@ public:
                     (loggedUnresolvedIndirect.count(location.address) == 0))
                 {
                   loggedUnresolvedIndirect.insert(location.address);
-                  BNLogInfo("Unresolved indirect control flow at 0x%" PRIx64 " in function 0x%" PRIx64,
-                            location.address, function->GetStart());
                 }
                 block->SetUndeterminedOutgoingEdges(true);
               }
