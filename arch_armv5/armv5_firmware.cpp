@@ -10,6 +10,7 @@
 #include <set>
 #include <map>
 #include <cstring>
+#include <chrono>
 
 #include <cstdint>
 using namespace std;
@@ -38,6 +39,7 @@ struct FirmwareScanContext
 	Ref<Architecture> arch;
 	Ref<Platform> plat;
 	Ref<Logger> logger;
+	bool verboseLog;
 	BinaryView* view;
 
 	uint64_t ImageEnd() const { return imageBase + length; }
@@ -80,7 +82,11 @@ void BinaryNinja::InitArmv5FirmwareViewType()
 
 
 Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryView("ARMv5 Firmware", data->GetFile(), data),
-	m_parseOnly(parseOnly), m_entryPoint(0), m_endian(LittleEndian), m_addressSize(4)
+	m_parseOnly(parseOnly),
+	m_entryPoint(0),
+	m_endian(LittleEndian),
+	m_addressSize(4),
+	m_postAnalysisScansDone(false)
 {
 	CreateLogger("BinaryView");
 	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
@@ -89,6 +95,8 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 
 Armv5FirmwareView::~Armv5FirmwareView()
 {
+	if (m_postAnalysisScanEvent)
+		m_postAnalysisScanEvent->Cancel();
 }
 
 
@@ -235,6 +243,64 @@ struct MemRegion {
 	const char* type;
 };
 
+static bool LooksLikeReturnThunk(const uint8_t* data, uint64_t dataLen, BNEndianness endian,
+	uint64_t imageBase, uint64_t length, uint64_t addr)
+{
+	if (addr < imageBase || addr + 4 > imageBase + length)
+		return false;
+	uint64_t offset = addr - imageBase;
+	const uint32_t maxInstrs = 6;
+
+	for (uint32_t i = 0; i < maxInstrs; i++)
+	{
+		uint64_t cur = offset + (uint64_t)i * 4;
+		if (cur + 4 > dataLen)
+			return false;
+		uint32_t word = 0;
+		memcpy(&word, data + cur, sizeof(word));
+		if (endian == BigEndian)
+			word = Swap32(word);
+
+		if (word == 0xE1A00000 || word == 0x00000000 || word == 0xFFFFFFFF)
+			continue;
+
+		armv5::Instruction instr;
+		memset(&instr, 0, sizeof(instr));
+		if (armv5::armv5_decompose(word, &instr, (uint32_t)cur, 0) != 0)
+			return false;
+
+		if ((instr.cond != armv5::COND_AL) && (instr.cond != armv5::COND_NV))
+			return false;
+
+		if (instr.operation == armv5::ARMV5_BX &&
+			instr.operands[0].cls == armv5::REG && instr.operands[0].reg == armv5::REG_LR)
+			return true;
+
+		if (instr.operation == armv5::ARMV5_MOV &&
+			instr.operands[0].cls == armv5::REG && instr.operands[0].reg == armv5::REG_PC &&
+			instr.operands[1].cls == armv5::REG && instr.operands[1].reg == armv5::REG_LR)
+			return true;
+
+		if (instr.operation == armv5::ARMV5_POP || instr.operation == armv5::ARMV5_LDM ||
+			instr.operation == armv5::ARMV5_LDMIA || instr.operation == armv5::ARMV5_LDMIB ||
+			instr.operation == armv5::ARMV5_LDMDA || instr.operation == armv5::ARMV5_LDMDB)
+		{
+			for (int op = 0; op < MAX_OPERANDS; op++)
+			{
+				if (instr.operands[op].cls == armv5::NONE)
+					break;
+				if (instr.operands[op].cls == armv5::REG_LIST &&
+					(instr.operands[op].imm & (1U << armv5::REG_PC)))
+					return true;
+			}
+		}
+
+		return false;
+	}
+
+	return false;
+}
+
 
 /*
  * Scan for ARM function prologues and add them as entry points.
@@ -288,12 +354,22 @@ struct MemRegion {
  */
 static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
-	Ref<Architecture> armArch, Ref<Architecture> thumbArch, Ref<Platform> plat, Ref<Logger> logger)
+	Ref<Architecture> armArch, Ref<Architecture> thumbArch, Ref<Platform> plat, Ref<Logger> logger,
+	bool verboseLog, std::set<uint64_t>* seededFunctions)
 {
 	size_t prologuesFound = 0;
+	size_t totalWords = 0;
+	size_t codeWords = 0;
+	size_t prologueHits = 0;
+	size_t addedCount = 0;
+	size_t skippedExisting = 0;
+	size_t skippedNonCode = 0;
 
 	// Minimum offset to start scanning (skip vector table area)
 	uint64_t startOffset = 0x40;
+	uint64_t scanLen = (dataLen < length) ? dataLen : length;
+	if (scanLen <= startOffset)
+		return 0;
 
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
@@ -303,8 +379,16 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		if (addedAddrs.find(funcAddr) == addedAddrs.end())
 		{
 			if (!view->GetAnalysisFunctionsContainingAddress(funcAddr).empty())
+			{
+				skippedExisting++;
 				return;
-			view->AddFunctionForAnalysis(plat, funcAddr);
+			}
+			if (view->AddFunctionForAnalysis(plat, funcAddr))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(funcAddr);
+				addedCount++;
+			}
 			addedAddrs.insert(funcAddr);
 			prologuesFound++;
 		}
@@ -315,10 +399,22 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 	// Track the previous instruction for boundary-based patterns
 	uint32_t prevInstr = 0;
+	uint32_t prevPrevInstr = 0;
 
 	// Scan for ARM prologues (4-byte aligned)
-	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
+	for (uint64_t offset = startOffset; offset + 4 <= scanLen; offset += 4)
 	{
+		totalWords++;
+		uint64_t instrAddr = imageBase + offset;
+		if (!view->IsOffsetCodeSemantics(instrAddr))
+		{
+			skippedNonCode++;
+			prevPrevInstr = 0;
+			prevInstr = 0;
+			continue;
+		}
+		codeWords++;
+
 		uint32_t instr = 0;
 		if (offset + 4 <= dataLen)
 		{
@@ -360,17 +456,56 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 			return armv5::armv5_decompose(ins, &decoded, (uint32_t)addr, 0) == 0;
 		};
 
-		bool prevIsBoundary = isBoundaryInstr(prevInstr);
-		if (!prevIsBoundary && offset >= 4)
-		{
-			uint32_t prevWord = prevInstr;
-			if (prevWord == 0 || prevWord == 0xFFFFFFFF)
-				prevIsBoundary = true;
-			else if (!isValidArmInstruction(prevWord, offset - 4))
-				prevIsBoundary = true;
-		}
-		if (offset == startOffset)
-			prevIsBoundary = true;
+		auto isPaddingWord = [](uint32_t w) -> bool {
+			return (w == 0) || (w == 0xFFFFFFFF) || (w == 0xE1A00000);
+		};
+
+		auto readWordAt = [&](uint64_t wordOffset, uint32_t& outWord) -> bool {
+			if (wordOffset + 4 > dataLen)
+				return false;
+			memcpy(&outWord, data + wordOffset, sizeof(outWord));
+			if (endian == BigEndian)
+				outWord = Swap32(outWord);
+			return true;
+		};
+
+		auto boundaryBefore = [&](uint64_t currOffset) -> bool {
+			if (currOffset == startOffset)
+				return true;
+			int checked = 0;
+			uint64_t off = currOffset;
+			while (off >= 4 && checked < 8)
+			{
+				uint32_t w = 0;
+				if (!readWordAt(off - 4, w))
+					return false;
+				if (isPaddingWord(w))
+				{
+					off -= 4;
+					checked++;
+					continue;
+				}
+				return isBoundaryInstr(w);
+			}
+			return false;
+		};
+
+		auto hasReturnSoon = [&](uint64_t currOffset) -> bool {
+			for (int i = 1; i <= 4; i++)
+			{
+				uint64_t off = currOffset + (uint64_t)i * 4;
+				uint32_t w = 0;
+				if (!readWordAt(off, w))
+					return false;
+				if (!isValidArmInstruction(w, off))
+					return false;
+				if (isReturnInstr(w))
+					return true;
+			}
+			return false;
+		};
+
+		bool prevIsBoundary = boundaryBefore(offset);
 
 		// Pattern 1: STMFD/STMDB/PUSH sp!, {..., lr} with 2+ registers
 		// Encoding: cond 100 P U S W L Rn reglist
@@ -387,7 +522,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Pattern 3: MOV ip, sp followed by STMFD with fp and lr
 		// This is the classic APCS prologue
 		// Very reliable as the two-instruction sequence is unlikely to appear in data
-		if (instr == 0xE1A0C00D)
+		if (instr == 0xE1A0C00D && prevIsBoundary)
 		{
 			if (offset + 8 <= dataLen)
 			{
@@ -405,7 +540,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 		// Pattern 4: STR lr, [sp, #-4]! followed by SUB sp, sp, #imm
 		// Encoding: 0xE52DE004 followed by 0xE24DD0xx
-		if (instr == 0xE52DE004)
+		if (instr == 0xE52DE004 && prevIsBoundary)
 		{
 			if (offset + 8 <= dataLen)
 			{
@@ -426,7 +561,7 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Mask: 0x0FBF0FFF (ignore condition and Rd)
 		if ((instr & 0x0FBF0FFF) == 0x010F0000)
 		{
-			if (prevIsBoundary)
+			if (prevIsBoundary && hasReturnSoon(offset))
 				isPrologue = true;
 		}
 
@@ -457,16 +592,18 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 		// Mask: check for 0xEE......1. pattern
 		if ((instr & 0x0F000010) == 0x0E000010)
 		{
-			if (prevIsBoundary)
+			if (prevIsBoundary && hasReturnSoon(offset))
 				isPrologue = true;
 		}
 
 		if (isPrologue)
 		{
+			prologueHits++;
 			addFunction(imageBase + offset);
 		}
 
 		// Remember this instruction for next iteration
+		prevPrevInstr = prevInstr;
 		prevInstr = instr;
 	}
 
@@ -481,6 +618,12 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	// that set the Thumb bit in the target address.
 
 	logger->LogInfo("Prologue scan: Found %zu function prologues", prologuesFound);
+	if (verboseLog)
+	{
+		logger->LogInfo(
+			"Prologue scan detail: scanned=%zu code=%zu prologue_hits=%zu added=%zu skipped_existing=%zu skipped_noncode=%zu",
+			totalWords, codeWords, prologueHits, addedCount, skippedExisting, skippedNonCode);
+	}
 	return prologuesFound;
 }
 
@@ -491,6 +634,8 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
  * This complements prologue scanning by finding functions that are called
  * but might not have recognizable prologues (e.g., hand-written assembly,
  * optimized leaf functions, Thumb code).
+ * To reduce false positives, only callsites within discovered functions
+ * are considered.
  *
  * Detected patterns:
  *
@@ -513,9 +658,26 @@ static size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
  */
 static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
-	Ref<Platform> plat, Ref<Logger> logger)
+	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, std::set<uint64_t>* seededFunctions)
 {
 	size_t targetsFound = 0;
+	uint64_t scanLen = (dataLen < length) ? dataLen : length;
+	size_t totalInstrs = 0;
+	size_t codeInstrs = 0;
+	size_t inFunctionInstrs = 0;
+	size_t skippedNonCode = 0;
+	size_t skippedNotInFunction = 0;
+	size_t skippedPrevNotCode = 0;
+	size_t blMatches = 0;
+	size_t ldrMatches = 0;
+	size_t addedCount = 0;
+	size_t skipMisaligned = 0;
+	size_t skipOutOfBounds = 0;
+	size_t skipNonCodeTarget = 0;
+	size_t skipExistingTarget = 0;
+	size_t skipReturnThunk = 0;
+	size_t skipInvalidTarget = 0;
+	size_t skipDuplicate = 0;
 
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
@@ -525,21 +687,37 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		// For ARM mode, addresses must be 4-byte aligned.
 		// Strip any Thumb bit and reject misaligned addresses.
 		uint64_t alignedAddr = funcAddr & ~3ULL;
+		if (funcAddr & 3)
+		{
+			skipMisaligned++;
+			return;
+		}
 
 		// Must be within image bounds
 		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
+		{
+			skipOutOfBounds++;
 			return;
+		}
 
-		// Only add functions in code semantics
+		// Only add functions in code semantics (standard BN behavior)
 		if (!view->IsOffsetCodeSemantics(alignedAddr))
+		{
+			skipNonCodeTarget++;
 			return;
+		}
 
 		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
+		{
+			skipExistingTarget++;
 			return;
+		}
 
-		// Reject misaligned addresses - these cause slow analysis
-		if (funcAddr & 3)
+		if (LooksLikeReturnThunk(data, dataLen, endian, imageBase, length, alignedAddr))
+		{
+			skipReturnThunk++;
 			return;
+		}
 
 		// Validate target looks like valid ARM code
 		uint64_t offset = alignedAddr - imageBase;
@@ -552,11 +730,17 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 
 			// Skip if target is all zeros (BSS/uninitialized data)
 			if (targetInstr == 0)
+			{
+				skipInvalidTarget++;
 				return;
+			}
 
 			// Skip if target is all 0xFF (erased flash)
 			if (targetInstr == 0xFFFFFFFF)
+			{
+				skipInvalidTarget++;
 				return;
+			}
 
 			// In ARMv5, condition code 0b1111 (0xFxxxxxxx) is mostly undefined
 			// except for a few specific encodings. Most valid ARM code uses
@@ -570,20 +754,35 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 				// Most other 0xFxxxxxxx patterns are undefined
 				uint32_t op = (targetInstr >> 24) & 0xFF;
 				if (op != 0xFA && op != 0xFB)
+				{
+					skipInvalidTarget++;
 					return;  // Likely data, not code
+				}
 			}
 
 			// Additional heuristic: very unlikely instruction patterns
 			// ANDEQ r0, r0, r0 with random high bits often indicates data
 			if ((targetInstr & 0x0FFFFFFF) == 0x00000000 && cond != 0xE)
+			{
+				skipInvalidTarget++;
 				return;
+			}
 		}
 
 		if (addedAddrs.find(alignedAddr) == addedAddrs.end())
 		{
-			view->AddFunctionForAnalysis(plat, alignedAddr);
+			if (view->AddFunctionForAnalysis(plat, alignedAddr))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(alignedAddr);
+				addedCount++;
+			}
 			addedAddrs.insert(alignedAddr);
 			targetsFound++;
+		}
+		else
+		{
+			skipDuplicate++;
 		}
 	};
 
@@ -621,8 +820,9 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	uint64_t startOffset = 0x40;
 
 	// Scan for ARM call instructions (4-byte aligned)
-	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
+	for (uint64_t offset = startOffset; offset + 4 <= scanLen; offset += 4)
 	{
+		totalInstrs++;
 		uint32_t instr = 0;
 		if (offset + 4 <= dataLen)
 		{
@@ -632,6 +832,20 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		}
 
 		uint64_t instrAddr = imageBase + offset;
+		if (!view->IsOffsetCodeSemantics(instrAddr))
+		{
+			skippedNonCode++;
+			prevInstr = 0;
+			continue;
+		}
+		codeInstrs++;
+		if (view->GetAnalysisFunctionsContainingAddress(instrAddr).empty())
+		{
+			skippedNotInFunction++;
+			prevInstr = 0;
+			continue;
+		}
+		inFunctionInstrs++;
 
 		// Pattern 1: BL imm (ARM branch-and-link)
 		// Encoding: cond 1011 imm24 where cond != 1111
@@ -642,6 +856,7 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 			// This filters out BL-like patterns in literal pools
 			if (offset >= 4 && isLikelyCode(prevInstr))
 			{
+				blMatches++;
 				// Extract 24-bit signed offset, shift left 2, add to PC+8
 				int32_t imm24 = instr & 0x00FFFFFF;
 				// Sign-extend from 24 bits
@@ -651,6 +866,10 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 				uint64_t target = instrAddr + 8 + offset_bytes;
 
 				addFunction(target, "BL");
+			}
+			else
+			{
+				skippedPrevNotCode++;
 			}
 		}
 
@@ -670,6 +889,7 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 			// Only trust LDR PC if preceded by valid code
 			if (offset >= 4 && isLikelyCode(prevInstr))
 			{
+				ldrMatches++;
 				uint32_t imm12 = instr & 0xFFF;
 				bool add = (instr & 0x00800000) != 0;
 				// PC reads as instrAddr + 8 in ARM mode
@@ -691,6 +911,10 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 					}
 				}
 			}
+			else
+			{
+				skippedPrevNotCode++;
+			}
 		}
 
 		// Remember this instruction for next iteration
@@ -698,23 +922,46 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	}
 
 	logger->LogInfo("Call target scan: Found %zu call targets", targetsFound);
+	if (verboseLog)
+	{
+		logger->LogInfo(
+			"Call target scan detail: scanned=%zu code=%zu in_func=%zu bl=%zu ldr_pc=%zu added=%zu "
+			"skip_noncode=%zu skip_not_in_func=%zu skip_prev_not_code=%zu skip_misaligned=%zu "
+			"skip_oob=%zu skip_noncode_target=%zu skip_existing=%zu skip_return_thunk=%zu "
+			"skip_invalid_target=%zu skip_duplicate=%zu",
+			totalInstrs, codeInstrs, inFunctionInstrs, blMatches, ldrMatches, addedCount,
+			skippedNonCode, skippedNotInFunction, skippedPrevNotCode, skipMisaligned,
+			skipOutOfBounds, skipNonCodeTarget, skipExistingTarget, skipReturnThunk,
+			skipInvalidTarget, skipDuplicate);
+	}
 	return targetsFound;
 }
 
 /*
  * Scan for 32-bit pointers that reference executable code and add them as functions.
  *
- * This discovers entry points that are only referenced from data (e.g. tables),
- * which is common in firmware and boot ROMs.
+ * This discovers entry points referenced via data tables. To reduce false
+ * positives, only data variables that are referenced from code are considered.
  *
  * Returns the number of pointer targets found.
  */
 static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
-	Ref<Platform> plat, Ref<Logger> logger)
+	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, std::set<uint64_t>* seededFunctions)
 {
 	size_t targetsFound = 0;
 	std::set<uint64_t> addedAddrs;
+	size_t dataVarCount = 0;
+	size_t withCodeRefs = 0;
+	size_t pointerTyped = 0;
+	size_t addedCount = 0;
+	size_t skipNonCodeTarget = 0;
+	size_t skipOutOfBounds = 0;
+	size_t skipMisaligned = 0;
+	size_t skipExistingTarget = 0;
+	size_t skipReturnThunk = 0;
+	size_t skipInvalidTarget = 0;
+	size_t skipNotPointerType = 0;
 
 	uint64_t imageEnd = imageBase + length;
 	uint8_t minHigh = (uint8_t)(imageBase >> 24);
@@ -722,15 +969,39 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 
 	auto addFunction = [&](uint64_t funcAddr) {
 		uint64_t alignedAddr = funcAddr & ~3ULL;
+		if (funcAddr & 3)
+		{
+			skipMisaligned++;
+			return;
+		}
 		if (alignedAddr < imageBase || alignedAddr >= imageEnd)
+		{
+			skipOutOfBounds++;
 			return;
+		}
 		if (!view->IsOffsetCodeSemantics(alignedAddr))
+		{
+			skipNonCodeTarget++;
 			return;
+		}
 		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
+		{
+			skipExistingTarget++;
 			return;
+		}
+		if (LooksLikeReturnThunk(data, dataLen, endian, imageBase, length, alignedAddr))
+		{
+			skipReturnThunk++;
+			return;
+		}
 		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
 			return;
-		view->AddFunctionForAnalysis(plat, alignedAddr);
+		if (view->AddFunctionForAnalysis(plat, alignedAddr))
+		{
+			if (seededFunctions)
+				seededFunctions->insert(alignedAddr);
+			addedCount++;
+		}
 		addedAddrs.insert(alignedAddr);
 		targetsFound++;
 	};
@@ -746,34 +1017,75 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 		if (endian == BigEndian)
 			targetInstr = Swap32(targetInstr);
 		if (targetInstr == 0 || targetInstr == 0xFFFFFFFF)
+		{
+			skipInvalidTarget++;
 			return false;
+		}
 		uint32_t cond = (targetInstr >> 28) & 0xF;
 		if (cond == 0xF)
 		{
 			uint32_t op = (targetInstr >> 24) & 0xFF;
 			if (op != 0xFA && op != 0xFB)
+			{
+				skipInvalidTarget++;
 				return false;
+			}
 		}
 		armv5::Instruction decoded;
 		memset(&decoded, 0, sizeof(decoded));
-		return armv5::armv5_decompose(targetInstr, &decoded, (uint32_t)targetOffset, 0) == 0;
+		if (armv5::armv5_decompose(targetInstr, &decoded, (uint32_t)targetOffset, 0) != 0)
+		{
+			skipInvalidTarget++;
+			return false;
+		}
+		return true;
 	};
 
-	// Skip vector table area; those entries are handled explicitly.
-	uint64_t startOffset = 0x40;
-	for (uint64_t offset = startOffset; offset + 4 <= length; offset += 4)
+	// Only consider data variables that are referenced from code.
+	auto dataVars = view->GetDataVariables();
+	for (const auto& entry : dataVars)
 	{
-		uint64_t locationAddr = imageBase + offset;
+		dataVarCount++;
+		uint64_t locationAddr = entry.first;
+		const DataVariable& dataVar = entry.second;
+		if (locationAddr < imageBase + 0x40)
+			continue;
+		if (locationAddr + 4 > imageEnd)
+			continue;
 		if (view->IsOffsetCodeSemantics(locationAddr))
 			continue;
 
-		uint32_t value = 0;
-		if (offset + 4 <= dataLen)
+		if (view->GetCodeReferences(locationAddr).empty())
+			continue;
+		withCodeRefs++;
+		if (dataVar.type.GetValue())
 		{
-			memcpy(&value, data + offset, sizeof(value));
-			if (endian == BigEndian)
-				value = Swap32(value);
+			Ref<Type> varType = dataVar.type.GetValue();
+			if (varType && varType->GetClass() != PointerTypeClass)
+			{
+				if (varType->GetClass() != ArrayTypeClass)
+				{
+					skipNotPointerType++;
+					continue;
+				}
+				Ref<Type> elemType = varType->GetChildType().GetValue();
+				if (!elemType || elemType->GetClass() != PointerTypeClass)
+				{
+					skipNotPointerType++;
+					continue;
+				}
+			}
 		}
+		pointerTyped++;
+
+		uint64_t offset = locationAddr - imageBase;
+		if (offset + 4 > dataLen)
+			continue;
+
+		uint32_t value = 0;
+		memcpy(&value, data + offset, sizeof(value));
+		if (endian == BigEndian)
+			value = Swap32(value);
 		if (value == 0 || value == 0xFFFFFFFF)
 			continue;
 		if ((value & 3) != 0)
@@ -789,6 +1101,16 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	}
 
 	logger->LogInfo("Pointer target scan: Found %zu pointer targets", targetsFound);
+	if (verboseLog)
+	{
+		logger->LogInfo(
+			"Pointer target scan detail: data_vars=%zu code_ref_vars=%zu pointer_typed=%zu added=%zu "
+			"skip_not_pointer_type=%zu skip_misaligned=%zu skip_oob=%zu skip_noncode_target=%zu "
+			"skip_existing=%zu skip_return_thunk=%zu skip_invalid_target=%zu",
+			dataVarCount, withCodeRefs, pointerTyped, addedCount,
+			skipNotPointerType, skipMisaligned, skipOutOfBounds, skipNonCodeTarget,
+			skipExistingTarget, skipReturnThunk, skipInvalidTarget);
+	}
 	return targetsFound;
 }
 
@@ -1692,25 +2014,39 @@ static bool IsLikelyMMIOPointer(uint32_t value, uint64_t imageBase, uint64_t ima
 	return highNibble >= 4;  // 0x40000000 and above
 }
 
-// Scan for PC-relative loads and type their literal pool entries as pointers
-// This helps Binary Ninja display MMIO addresses correctly instead of as negative ints
+// Scan for PC-relative loads and type their literal pool entries as data
+// This keeps literal pools from being interpreted as code and improves display
 static void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 {
 	ctx.logger->LogDebug("Typing literal pool entries...");
 
 	Ref<Type> ptrType = Type::PointerType(ctx.arch, Type::VoidType());
+	Ref<Type> u32Type = Type::IntegerType(4, false);
 	uint32_t entriesTyped = 0;
+	uint32_t ldrPcCount = 0;
+	uint32_t skippedNonCode = 0;
+	uint32_t skippedInFunction = 0;
+	uint32_t skippedDecodedCode = 0;
+	uint32_t skippedExisting = 0;
 
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
 		uint32_t instr = 0;
 		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr);
+		uint64_t instrAddr = ctx.imageBase + offset;
+		// Only type literal pools referenced from code.
+		if (!ctx.view->IsOffsetCodeSemantics(instrAddr))
+		{
+			skippedNonCode++;
+			continue;
+		}
 
 		// LDR Rd, [PC, #imm] - pattern: cond 01 0 P U 0 W 1 1111 Rd imm12
 		// We want P=1, W=0 (offset addressing, no writeback), Rn=PC (1111)
 		// Mask: 0x0F7F0000, expect: 0x051F0000
 		if ((instr & 0x0F7F0000) == 0x051F0000)
 		{
+			ldrPcCount++;
 			uint32_t imm12 = instr & 0xFFF;
 			bool add = (instr & 0x00800000) != 0;
 			uint64_t pc = offset + 8;  // PC is 8 bytes ahead
@@ -1721,18 +2057,209 @@ static void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 				uint32_t value = 0;
 				ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, literalOffset, value);
 
-				// If it looks like an MMIO pointer, type it as void*
-				if (IsLikelyMMIOPointer(value, ctx.imageBase, ctx.ImageEnd()))
+				uint64_t literalAddr = ctx.imageBase + literalOffset;
+				// Avoid typing data inside discovered functions to reduce accidental code suppression.
+				if (!ctx.view->GetAnalysisFunctionsContainingAddress(literalAddr).empty())
 				{
-					uint64_t literalAddr = ctx.imageBase + literalOffset;
-					ctx.view->DefineDataVariable(literalAddr, ptrType);
-					entriesTyped++;
+					skippedInFunction++;
+					continue;
 				}
+				if (ctx.view->IsOffsetCodeSemantics(literalAddr))
+				{
+					armv5::Instruction decoded;
+					memset(&decoded, 0, sizeof(decoded));
+					if (armv5::armv5_decompose(value, &decoded, (uint32_t)literalOffset, 0) == 0)
+					{
+						skippedDecodedCode++;
+						continue;
+					}
+				}
+				DataVariable existing;
+				if (ctx.view->GetDataVariableAtAddress(literalAddr, existing) &&
+					existing.address == literalAddr)
+				{
+					skippedExisting++;
+					continue;
+				}
+
+				Ref<Type> entryType = u32Type;
+				if (IsLikelyMMIOPointer(value, ctx.imageBase, ctx.ImageEnd()) ||
+					((value & 3) == 0 && value >= ctx.imageBase && value < ctx.ImageEnd()))
+					entryType = ptrType;
+
+				ctx.view->DefineDataVariable(literalAddr, entryType);
+				entriesTyped++;
 			}
 		}
 	}
 
-	ctx.logger->LogInfo("Typed %u literal pool entries as pointers", entriesTyped);
+	ctx.logger->LogInfo("Typed %u literal pool entries as data", entriesTyped);
+	if (ctx.verboseLog)
+	{
+		ctx.logger->LogInfo(
+			"Literal pool typing detail: ldr_pc=%u typed=%u skipped_noncode=%u skipped_in_function=%u "
+			"skipped_decoded_code=%u skipped_existing=%u",
+			ldrPcCount, entriesTyped, skippedNonCode, skippedInFunction, skippedDecodedCode, skippedExisting);
+	}
+}
+
+static void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
+{
+	uint32_t cleared = 0;
+	uint32_t dataVarCount = 0;
+	uint32_t autoVarCount = 0;
+	uint32_t withCodeRefs = 0;
+	uint32_t decodeFailed = 0;
+	ctx.logger->LogDebug("Clearing auto data at code-referenced addresses...");
+
+	auto dataVars = ctx.view->GetDataVariables();
+	for (const auto& entry : dataVars)
+	{
+		dataVarCount++;
+		uint64_t addr = entry.first;
+		const DataVariable& dataVar = entry.second;
+		if (!dataVar.autoDiscovered || dataVar.address != addr)
+			continue;
+		autoVarCount++;
+		if (addr < ctx.imageBase || addr + 8 > ctx.ImageEnd())
+			continue;
+		if (!ctx.view->IsOffsetCodeSemantics(addr))
+			continue;
+		if (ctx.view->GetCodeReferences(addr).empty())
+			continue;
+		withCodeRefs++;
+
+		uint64_t offset = addr - ctx.imageBase;
+		uint32_t word0 = 0;
+		uint32_t word1 = 0;
+		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0))
+		{
+			decodeFailed++;
+			continue;
+		}
+		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1))
+		{
+			decodeFailed++;
+			continue;
+		}
+
+		armv5::Instruction instr0;
+		armv5::Instruction instr1;
+		memset(&instr0, 0, sizeof(instr0));
+		memset(&instr1, 0, sizeof(instr1));
+		if (armv5::armv5_decompose(word0, &instr0, (uint32_t)offset, 0) != 0)
+		{
+			decodeFailed++;
+			continue;
+		}
+		if (armv5::armv5_decompose(word1, &instr1, (uint32_t)(offset + 4), 0) != 0)
+		{
+			decodeFailed++;
+			continue;
+		}
+
+		ctx.view->UndefineDataVariable(addr, false);
+		cleared++;
+	}
+
+	ctx.logger->LogInfo("Cleared %u auto data variables at code-referenced addresses", cleared);
+	if (ctx.verboseLog)
+	{
+		ctx.logger->LogInfo(
+			"Clear auto data detail: data_vars=%u auto=%u code_ref=%u cleared=%u decode_fail=%u",
+			dataVarCount, autoVarCount, withCodeRefs, cleared, decodeFailed);
+	}
+}
+
+static void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
+	const std::set<uint64_t>* seededFunctions)
+{
+	uint32_t cleared = 0;
+	uint32_t targetsCount = 0;
+	uint32_t decodeFailed = 0;
+	const size_t maxInstrs = 16;
+
+	std::vector<uint64_t> targets;
+	if (seededFunctions && !seededFunctions->empty())
+	{
+		targets.reserve(seededFunctions->size());
+		for (auto addr : *seededFunctions)
+			targets.push_back(addr);
+	}
+	else
+	{
+		auto functions = ctx.view->GetAnalysisFunctionList();
+		targets.reserve(functions.size());
+		for (const auto& func : functions)
+		{
+			if (func)
+				targets.push_back(func->GetStart());
+		}
+	}
+
+	for (auto startAddr : targets)
+	{
+		targetsCount++;
+		uint64_t addr = startAddr;
+		for (size_t i = 0; i < maxInstrs; i++)
+		{
+			if (addr + 8 > ctx.ImageEnd())
+				break;
+			uint64_t offset = addr - ctx.imageBase;
+			uint32_t word0 = 0;
+			uint32_t word1 = 0;
+			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0))
+			{
+				decodeFailed++;
+				break;
+			}
+			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1))
+			{
+				decodeFailed++;
+				break;
+			}
+
+			armv5::Instruction instr0;
+			armv5::Instruction instr1;
+			memset(&instr0, 0, sizeof(instr0));
+			memset(&instr1, 0, sizeof(instr1));
+			if (armv5::armv5_decompose(word0, &instr0, (uint32_t)offset, 0) != 0)
+			{
+				decodeFailed++;
+				break;
+			}
+			if (armv5::armv5_decompose(word1, &instr1, (uint32_t)(offset + 4), 0) != 0)
+			{
+				decodeFailed++;
+				break;
+			}
+
+			DataVariable dataVar;
+			if (ctx.view->GetDataVariableAtAddress(addr, dataVar) &&
+				dataVar.address == addr && dataVar.autoDiscovered)
+			{
+				ctx.view->UndefineDataVariable(addr, false);
+				cleared++;
+			}
+
+			if ((instr0.operation == armv5::ARMV5_B) &&
+				(instr0.cond == armv5::COND_AL || instr0.cond == armv5::COND_NV))
+				break;
+			if (instr0.operation == armv5::ARMV5_BX)
+				break;
+
+			addr += 4;
+		}
+	}
+
+	if (cleared)
+		ctx.logger->LogInfo("Cleared %u auto data variables inside function entry blocks", cleared);
+	if (ctx.verboseLog)
+	{
+		ctx.logger->LogInfo(
+			"Entry block clear detail: targets=%u cleared=%u decode_fail=%u",
+			targetsCount, cleared, decodeFailed);
+	}
 }
 
 // Scan for jump tables (ADD PC, PC, Rn pattern) and mark them as uint32 arrays
@@ -1822,6 +2349,17 @@ bool Armv5FirmwareView::Init()
 	uint64_t length = GetParentView()->GetLength();
 	uint64_t imageBase = 0;
 	bool imageBaseFromUser = false;
+	/*
+	 * Default to core-analysis behavior (match other Binary Ninja views):
+	 * - Let linear sweep and recursive descent do their work.
+	 * - Avoid extra custom scans unless the user explicitly enables them.
+	 */
+	bool enablePrologueScan = false;
+	bool enableCallTargetScan = false;
+	bool enablePointerTargetScan = false;
+	bool enableLiteralPoolTyping = false;
+	bool enableClearAutoDataOnCodeRefs = false;
+	bool enableVerboseLogging = false;
 
 	// Get load settings if available
 	Ref<Settings> settings = GetLoadSettings(GetTypeName());
@@ -1829,6 +2367,21 @@ bool Armv5FirmwareView::Init()
 	{
 		imageBase = settings->Get<uint64_t>("loader.imageBase", this);
 		imageBaseFromUser = (imageBase != 0);
+	}
+	if (settings)
+	{
+		if (settings->Contains("loader.armv5.firmware.scanPrologues"))
+			enablePrologueScan = settings->Get<bool>("loader.armv5.firmware.scanPrologues", this);
+		if (settings->Contains("loader.armv5.firmware.scanCallTargets"))
+			enableCallTargetScan = settings->Get<bool>("loader.armv5.firmware.scanCallTargets", this);
+		if (settings->Contains("loader.armv5.firmware.scanPointerTargets"))
+			enablePointerTargetScan = settings->Get<bool>("loader.armv5.firmware.scanPointerTargets", this);
+		if (settings->Contains("loader.armv5.firmware.typeLiteralPools"))
+			enableLiteralPoolTyping = settings->Get<bool>("loader.armv5.firmware.typeLiteralPools", this);
+		if (settings->Contains("loader.armv5.firmware.clearAutoDataOnCodeRefs"))
+			enableClearAutoDataOnCodeRefs = settings->Get<bool>("loader.armv5.firmware.clearAutoDataOnCodeRefs", this);
+		if (settings->Contains("loader.armv5.firmware.verboseLogging"))
+			enableVerboseLogging = settings->Get<bool>("loader.armv5.firmware.verboseLogging", this);
 	}
 
 	// Handle platform override from settings
@@ -1893,12 +2446,10 @@ bool Armv5FirmwareView::Init()
 	// Add sections
 	// Vector table (0x00-0x1F): code (contains branch/load instructions)
 	// Vector literal pool (0x20-0x3F): data (contains handler addresses)
-	// Rest: DefaultSectionSemantics - rely on recursive descent from entry points
-	// Using ReadOnlyCodeSectionSemantics would trigger linear sweep which creates
-	// many false functions when data is embedded in code sections
+	// Rest: mark as code to follow core Binary Ninja view behavior (linear sweep + RD)
 	AddAutoSection("vectors", imageBase, 0x20, ReadOnlyCodeSectionSemantics);
 	AddAutoSection("vector_ptrs", imageBase + 0x20, 0x20, ReadOnlyDataSectionSemantics);
-	AddAutoSection("code", imageBase + 0x40, length - 0x40, DefaultSectionSemantics);
+	AddAutoSection("code", imageBase + 0x40, length - 0x40, ReadOnlyCodeSectionSemantics);
 
 	if (m_arch && m_plat)
 	{
@@ -2013,11 +2564,14 @@ bool Armv5FirmwareView::Init()
 	// Add vector table entries and handler functions for analysis
 	if (m_plat)
 	{
+		std::set<uint64_t> seededFunctions;
+
 		// Add vector table entries as functions (they contain LDR PC or B instructions)
 		for (int i = 0; i < 8; i++)
 		{
 			uint64_t vectorAddr = imageBase + (i * 4);
-			AddFunctionForAnalysis(m_plat, vectorAddr);
+			if (AddFunctionForAnalysis(m_plat, vectorAddr))
+				seededFunctions.insert(vectorAddr);
 		}
 
 		// Add resolved handler functions
@@ -2025,7 +2579,8 @@ bool Armv5FirmwareView::Init()
 		{
 			if (handlerAddrs[i] != 0 && handlerAddrs[i] >= imageBase && handlerAddrs[i] < imageBase + length)
 			{
-				AddFunctionForAnalysis(m_plat, handlerAddrs[i]);
+				if (AddFunctionForAnalysis(m_plat, handlerAddrs[i]))
+					seededFunctions.insert(handlerAddrs[i]);
 				DefineAutoSymbol(new Symbol(FunctionSymbol, handlerNames[i], handlerAddrs[i], GlobalBinding));
 
 				m_logger->LogDebug("Added handler function: %s at 0x%llx",
@@ -2076,7 +2631,8 @@ bool Armv5FirmwareView::Init()
 						// Verify cleanup address is within the image
 						if (cleanupAddr >= imageBase && cleanupAddr < imageBase + length)
 						{
-							AddFunctionForAnalysis(m_plat, cleanupAddr);
+							if (AddFunctionForAnalysis(m_plat, cleanupAddr))
+								seededFunctions.insert(cleanupAddr);
 
 							const char* cleanupName = (vecIdx == 6) ? "irq_return" : "fiq_return";
 							DefineAutoSymbol(new Symbol(FunctionSymbol, cleanupName, cleanupAddr, GlobalBinding));
@@ -2095,23 +2651,150 @@ bool Armv5FirmwareView::Init()
 		}
 
 		// Analyze MMU configuration to discover memory regions
-		AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
+		/*
+		 * Timing helper for firmware-specific analysis passes.
+		 * This only emits logs when verbose firmware logging is enabled, so we can
+		 * pinpoint slow phases without spamming normal runs.
+		 */
+		auto timePass = [&](const char* label, auto&& fn)
+		{
+			if (!enableVerboseLogging)
+			{
+				fn();
+				return;
+			}
+
+			auto start = std::chrono::steady_clock::now();
+			fn();
+			double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::steady_clock::now() - start).count();
+			m_logger->LogInfo("Firmware analysis timing: %s took %.3f s", label, seconds);
+		};
+
+		timePass("MMU analysis", [&]()
+		{
+			AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
+		});
+
+		// Define literal pool entries as data to avoid disassembling them as code
+		if (enableLiteralPoolTyping)
+		{
+			FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+				m_arch, m_plat, m_logger, enableVerboseLogging, this};
+			timePass("Literal pool typing", [&]()
+			{
+				TypeLiteralPoolEntries(scanCtx);
+			});
+			if (enableClearAutoDataOnCodeRefs)
+			{
+				timePass("Clear auto data on code refs", [&]()
+				{
+					ClearAutoDataOnCodeReferences(scanCtx);
+				});
+			}
+		}
 
 		// Scan for common function entry patterns to seed recursive descent analysis.
 		// These entry points are then expanded via call graph traversal.
 		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
-		ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
-			m_arch, thumbArch, m_plat, m_logger);
+		if (enablePrologueScan)
+		{
+			timePass("Function prologue scan", [&]()
+			{
+				ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
+					m_arch, thumbArch, m_plat, m_logger, enableVerboseLogging, &seededFunctions);
+			});
+		}
 
 		// Scan for pointer targets in data that reference executable code.
-		ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-			m_plat, m_logger);
+		if (enableClearAutoDataOnCodeRefs)
+		{
+			FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+				m_arch, m_plat, m_logger, enableVerboseLogging, this};
+			timePass("Clear auto data in function entry blocks (pre-analysis)", [&]()
+			{
+				ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
+			});
+		}
 
-		// Scan for BL/BLX/LDR PC call targets to discover additional functions.
-		// This finds functions that are called but may not have recognizable prologues
-		// (e.g., optimized leaf functions, hand-written assembly, Thumb code).
-		ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-			m_plat, m_logger);
+		if ((enablePointerTargetScan || enableCallTargetScan) && !m_postAnalysisScanEvent)
+		{
+			m_logger->LogInfo("Deferring pointer/call target scan until analysis completes");
+			bool postPointerScan = enablePointerTargetScan;
+			bool postCallScan = enableCallTargetScan;
+			bool postClearAutoData = enableClearAutoDataOnCodeRefs;
+			bool postVerbose = enableVerboseLogging;
+			m_postAnalysisScanEvent = AddAnalysisCompletionEvent([this, postPointerScan, postCallScan,
+				postClearAutoData, postVerbose]()
+			{
+				if (m_postAnalysisScansDone)
+					return;
+				m_postAnalysisScansDone = true;
+
+				uint64_t imageBase = GetStart();
+				uint64_t length = GetLength();
+				if (!length)
+					return;
+
+				uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
+				DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
+				const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
+				uint64_t fileDataLen = fileBuf.GetLength();
+				if (!fileData || fileDataLen == 0)
+					return;
+
+				BinaryReader reader(GetParentView());
+				reader.SetEndianness(m_endian);
+
+				/*
+				 * Timing helper for post-analysis scans (runs after core analysis completes).
+				 * These timers let us verify whether "phase 3" time is dominated by our scans
+				 * or by core Binary Ninja analysis.
+				 */
+				auto timePostPass = [&](const char* label, auto&& fn)
+				{
+					if (!postVerbose)
+					{
+						fn();
+						return;
+					}
+
+					auto start = std::chrono::steady_clock::now();
+					fn();
+					double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+						std::chrono::steady_clock::now() - start).count();
+					m_logger->LogInfo("Firmware post-analysis timing: %s took %.3f s", label, seconds);
+				};
+
+				std::set<uint64_t> addedFunctions;
+				if (postPointerScan)
+				{
+					timePostPass("Pointer target scan", [&]()
+					{
+						ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+							m_plat, m_logger, postVerbose, &addedFunctions);
+					});
+				}
+				if (postCallScan)
+				{
+					timePostPass("Call target scan", [&]()
+					{
+						ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+							m_plat, m_logger, postVerbose, &addedFunctions);
+					});
+				}
+
+				if (postClearAutoData && !addedFunctions.empty())
+				{
+					FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+						m_arch, m_plat, m_logger, postVerbose, this};
+					timePostPass("Clear auto data in function entry blocks (post-analysis)", [&]()
+					{
+						ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
+					});
+				}
+			});
+		}
 
 		// NOTE: Exception handlers are named (irq_handler, fiq_handler, etc.) but we
 		// don't auto-apply the irq-handler calling convention. Users can apply it
@@ -2300,6 +2983,49 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView* data)
 	}
 
 	Ref<Settings> settings = GetDefaultLoadSettingsForData(viewRef);
+
+	settings->RegisterSetting("loader.armv5.firmware.scanPrologues",
+		R"({
+		"title" : "Scan for function prologues",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Discover additional function entry points by scanning for common prologue patterns."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.scanCallTargets",
+		R"({
+		"title" : "Scan for call targets",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Discover additional function entry points from direct call and indirect branch targets."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.scanPointerTargets",
+		R"({
+		"title" : "Scan for pointer targets",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Discover function entry points referenced by data pointers."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.typeLiteralPools",
+		R"({
+		"title" : "Type literal pool entries",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Define literal pool entries as data to avoid disassembling them as code."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.clearAutoDataOnCodeRefs",
+		R"({
+		"title" : "Clear auto data on code references",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Undefine auto-discovered data at code-referenced addresses when nearby bytes decode as valid instructions."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.verboseLogging",
+		R"({
+		"title" : "Verbose firmware analysis logging",
+		"type" : "boolean",
+		"default" : false,
+		"description" : "Emit per-pass summary logs for firmware analysis heuristics without enabling global debug logging."
+		})");
 
 	// Allow overriding image base and platform
 	vector<string> overrides = {"loader.imageBase", "loader.platform"};

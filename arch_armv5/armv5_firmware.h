@@ -21,6 +21,8 @@ namespace BinaryNinja
 		Ref<Architecture> m_arch;
 		Ref<Platform> m_plat;
 		Ref<Logger> m_logger;
+		Ref<AnalysisCompletionEvent> m_postAnalysisScanEvent;
+		bool m_postAnalysisScansDone;
 
 		virtual uint64_t PerformGetEntryPoint() const override;
 		virtual bool PerformIsExecutable() const override { return true; }

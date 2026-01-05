@@ -259,47 +259,57 @@ static inline ExprId DirectJump(Architecture *arch, LowLevelILFunction &il, uint
 }
 
 /*
- * ============================================================================
- * FIXED CONDITIONAL JUMP (B{cond})
- * ============================================================================
+ * Conditional branch helper (matches ARMv7 plugin behavior).
  *
- * Old behavior:
- *   - Always emitted a Jump(falseTarget), even when falseTarget == addr+4.
- *   - This creates strong edges and encourages tail merging.
- *
- * New behavior:
- *   - Unconditional B: emit Jump(target) and terminate.
- *   - Conditional B: emit If(cond) goto target else fallthrough.
- *
- * Binary Ninja can naturally model the fallthrough to the next instruction,
- * which is stronger for function boundary recovery.
+ * Emit explicit true/false edges so the core analyzer can build a complete CFG.
+ * Use a direct label jump when a label already exists for the target.
  */
 static void ConditionalJump(
     Architecture *arch,
     LowLevelILFunction &il,
     uint32_t cond,
     size_t addrSize,
-    uint64_t targetAddr)
+    uint64_t trueTarget,
+    uint64_t falseTarget)
 {
-    (void)arch;
+    BNLowLevelILLabel *trueLabel = il.GetLabelForAddress(arch, trueTarget);
+    BNLowLevelILLabel *falseLabel = il.GetLabelForAddress(arch, falseTarget);
 
-    /* Unconditional branch: jump, no fallthrough */
     if (IsUnconditional(cond))
     {
-        il.AddInstruction(il.Jump(il.ConstPointer(addrSize, targetAddr)));
+        il.AddInstruction(DirectJump(arch, il, trueTarget, addrSize));
         return;
     }
 
-    /*
-     * Conditional branch:
-     *  if (cond) goto target;
-     *  else fallthrough naturally
-     */
-    LowLevelILLabel doJump, fallthrough;
-    il.AddInstruction(il.If(GetCondition(il, cond), doJump, fallthrough));
-    il.MarkLabel(doJump);
-    il.AddInstruction(il.Jump(il.ConstPointer(addrSize, targetAddr)));
-    il.MarkLabel(fallthrough);
+    if (trueLabel && falseLabel)
+    {
+        il.AddInstruction(il.If(GetCondition(il, cond), *trueLabel, *falseLabel));
+        return;
+    }
+
+    LowLevelILLabel trueCode, falseCode;
+
+    if (trueLabel)
+    {
+        il.AddInstruction(il.If(GetCondition(il, cond), *trueLabel, falseCode));
+        il.MarkLabel(falseCode);
+        il.AddInstruction(il.Jump(il.ConstPointer(addrSize, falseTarget)));
+        return;
+    }
+
+    if (falseLabel)
+    {
+        il.AddInstruction(il.If(GetCondition(il, cond), trueCode, *falseLabel));
+        il.MarkLabel(trueCode);
+        il.AddInstruction(il.Jump(il.ConstPointer(addrSize, trueTarget)));
+        return;
+    }
+
+    il.AddInstruction(il.If(GetCondition(il, cond), trueCode, falseCode));
+    il.MarkLabel(trueCode);
+    il.AddInstruction(il.Jump(il.ConstPointer(addrSize, trueTarget)));
+    il.MarkLabel(falseCode);
+    il.AddInstruction(il.Jump(il.ConstPointer(addrSize, falseTarget)));
 }
 
 /* Helper to count number of registers in a register list */
@@ -790,15 +800,7 @@ bool LiftDataProcessing(Architecture *arch, LowLevelILFunction &il,
 }
 
 /*
- * ============================================================================
- * FIXED BRANCH LIFTING
- * ============================================================================
- *
- * Fixes:
- *  - Conditional B now has fallthrough (return true)
- *  - Unconditional B terminates (return false)
- *  - BX LR becomes Return() (no operand!)
- *  - BX reg uses Jump() not TailCall() unless proven
+ * Branch lifting for ARM mode (match ARMv7 IL patterns).
  */
 bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
                 Instruction &instr, uint64_t addr, bool thumb)
@@ -810,9 +812,8 @@ bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
     {
     case ARMV5_B:
     {
-        ConditionalJump(arch, il, instr.cond, addrSize, instr.operands[0].imm);
-
-        return true;
+        ConditionalJump(arch, il, instr.cond, addrSize, instr.operands[0].imm, addr + 4);
+        return false;
     }
 
     case ARMV5_BL:
@@ -839,21 +840,8 @@ bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
 
     case ARMV5_BX:
     {
-        Register rm = instr.operands[0].reg;
-
-        if (rm == REG_LR)
-        {
-            /* BX LR is a function return */
-            ConditionExecute(il, instr.cond,
-                             il.Return(ReadRegisterOrPointer(il, rm, addr)));
-        }
-        else
-        {
-            /* BX to non-LR register - use TailCall for better function boundary detection */
-            ConditionExecute(il, instr.cond,
-                             il.TailCall(ReadRegisterOrPointer(il, rm, addr)));
-        }
-
+        ConditionExecute(il, instr.cond,
+                         il.Jump(ReadILOperand(il, instr.operands[0], addr, true)));
         return true;
     }
 

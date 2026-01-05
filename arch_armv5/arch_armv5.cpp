@@ -861,10 +861,8 @@ protected:
     if (disassembled == 1)
     {
       len = 4;
-      bool ok = GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
-    if (!ok)
-      il.AddInstruction(il.Unimplemented());
-    return true;}
+      return GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
+    }
 
     LowLevelILLabel doneLabel;
     LowLevelILLabel condLabels[2];
@@ -1755,8 +1753,8 @@ public:
     if (!Disassemble(data, addr, len, instr))
     {
       il.AddInstruction(il.Undefined());
-    len = 4;
-    return false;
+      len = 4;
+      return false;
     }
 
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
@@ -1764,8 +1762,8 @@ public:
         instr.operation == ARMV5_UNPREDICTABLE)
     {
       il.AddInstruction(il.Undefined());
-    len = 4;
-    return false;
+      len = 4;
+      return false;
     }
 
     /* Treat likely data as invalid instructions */
@@ -1782,10 +1780,8 @@ public:
       return GetCoalescedLowLevelIL(data, addr, len, il, instr);
 
     len = 4;
-    bool ok = GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
-    if (!ok)
-      il.AddInstruction(il.Unimplemented());
-    return true;}
+    return GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
+  }
 
   virtual string GetIntrinsicName(uint32_t intrinsic) override
   {
@@ -2368,18 +2364,27 @@ public:
       return false;
 
     const InstructionOperand &memOp = instr.operands[1];
-    if (memOp.cls != MEM_IMM)
-      return false;
-    if (memOp.reg != REG_PC)
-      return false;
-    if (memOp.flags.offsetRegUsed)
-      return false;
-
-    uint64_t literalAddr = jumpAddr + 8;
-    if (memOp.flags.add)
-      literalAddr += memOp.imm;
+    uint64_t literalAddr = 0;
+    if (memOp.cls == LABEL)
+    {
+      /* Disassembler pre-computes PC-relative effective address into LABEL */
+      literalAddr = memOp.imm;
+    }
     else
-      literalAddr -= memOp.imm;
+    {
+      if (memOp.cls != MEM_IMM)
+        return false;
+      if (memOp.reg != REG_PC)
+        return false;
+      if (memOp.flags.offsetRegUsed)
+        return false;
+
+      literalAddr = jumpAddr + 8;
+      if (memOp.flags.add)
+        literalAddr += memOp.imm;
+      else
+        literalAddr -= memOp.imm;
+    }
 
     DataBuffer entryData = view->ReadBuffer(literalAddr, 4);
     if (entryData.GetLength() < 4)
@@ -2547,12 +2552,30 @@ public:
     auto &haltedDisassemblyAddresses = context.GetHaltedDisassemblyAddresses();
     auto &inlinedUnresolvedIndirectBranches = context.GetInlinedUnresolvedIndirectBranches();
 
+    auto defineLocalLabel = [&](uint64_t addr) {
+      if (addr == function->GetStart())
+        return;
+      if (!data->IsOffsetCodeSemantics(addr))
+        return;
+      DataVariable dataVar;
+      if (data->GetDataVariableAtAddress(addr, dataVar) && (dataVar.address == addr))
+        return;
+      if (!data->GetAnalysisFunctionsForAddress(addr).empty())
+        return;
+      if (data->GetSymbolByAddress(addr))
+        return;
+      size_t width = data->GetAddressSize() * 2;
+      string name = fmt::format("loc_{:0{}X}", addr, width);
+      data->DefineAutoSymbol(new Symbol(LocalLabelSymbol, name, addr, LocalBinding));
+    };
+
     bool hasInvalidInstructions = false;
     set<ArchAndAddr> guidedSourceBlockTargets;
     auto guidedSourceBlocks = function->GetGuidedSourceBlocks();
     set<ArchAndAddr> guidedSourceBlocksSet;
     for (const auto &block : guidedSourceBlocks)
       guidedSourceBlocksSet.insert(block);
+    set<uint64_t> loggedUnresolvedIndirect;
 
     BNStringReference strRef;
     auto targetExceedsByteLimit = [](const BNStringReference &strRef)
@@ -2640,6 +2663,46 @@ public:
         if (data->AnalysisIsAborted())
           return;
 
+        DataVariable dataVar;
+        if (data->GetDataVariableAtAddress(location.address, dataVar) &&
+            (dataVar.address == location.address) && (location.address != function->GetStart()))
+        {
+          bool smallAutoData = false;
+          if (dataVar.type.GetValue())
+          {
+            uint64_t width = dataVar.type.GetValue()->GetWidth();
+            smallAutoData = (width <= 1);
+          }
+          bool canRecover =
+              dataVar.autoDiscovered && (smallAutoData || !dataVar.type.GetValue()) &&
+              data->IsOffsetCodeSemantics(location.address) &&
+              (location.address - function->GetStart() <= 0x40);
+          if (canRecover)
+          {
+            uint8_t probe[BN_MAX_INSTRUCTION_LENGTH];
+            size_t probeLen = data->Read(probe, location.address, location.arch->GetMaxInstructionLength());
+            InstructionInfo probeInfo;
+            if (probeLen && location.arch->GetInstructionInfo(probe, location.address, probeLen, probeInfo) &&
+                probeInfo.length > 0)
+            {
+              uint64_t nextAddr = location.address + probeInfo.length;
+              uint8_t probeNext[BN_MAX_INSTRUCTION_LENGTH];
+              size_t probeNextLen = data->Read(probeNext, nextAddr, location.arch->GetMaxInstructionLength());
+              InstructionInfo probeNextInfo;
+              if (probeNextLen &&
+                  location.arch->GetInstructionInfo(probeNext, nextAddr, probeNextLen, probeNextInfo) &&
+                  probeNextInfo.length > 0)
+              {
+                data->UndefineDataVariable(location.address, true);
+                continue;
+              }
+            }
+          }
+
+          // Stop at typed data (literal pools) or non-code bytes.
+          break;
+        }
+
         if (!delaySlotCount)
         {
           auto blockIter = instrBlocks.find(location);
@@ -2681,6 +2744,7 @@ public:
               targetBlock->AddPendingOutgoingEdge(UnconditionalBranch, location.address, nullptr, true);
 
               seenBlocks.insert(location);
+              defineLocalLabel(location.address);
               context.AddFunctionBasicBlock(splitBlock);
 
               block->AddPendingOutgoingEdge(UnconditionalBranch, location.address);
@@ -2761,6 +2825,7 @@ public:
             {
               endsBlock = true;
 
+              bool callLikeIndirect = false;
               if (info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch)
               {
                 Ref<LowLevelILFunction> ilFunc = new LowLevelILFunction(location.arch, nullptr);
@@ -2770,8 +2835,80 @@ public:
                 {
                   if ((*ilFunc)[idx].operation == LLIL_CALL)
                   {
+                    callLikeIndirect = true;
                     endsBlock = false;
                     break;
+                  }
+                  if ((*ilFunc)[idx].operation == LLIL_TAILCALL)
+                  {
+                    callLikeIndirect = true;
+                    break;
+                  }
+                }
+              }
+
+              /*
+               * Heuristic: treat "MOV/ADD LR, PC; LDR PC, [Rn, #imm]" as an indirect call.
+               *
+               * Rationale:
+               * - On ARMv5, compilers often synthesize a call through a function pointer
+               *   (vtable/dispatch) using:
+               *       mov lr, pc
+               *       ldr pc, [rX, #imm]
+               * - Semantically this behaves like BLX/BL: LR is set to the return address
+               *   and control returns to the next instruction after the LDR.
+               * - We cannot resolve the target statically, but we can avoid logging it as
+               *   "unresolved indirect control flow" because it is a normal callsite.
+               *
+               * Implementation notes:
+               * - Only apply in ARM mode (4-byte instructions).
+               * - Confirm the current instruction is an LDR into PC.
+               * - Look back one instruction for LR being set from PC (MOV or ADD #imm).
+               * - If matched, mark as call-like and allow fallthrough (endsBlock = false).
+               */
+              if (!callLikeIndirect && (info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch) &&
+                  (info.length == 4) && (location.address >= 4))
+              {
+                Instruction curInstr{};
+                uint32_t bigEndian = (location.arch->GetEndianness() == BigEndian);
+                if (armv5_decompose(*(uint32_t *)opcode, &curInstr, (uint32_t)location.address, bigEndian) == 0)
+                {
+                  bool isLdrPc =
+                      (curInstr.operation == ARMV5_LDR) &&
+                      (curInstr.operands[0].cls == REG) &&
+                      (curInstr.operands[0].reg == REG_PC);
+
+                  if (isLdrPc)
+                  {
+                    DataBuffer prevData = data->ReadBuffer(location.address - 4, 4);
+                    if (prevData.GetLength() == 4)
+                    {
+                      Instruction prevInstr{};
+                      if (armv5_decompose(*(uint32_t *)prevData.GetData(), &prevInstr,
+                                          (uint32_t)(location.address - 4), bigEndian) == 0)
+                      {
+                        bool movLrPc =
+                            (prevInstr.operation == ARMV5_MOV) &&
+                            (prevInstr.operands[0].cls == REG) &&
+                            (prevInstr.operands[0].reg == REG_LR) &&
+                            (prevInstr.operands[1].cls == REG) &&
+                            (prevInstr.operands[1].reg == REG_PC);
+
+                        bool addLrPcImm =
+                            (prevInstr.operation == ARMV5_ADD) &&
+                            (prevInstr.operands[0].cls == REG) &&
+                            (prevInstr.operands[0].reg == REG_LR) &&
+                            (prevInstr.operands[1].cls == REG) &&
+                            (prevInstr.operands[1].reg == REG_PC) &&
+                            (prevInstr.operands[2].cls == IMM);
+
+                        if (movLrPc || addLrPcImm)
+                        {
+                          callLikeIndirect = true;
+                          endsBlock = false;
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -2810,14 +2947,15 @@ public:
                       data->GetAnalysisFunction(targetPlatform, branch.address))
                     continue;
 
-                  if (isGuidedSourceBlock)
-                    guidedSourceBlockTargets.insert(branch);
+                if (isGuidedSourceBlock)
+                  guidedSourceBlockTargets.insert(branch);
 
-                  block->AddPendingOutgoingEdge(IndirectBranch, branch.address, branch.arch);
-                  if (seenBlocks.count(branch) == 0)
-                  {
-                    blocksToProcess.push(branch);
-                    seenBlocks.insert(branch);
+                defineLocalLabel(branch.address);
+                block->AddPendingOutgoingEdge(IndirectBranch, branch.address, branch.arch);
+                if (seenBlocks.count(branch) == 0)
+                {
+                  blocksToProcess.push(branch);
+                  seenBlocks.insert(branch);
                   }
                 }
               }
@@ -2846,6 +2984,14 @@ public:
               }
               else
               {
+                if ((info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch) &&
+                    !callLikeIndirect && resolvedTargets.empty() &&
+                    (loggedUnresolvedIndirect.count(location.address) == 0))
+                {
+                  loggedUnresolvedIndirect.insert(location.address);
+                  BNLogInfo("Unresolved indirect control flow at 0x%" PRIx64 " in function 0x%" PRIx64,
+                            location.address, function->GetStart());
+                }
                 block->SetUndeterminedOutgoingEdges(true);
               }
             };
@@ -2945,6 +3091,8 @@ public:
                   if (isGuidedSourceBlock)
                     guidedSourceBlockTargets.insert(target);
 
+                  if (info.branchType[i] != FalseBranch)
+                    defineLocalLabel(target.address);
                   block->AddPendingOutgoingEdge(info.branchType[i], target.address, target.arch);
                   if (seenBlocks.count(target) == 0)
                   {
