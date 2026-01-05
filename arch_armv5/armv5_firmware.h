@@ -35,6 +35,7 @@ namespace BinaryNinja
 		Armv5FirmwareView(BinaryView* data, bool parseOnly = false);
 		virtual ~Armv5FirmwareView();
 		virtual bool Init() override;
+		void RunFirmwareWorkflowScans();
 	};
 
 	class Armv5FirmwareViewType: public BinaryViewType
@@ -50,4 +51,5 @@ namespace BinaryNinja
 	};
 
 	void InitArmv5FirmwareViewType();
+	void RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view);
 }

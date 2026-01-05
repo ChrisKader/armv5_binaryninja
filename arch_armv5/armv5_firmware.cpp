@@ -8,7 +8,10 @@
 #include "armv5_firmware.h"
 #include "armv5_disasm/armv5.h"
 #include <set>
+#include <unordered_map>
+#include <mutex>
 #include <map>
+#include <unordered_map>
 #include <cstring>
 #include <chrono>
 
@@ -34,9 +37,9 @@ struct FirmwareScanTuning
 	uint32_t minValidInstr = 2;   // Minimum consecutive valid ARM instructions
 	uint32_t minBodyInstr = 1;    // Minimum valid instructions after the prologue
 	uint32_t maxLiteralRun = 2;   // Max consecutive LDR literal instructions
-	uint32_t minPointerRun = 3;  // Minimum consecutive pointers to treat as table
+	uint32_t minPointerRun = 3;  // Minimum consecutive pointers to treat as table (conservative by default)
 	bool scanRawPointerTables = true;  // Scan raw data for pointer tables
-	bool requirePointerTableCodeRefs = true;  // Require code refs into pointer tables
+	bool requirePointerTableCodeRefs = true;  // Require code refs into pointer tables to avoid runaway false positives
 	bool allowPointerTablesInCode = false;  // Allow raw pointer tables inside code semantics
 	bool requireCallInFunction = false;  // Require call targets to be inside existing functions
 };
@@ -80,6 +83,19 @@ static inline bool IsLdrLiteral(uint32_t instr)
 {
 	// bits[27:26]=01, bit25=0 (imm), bit20=1 (L), Rn=PC (0b1111)
 	return (instr & 0x0E1F0000) == 0x041F0000;
+}
+
+static inline bool IsJumpTableDispatchInstruction(uint32_t instr)
+{
+	// LDR PC, [PC, #imm] (PC-relative indirect jump)
+	if ((instr & 0x0F7FF000) == 0x051FF000)
+		return true;
+
+	// ADD PC, PC, Rn (computed jump used by switch tables)
+	if ((instr & 0x0FFFF010) == 0x008FF000)
+		return true;
+
+	return false;
 }
 
 static bool IsPcWriteInstruction(const Instruction& instr)
@@ -163,6 +179,44 @@ static bool IsPcWriteInstruction(const Instruction& instr)
 	return false;
 }
 
+static bool IsLikelyFunctionBoundary(const uint8_t* data, uint64_t dataLen, BNEndianness endian,
+	uint64_t imageBase, uint64_t length, uint64_t addr)
+{
+	// Treat the start of the code region as a boundary.
+	if (addr <= imageBase + 0x40)
+		return true;
+	if (addr < imageBase + 4)
+		return true;
+
+	uint64_t prevAddr = addr - 4;
+	if (prevAddr < imageBase || prevAddr + 4 > imageBase + length)
+		return false;
+
+	uint64_t prevOff = prevAddr - imageBase;
+	if (prevOff + 4 > dataLen)
+		return false;
+
+	uint32_t prevWord = 0;
+	memcpy(&prevWord, data + prevOff, sizeof(prevWord));
+	if (endian == BigEndian)
+		prevWord = Swap32(prevWord);
+
+	// Padding or erased data implies a boundary.
+	if (IsPaddingWord(prevWord))
+		return true;
+
+	armv5::Instruction decoded;
+	memset(&decoded, 0, sizeof(decoded));
+	if (armv5::armv5_decompose(prevWord, &decoded, (uint32_t)prevAddr, (uint32_t)(endian == BigEndian)) != 0)
+		return true;
+
+	// Only treat unconditional PC writes as hard boundaries.
+	if (UNCONDITIONAL(decoded.cond) && IsPcWriteInstruction(decoded))
+		return true;
+
+	return false;
+}
+
 static bool IsAllowedPcWriteStart(const Instruction& instr)
 {
 	// Allow unconditional/conditional branch thunks and BL/BLX/BX.
@@ -205,6 +259,15 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 	if (view->GetDataVariableAtAddress(addr, dataVar) && (dataVar.address == addr))
 		return false;
 
+	// Align candidate validation with core analysis by using the architecture's
+	// GetInstructionInfo callback. This applies the same IsLikelyData heuristics
+	// and undefined/unpredictable filtering the core uses when accepting code.
+	Ref<Architecture> arch = view->GetDefaultArchitecture();
+	if (!arch)
+		arch = Architecture::GetByName("armv5");
+	if (!arch)
+		return false;
+
 	uint64_t offset = addr - imageBase;
 	if (offset + 4 > dataLen)
 		return false;
@@ -222,6 +285,7 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 	uint32_t validCount = 0;
 	uint32_t bodyCount = 0;
 	uint32_t literalRun = 0;
+	uint32_t paddingRun = 0;
 
 	for (uint32_t i = 0; i < window; i++)
 	{
@@ -235,6 +299,26 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 			instr = Swap32(instr);
 
 		if (i == 0 && IsPaddingWord(instr))
+			return false;
+
+		// Treat consecutive padding words as data, not code.
+		if (IsPaddingWord(instr))
+		{
+			paddingRun++;
+			if (paddingRun >= 2)
+				return false;
+			continue;
+		}
+		else
+		{
+			paddingRun = 0;
+		}
+
+		InstructionInfo info;
+		size_t maxLen = 4;
+		if (!arch->GetInstructionInfo(data + curOff, addr + i * 4, maxLen, info))
+			return false;
+		if (info.length != 4)
 			return false;
 
 		armv5::Instruction decoded;
@@ -259,6 +343,28 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 
 		if (literalRun > tuning.maxLiteralRun)
 			return false;
+
+		// Reject candidates that immediately branch/jump outside the binary image.
+		// This prevents core analysis from chasing invalid targets and reading past EOF.
+		if ((instr & 0x0E000000) == 0x0A000000)
+		{
+			int32_t imm24 = (int32_t)(instr & 0x00FFFFFF);
+			if (imm24 & 0x00800000)
+				imm24 |= 0xFF000000;
+			int64_t target = (int64_t)(addr + (i * 4) + 8) + ((int64_t)imm24 << 2);
+			if (target < (int64_t)imageBase || target >= (int64_t)(imageBase + length))
+				return false;
+		}
+
+		// LDR PC, [PC, #imm] should reference a literal inside the image.
+		if ((instr & 0x0F7FF000) == 0x051FF000)
+		{
+			uint32_t imm12 = instr & 0xFFF;
+			bool add = (instr & 0x00800000) != 0;
+			uint64_t litAddr = add ? (addr + (i * 4) + 8 + imm12) : (addr + (i * 4) + 8 - imm12);
+			if (litAddr < imageBase || (litAddr + 4) > (imageBase + length))
+				return false;
+		}
 	}
 
 	if (validCount < minValid)
@@ -270,8 +376,14 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 }
 
 static bool ReadU32At(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
-	BNEndianness endian, uint64_t offset, uint32_t& out)
+	BNEndianness endian, uint64_t offset, uint32_t& out, uint64_t length)
 {
+	// Prevent out-of-bounds reads against the underlying BinaryView.
+	if (length != 0 && offset + 4 > length)
+	{
+		out = 0;
+		return false;
+	}
 	if (data && offset + 4 <= dataLen)
 	{
 		memcpy(&out, data + offset, sizeof(out));
@@ -280,11 +392,30 @@ static bool ReadU32At(BinaryReader& reader, const uint8_t* data, uint64_t dataLe
 		return true;
 	}
 	reader.Seek(offset);
-	out = reader.Read32();
-	return true;
+	try
+	{
+		out = reader.Read32();
+		return true;
+	}
+	catch (...)
+	{
+		out = 0;
+		return false;
+	}
 }
 
 static Armv5FirmwareViewType* g_armv5FirmwareViewType = nullptr;
+static std::mutex& FirmwareViewMutex()
+{
+	static std::mutex* mutex = new std::mutex();
+	return *mutex;
+}
+
+static std::unordered_map<BNBinaryView*, Armv5FirmwareView*>& FirmwareViewMap()
+{
+	static auto* map = new std::unordered_map<BNBinaryView*, Armv5FirmwareView*>();
+	return *map;
+}
 
 
 void BinaryNinja::InitArmv5FirmwareViewType()
@@ -314,6 +445,10 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 {
 	CreateLogger("BinaryView");
 	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
+	{
+		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+		FirmwareViewMap()[GetObject()] = this;
+	}
 }
 
 
@@ -321,6 +456,13 @@ Armv5FirmwareView::~Armv5FirmwareView()
 {
 	if (m_postAnalysisScanEvent)
 		m_postAnalysisScanEvent->Cancel();
+	{
+		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+		auto& map = FirmwareViewMap();
+		auto it = map.find(GetObject());
+		if (it != map.end() && it->second == this)
+			map.erase(it);
+	}
 }
 
 
@@ -914,9 +1056,13 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	size_t blMatches = 0;
 	size_t ldrMatches = 0;
 	size_t addedCount = 0;
+	size_t skipLdrPcInFunction = 0;
+	size_t skipBlIntraFunction = 0;
+	size_t skipBlNonFuncBoundary = 0;
 	size_t skipMisaligned = 0;
 	size_t skipOutOfBounds = 0;
 	size_t skipNonCodeTarget = 0;
+	size_t skipNonBoundary = 0;
 	size_t skipExistingTarget = 0;
 	size_t skipReturnThunk = 0;
 	size_t skipInvalidTarget = 0;
@@ -928,7 +1074,7 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 
 	// Helper to add a function if not already added and target is valid
-	auto addFunction = [&](uint64_t funcAddr, const char* source) {
+	auto addFunction = [&](uint64_t funcAddr, const char* source, bool requireBoundary) {
 		// For ARM mode, addresses must be 4-byte aligned.
 		// Strip any Thumb bit and reject misaligned addresses.
 		uint64_t alignedAddr = funcAddr & ~3ULL;
@@ -949,6 +1095,13 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(alignedAddr))
 		{
 			skipNonCodeTarget++;
+			return;
+		}
+
+		// Reject targets that are not at a likely function boundary.
+		if (requireBoundary && !IsLikelyFunctionBoundary(data, dataLen, endian, imageBase, length, alignedAddr))
+		{
+			skipNonBoundary++;
 			return;
 		}
 
@@ -1014,8 +1167,11 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 			}
 		}
 
+		// Call-targets should start with real code, not a PC-write stub. Requiring
+		// a body instruction and disallowing PC-write starts avoids seeding functions
+		// that the core later merges or deletes as mid-function labels.
 		if (!ValidateFirmwareFunctionCandidate(view, data, dataLen, endian, imageBase, length,
-			alignedAddr, tuning, false, true))
+			alignedAddr, tuning, true, false))
 		{
 			skipInvalidCandidate++;
 			return;
@@ -1091,7 +1247,9 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 			continue;
 		}
 		codeInstrs++;
-		if (view->GetAnalysisFunctionsContainingAddress(instrAddr).empty())
+		auto callsiteFuncs = view->GetAnalysisFunctionsContainingAddress(instrAddr);
+		bool inFunction = !callsiteFuncs.empty();
+		if (!inFunction)
 		{
 			nonFunctionInstrs++;
 			if (tuning.requireCallInFunction)
@@ -1123,8 +1281,38 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 					imm24 |= 0xFF000000;
 				int32_t offset_bytes = imm24 << 2;
 				uint64_t target = instrAddr + 8 + offset_bytes;
+				uint64_t alignedTarget = target & ~3ULL;
 
-				addFunction(target, "BL");
+				// If the BL is inside a function and the target is also inside that
+				// same function, it's almost certainly an internal label (PIC, thunk).
+				if (inFunction)
+				{
+					auto targetFuncs = view->GetAnalysisFunctionsContainingAddress(alignedTarget);
+					bool intraFunction = false;
+					for (const auto& cf : callsiteFuncs)
+					{
+						if (!cf)
+							continue;
+						for (const auto& tf : targetFuncs)
+						{
+							if (tf && (tf->GetStart() == cf->GetStart()))
+							{
+								intraFunction = true;
+								break;
+							}
+						}
+						if (intraFunction)
+							break;
+					}
+					if (intraFunction)
+					{
+						skipBlIntraFunction++;
+						prevInstr = instr;
+						continue;
+					}
+				}
+				// BL targets are likely real function starts.
+				addFunction(target, "BL", false);
 			}
 			else
 			{
@@ -1145,6 +1333,17 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		// Example: LDR PC, [PC, #0x10] = 0xE59FF010
 		if ((instr & 0x0F7FF000) == 0x051FF000)
 		{
+			// LDR PC is commonly used for jump tables inside functions; those
+			// targets are *not* function entry points. Only treat LDR PC as a
+			// potential function target when the dispatch itself is outside any
+			// existing function (e.g., a veneer in standalone code).
+			if (!view->GetAnalysisFunctionsContainingAddress(instrAddr).empty())
+			{
+				skipLdrPcInFunction++;
+				prevInstr = instr;
+				continue;
+			}
+
 			// Only trust LDR PC if preceded by valid code
 			if (offset >= 4 && isLikelyCode(prevInstr))
 			{
@@ -1166,7 +1365,8 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 							target = Swap32(target);
 
 						// Add as function (preserving Thumb bit if present)
-						addFunction(target, "LDR PC");
+						// Indirect branches are common for jump tables; require a boundary.
+						addFunction(target, "LDR PC", true);
 					}
 				}
 			}
@@ -1186,11 +1386,13 @@ static size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 		logger->LogInfo(
 			"Call target scan detail: scanned=%zu code=%zu in_func=%zu non_func=%zu bl=%zu ldr_pc=%zu added=%zu "
 			"skip_noncode=%zu skip_not_in_func=%zu skip_prev_not_code=%zu skip_misaligned=%zu "
-			"skip_oob=%zu skip_noncode_target=%zu skip_existing=%zu skip_return_thunk=%zu "
+			"skip_oob=%zu skip_noncode_target=%zu skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_ldr_pc_in_func=%zu "
+			"skip_bl_intra_func=%zu skip_bl_nonfunc_boundary=%zu "
 			"skip_invalid_target=%zu skip_duplicate=%zu skip_invalid_candidate=%zu",
 			totalInstrs, codeInstrs, inFunctionInstrs, nonFunctionInstrs, blMatches, ldrMatches, addedCount,
 			skippedNonCode, skippedNotInFunction, skippedPrevNotCode, skipMisaligned,
-			skipOutOfBounds, skipNonCodeTarget, skipExistingTarget, skipReturnThunk,
+			skipOutOfBounds, skipNonCodeTarget, skipNonBoundary, skipExistingTarget, skipReturnThunk, skipLdrPcInFunction,
+			skipBlIntraFunction, skipBlNonFuncBoundary,
 			skipInvalidTarget, skipDuplicate, skipInvalidCandidate);
 	}
 	return targetsFound;
@@ -1223,6 +1425,8 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	size_t skipInvalidTarget = 0;
 	size_t skipNotPointerType = 0;
 	size_t skipInvalidCandidate = 0;
+	size_t skipJumpTableRefs = 0;
+	size_t skipNonBoundary = 0;
 	size_t rawWordScanned = 0;
 	size_t rawRunsFound = 0;
 	size_t rawRunsWithRefs = 0;
@@ -1231,6 +1435,7 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	size_t rawAddedCount = 0;
 	size_t rawSkipInFunction = 0;
 	size_t rawSkipInvalidTarget = 0;
+	size_t rawSkipJumpTableRefs = 0;
 
 	uint64_t imageEnd = imageBase + length;
 	uint8_t minHigh = (uint8_t)(imageBase >> 24);
@@ -1254,6 +1459,11 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 			skipNonCodeTarget++;
 			return;
 		}
+		if (!IsLikelyFunctionBoundary(data, dataLen, endian, imageBase, length, alignedAddr))
+		{
+			skipNonBoundary++;
+			return;
+		}
 		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
 		{
 			skipExistingTarget++;
@@ -1264,8 +1474,10 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 			skipReturnThunk++;
 			return;
 		}
+		// Pointer targets should also look like real function entries; avoid
+		// PC-write stubs and require a body instruction to reduce false starts.
 		if (!ValidateFirmwareFunctionCandidate(view, data, dataLen, endian, imageBase, length,
-			alignedAddr, tuning, false, true))
+			alignedAddr, tuning, true, false))
 		{
 			skipInvalidCandidate++;
 			return;
@@ -1320,6 +1532,33 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 		return true;
 	};
 
+	auto readInstrAt = [&](uint64_t addr, uint32_t& outInstr) -> bool {
+		if (addr < imageBase || addr + 4 > imageEnd)
+			return false;
+		uint64_t off = addr - imageBase;
+		if (off + 4 > dataLen)
+			return false;
+		memcpy(&outInstr, data + off, sizeof(outInstr));
+		if (endian == BigEndian)
+			outInstr = Swap32(outInstr);
+		return true;
+	};
+
+	auto hasOnlyJumpTableRefs = [&](uint64_t addr) -> bool {
+		auto refs = view->GetCodeReferences(addr);
+		if (refs.empty())
+			return false;
+		for (const auto& ref : refs)
+		{
+			uint32_t instr = 0;
+			if (!readInstrAt(ref.addr, instr))
+				return false;
+			if (!IsJumpTableDispatchInstruction(instr))
+				return false;
+		}
+		return true;
+	};
+
 	// Only consider data variables that are referenced from code.
 	auto dataVars = view->GetDataVariables();
 	for (const auto& entry : dataVars)
@@ -1336,6 +1575,14 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 
 		if (view->GetCodeReferences(locationAddr).empty())
 			continue;
+
+		// If all code refs are jump-table dispatches, these pointers are case labels,
+		// not function entry points. Skip to avoid adding mid-function functions.
+		if (hasOnlyJumpTableRefs(locationAddr))
+		{
+			skipJumpTableRefs++;
+			continue;
+		}
 		withCodeRefs++;
 		if (dataVar.type.GetValue())
 		{
@@ -1396,29 +1643,38 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 
 			uint64_t tableAddr = imageBase + startOffset;
 			bool hasCodeRefs = false;
+			bool hasNonJumpRef = false;
 			for (uint32_t i = 0; i < count; i++)
 			{
 				uint64_t addr = imageBase + startOffset + (uint64_t)i * 4;
 				if (!view->GetCodeReferences(addr).empty())
 				{
 					hasCodeRefs = true;
-					break;
+					if (!hasOnlyJumpTableRefs(addr))
+						hasNonJumpRef = true;
+					if (hasNonJumpRef)
+						break;
 				}
 			}
 
-			if (!hasCodeRefs)
+		if (!hasCodeRefs)
+		{
+			rawRunsNoRefs++;
+			if (tuning.requirePointerTableCodeRefs)
+				return;
+			if (view->IsOffsetCodeSemantics(tableAddr) && !tuning.allowPointerTablesInCode)
+				return;
+			rawRunsAllowedNoRefs++;
+		}
+		else
+		{
+			if (!hasNonJumpRef)
 			{
-				rawRunsNoRefs++;
-				if (tuning.requirePointerTableCodeRefs)
-					return;
-				if (view->IsOffsetCodeSemantics(tableAddr) && !tuning.allowPointerTablesInCode)
-					return;
-				rawRunsAllowedNoRefs++;
+				rawSkipJumpTableRefs++;
+				return;
 			}
-			else
-			{
-				rawRunsWithRefs++;
-			}
+			rawRunsWithRefs++;
+		}
 
 			// Define the pointer table as data if it doesn't already exist.
 			DataVariable existing;
@@ -1525,16 +1781,242 @@ static size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 		logger->LogInfo(
 			"Pointer target scan detail: data_vars=%zu code_ref_vars=%zu pointer_typed=%zu added=%zu "
 			"skip_not_pointer_type=%zu skip_misaligned=%zu skip_oob=%zu skip_noncode_target=%zu "
-			"skip_existing=%zu skip_return_thunk=%zu skip_invalid_target=%zu skip_invalid_candidate=%zu "
-			"raw_words=%zu raw_runs=%zu raw_runs_with_refs=%zu raw_runs_no_refs=%zu raw_runs_allowed_no_refs=%zu raw_added=%zu "
-			"raw_skip_in_func=%zu raw_skip_invalid_target=%zu",
+			"skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_invalid_target=%zu skip_invalid_candidate=%zu "
+			"skip_jump_table_refs=%zu raw_words=%zu raw_runs=%zu raw_runs_with_refs=%zu raw_runs_no_refs=%zu "
+			"raw_runs_allowed_no_refs=%zu raw_added=%zu raw_skip_in_func=%zu raw_skip_invalid_target=%zu "
+			"raw_skip_jump_table_refs=%zu",
 			dataVarCount, withCodeRefs, pointerTyped, addedCount,
 			skipNotPointerType, skipMisaligned, skipOutOfBounds, skipNonCodeTarget,
-			skipExistingTarget, skipReturnThunk, skipInvalidTarget, skipInvalidCandidate,
+			skipNonBoundary, skipExistingTarget, skipReturnThunk, skipInvalidTarget, skipInvalidCandidate, skipJumpTableRefs,
 			rawWordScanned, rawRunsFound, rawRunsWithRefs, rawRunsNoRefs, rawRunsAllowedNoRefs, rawAddedCount,
-			rawSkipInFunction, rawSkipInvalidTarget);
+			rawSkipInFunction, rawSkipInvalidTarget, rawSkipJumpTableRefs);
 	}
 	return targetsFound;
+}
+
+/*
+ * Scan for orphaned code blocks post-analysis.
+ *
+ * After core analysis completes, find basic blocks that are not yet part of
+ * any function. These represent undiscovered functions that weren't captured by
+ * explicit calls or prologue patterns. This is a post-analysis sweep that fills
+ * gaps left by the CFG-based discovery process.
+ *
+ * Returns the number of orphan functions found and added.
+ */
+static size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
+	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
+	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
+	uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes, uint32_t maxPerPage,
+	bool requirePrologue,
+	std::set<uint64_t>* seededFunctions)
+{
+	size_t orphansFound = 0;
+	size_t blocksScanned = 0;
+	size_t orphanCandidates = 0;
+	size_t addedCount = 0;
+	size_t skipExisting = 0;
+	size_t skipInvalidCandidate = 0;
+	size_t skipProtected = 0;
+	size_t skipNonBoundaryOrPrologue = 0;
+	size_t skipSpacing = 0;
+	size_t skipPageCap = 0;
+	size_t skipPaddingRun = 0;
+	size_t skipNoPrologue = 0;
+
+	std::set<uint64_t> addedAddrs;
+	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
+	uint64_t lastAddedAddr = 0;
+	std::unordered_map<uint64_t, uint32_t> pageCounts;
+
+	auto isStrongPrologue = [&](uint32_t instr) -> bool {
+		uint32_t cond = (instr >> 28) & 0xF;
+		if (cond != 0xE)
+			return false;
+		if ((instr & 0xFFFF0000) != 0xE92D0000)
+			return false;
+		uint32_t reglist = instr & 0xFFFF;
+		if (!(reglist & (1U << REG_LR)))
+			return false;
+		return __builtin_popcount(reglist) >= 3;
+	};
+	auto isWeakPrologue = [&](uint32_t instr) -> bool {
+		uint32_t cond = (instr >> 28) & 0xF;
+		if (cond != 0xE)
+			return false;
+		// STMDB/STMFD sp!, {..., lr}
+		if ((instr & 0xFFFF0000) == 0xE92D0000)
+		{
+			uint32_t reglist = instr & 0xFFFF;
+			return (reglist & (1U << REG_LR)) != 0;
+		}
+		// SUB sp, sp, #imm (stack allocation)
+		if ((instr & 0xFFFFF000) == 0xE24DD000)
+			return true;
+		return false;
+	};
+
+	auto addFunction = [&](uint64_t funcAddr) {
+		uint64_t alignedAddr = funcAddr & ~3ULL;
+		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
+			return;
+		if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(alignedAddr))
+			return;
+		if (!view->GetAnalysisFunctionsContainingAddress(alignedAddr).empty())
+		{
+			skipExisting++;
+			return;
+		}
+		// Protect seeded functions from being removed later
+		if (seededFunctions && seededFunctions->find(alignedAddr) != seededFunctions->end())
+		{
+			skipProtected++;
+			return;
+		}
+		FirmwareScanTuning orphanTuning = tuning;
+		orphanTuning.minValidInstr = minValidInstr;
+		orphanTuning.minBodyInstr = minBodyInstr;
+		// Validate that the orphan block looks like real code
+		if (!ValidateFirmwareFunctionCandidate(view, data, dataLen, endian, imageBase, length,
+			alignedAddr, orphanTuning, true, false))
+		{
+			skipInvalidCandidate++;
+			return;
+		}
+		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
+			return;
+		if (view->AddFunctionForAnalysis(plat, alignedAddr, true))
+		{
+			if (seededFunctions)
+				seededFunctions->insert(alignedAddr);
+			addedCount++;
+			lastAddedAddr = alignedAddr;
+			pageCounts[alignedAddr & ~0xFFFULL]++;
+		}
+		addedAddrs.insert(alignedAddr);
+		orphansFound++;
+	};
+
+	// Collect all basic blocks from the view
+	auto allFuncs = view->GetAnalysisFunctionList();
+	std::set<uint64_t> coveredRanges;
+
+	// Build a set of all addresses covered by existing functions
+	for (const auto& func : allFuncs)
+	{
+		if (!func)
+			continue;
+		uint64_t funcStart = func->GetStart();
+		uint64_t funcEnd = func->GetHighestAddress();
+		// Mark entire function range as covered
+		for (uint64_t addr = funcStart; addr <= funcEnd; addr += 4)
+		{
+			coveredRanges.insert(addr);
+		}
+	}
+
+	// Scan for orphaned 4-byte aligned code in code semantics regions
+	logger->LogInfo("Orphan code scan: Scanning for unreachable functions in %llu bytes",
+		(unsigned long long)(length));
+
+	for (uint64_t offset = 0; offset + 4 <= length; offset += 4)
+	{
+		uint64_t instrAddr = imageBase + offset;
+
+		// Skip if already covered by a function
+		if (coveredRanges.find(instrAddr) != coveredRanges.end())
+			continue;
+
+		// Skip if not in code semantics
+		if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(instrAddr))
+			continue;
+
+		blocksScanned++;
+
+		// Enforce spacing between added functions to avoid runaway growth.
+		if (lastAddedAddr && (instrAddr - lastAddedAddr) < minSpacingBytes)
+		{
+			skipSpacing++;
+			continue;
+		}
+
+		// Per-page cap to avoid flooding a single 4KB region with functions.
+		uint64_t page = instrAddr & ~0xFFFULL;
+		if (maxPerPage > 0)
+		{
+			auto it = pageCounts.find(page);
+			if (it != pageCounts.end() && it->second >= maxPerPage)
+			{
+				skipPageCap++;
+				continue;
+			}
+		}
+
+		// Candidate if it looks like a boundary or a prologue.
+		bool isBoundary = IsLikelyFunctionBoundary(data, dataLen, endian, imageBase, length, instrAddr);
+		bool isPrologue = false;
+
+		// Quick filter: reject regions dominated by padding/erased words.
+		// This avoids ballooning candidate counts on zero-filled data.
+		uint32_t paddingCount = 0;
+		const uint32_t padWindow = 3;
+		if (offset + (uint64_t)padWindow * 4 <= dataLen)
+		{
+			for (uint32_t i = 0; i < padWindow; i++)
+			{
+				uint32_t word = 0;
+				memcpy(&word, data + offset + (uint64_t)i * 4, sizeof(word));
+				if (endian == BigEndian)
+					word = Swap32(word);
+				if (IsPaddingWord(word))
+					paddingCount++;
+			}
+		}
+		if (paddingCount >= 2)
+		{
+			skipPaddingRun++;
+			continue;
+		}
+
+		// Strong prologue pattern (STMFD/PUSH sp!, {..., lr} with 3+ regs)
+		if (offset + 4 <= dataLen)
+		{
+			uint32_t instr = 0;
+			memcpy(&instr, data + offset, sizeof(instr));
+			if (endian == BigEndian)
+				instr = Swap32(instr);
+			isPrologue = isWeakPrologue(instr) || isStrongPrologue(instr);
+		}
+
+		if (requirePrologue && !isPrologue)
+		{
+			skipNoPrologue++;
+			continue;
+		}
+
+		if (!requirePrologue && !isBoundary && !isPrologue)
+		{
+			skipNonBoundaryOrPrologue++;
+			continue;
+		}
+		orphanCandidates++;
+		addFunction(instrAddr);
+	}
+
+	logger->LogInfo("Orphan code scan: Found %zu orphaned functions", orphansFound);
+	if (verboseLog)
+	{
+		logger->LogInfo(
+			"Orphan code scan detail: scanned=%zu candidates=%zu added=%zu "
+			"skip_existing=%zu skip_invalid_candidate=%zu skip_protected=%zu "
+			"skip_non_boundary_or_prologue=%zu skip_spacing=%zu skip_page_cap=%zu "
+			"skip_padding_run=%zu skip_no_prologue=%zu",
+			blocksScanned, orphanCandidates, addedCount,
+			skipExisting, skipInvalidCandidate, skipProtected,
+			skipNonBoundaryOrPrologue, skipSpacing, skipPageCap,
+			skipPaddingRun, skipNoPrologue);
+	}
+	return orphansFound;
 }
 
 static size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t dataLen,
@@ -1697,8 +2179,8 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 	for (uint64_t offset = 0; offset + 8 <= length; offset += 4)
 	{
 		uint32_t instr1 = 0, instr2 = 0;
-		ReadU32At(reader, data, dataLen, endian, offset, instr1);
-		ReadU32At(reader, data, dataLen, endian, offset + 4, instr2);
+		ReadU32At(reader, data, dataLen, endian, offset, instr1, length);
+		ReadU32At(reader, data, dataLen, endian, offset + 4, instr2, length);
 
 		// Check for LDRLO followed by STRLO (or vice versa)
 		bool isLdrLo1 = (instr1 & 0x0FF00FFF) == 0x04900004 && (instr1 & 0xF0000000) == 0x30000000;
@@ -1723,7 +2205,7 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 			for (int i = 1; i <= 64 && offset >= (uint64_t)(i * 4); i++)
 			{
 				uint32_t prevInstr = 0;
-				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr);
+				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr, length);
 
 				// LDR Rd, [PC, #imm]: 0x051F0000 (sub) or 0x059F0000 (add)
 				if ((prevInstr & 0x0F7F0000) == 0x051F0000)
@@ -1736,7 +2218,7 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 					if (litAddr + 4 <= length)
 					{
 						uint32_t value = 0;
-						ReadU32At(reader, data, dataLen, endian, litAddr, value);
+						ReadU32At(reader, data, dataLen, endian, litAddr, value, length);
 						literalRefs.push_back({litAddr, value});
 					}
 				}
@@ -1826,7 +2308,8 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 
 // Read u32, using ROM copy data for SRAM addresses if available
 static bool ReadU32Smart(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
-	BNEndianness endian, uint64_t addr, uint64_t aliasBase, const RomToSramCopy& romCopy, uint32_t& out)
+	BNEndianness endian, uint64_t addr, uint64_t aliasBase, uint64_t length,
+	const RomToSramCopy& romCopy, uint32_t& out)
 {
 	// Check if this is an SRAM address that falls within the ROM copy range
 	if (romCopy.valid && aliasBase != 0 &&
@@ -1838,7 +2321,7 @@ static bool ReadU32Smart(BinaryReader& reader, const uint8_t* data, uint64_t dat
 		uint64_t romAddr = romCopy.romSrc + offsetInSram;
 
 		// Read from ROM instead
-		return ReadU32At(reader, data, dataLen, endian, romAddr, out);
+		return ReadU32At(reader, data, dataLen, endian, romAddr, out, length);
 	}
 
 	// For addresses within the file, read directly
@@ -1849,7 +2332,7 @@ static bool ReadU32Smart(BinaryReader& reader, const uint8_t* data, uint64_t dat
 		readAddr = addr & 0x00FFFFFF;
 	}
 
-	return ReadU32At(reader, data, dataLen, endian, readAddr, out);
+	return ReadU32At(reader, data, dataLen, endian, readAddr, out, length);
 }
 
 // Analyze MMU configuration to discover memory regions
@@ -1871,7 +2354,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 	for (uint64_t offset = 0; offset + 4 <= length; offset += 4)
 	{
 		uint32_t instr = 0;
-		ReadU32At(reader, data, dataLen, endian, offset, instr);
+		ReadU32At(reader, data, dataLen, endian, offset, instr, length);
 
 		// MCR p15, 0, Rx, c2, c0, 0 - write TTBR0
 		if ((instr & 0x0FFF0FFF) == 0x0E020F10)
@@ -1888,7 +2371,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 			for (int i = 1; i <= 128 && offset >= (uint64_t)(i * 4); i++)
 			{
 				uint32_t prevInstr = 0;
-				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr);
+				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr, length);
 
 				// Check for function prologue (STMFD sp!, {..., lr})
 				// This helps us identify the start of the MMU setup function
@@ -1919,7 +2402,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 					if (literalAddr < length)
 					{
 						uint32_t value = 0;
-						ReadU32At(reader, data, dataLen, endian, literalAddr, value);
+						ReadU32At(reader, data, dataLen, endian, literalAddr, value, length);
 						ttbrValue = value;
 						logger->LogInfo("MMU: TTBR value loaded: 0x%llx from literal at 0x%llx",
 							(unsigned long long)ttbrValue, (unsigned long long)literalAddr);
@@ -2045,7 +2528,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 	for (uint32_t i = 0; i < 4096; i++)
 	{
 		uint32_t descriptor = 0;
-		ReadU32At(reader, data, dataLen, endian, ttbrFileOffset + (i * 4), descriptor);
+		ReadU32At(reader, data, dataLen, endian, ttbrFileOffset + (i * 4), descriptor, length);
 
 		uint64_t virtAddr = (uint64_t)i << 20;  // Each entry covers 1MB
 		uint32_t descType = descriptor & 0x3;
@@ -2164,7 +2647,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 		for (uint64_t off = scanStart; off + 4 <= scanEnd; off += 4)
 		{
 			uint32_t instr = 0;
-			ReadU32At(reader, data, dataLen, endian, off, instr);
+			ReadU32At(reader, data, dataLen, endian, off, instr, length);
 
 			// LDR Rd, [PC, #imm]: collect literal pool references
 			if ((instr & 0x0F7F0000) == 0x051F0000)
@@ -2177,7 +2660,7 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 				if (litAddr + 4 <= length)
 				{
 					uint32_t value = 0;
-					ReadU32At(reader, data, dataLen, endian, litAddr, value);
+					ReadU32At(reader, data, dataLen, endian, litAddr, value, length);
 					literalRefs.push_back({litAddr, value});
 				}
 			}
@@ -2239,9 +2722,9 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 
 			// Read first few entries using ReadU32Smart to get data from ROM if needed
 			uint32_t firstEntry = 0, secondEntry = 0, thirdEntry = 0;
-			ReadU32Smart(reader, data, dataLen, endian, val1, discoveredAliasBase, romCopy, firstEntry);
-			ReadU32Smart(reader, data, dataLen, endian, val1 + 4, discoveredAliasBase, romCopy, secondEntry);
-			ReadU32Smart(reader, data, dataLen, endian, val1 + 8, discoveredAliasBase, romCopy, thirdEntry);
+			ReadU32Smart(reader, data, dataLen, endian, val1, discoveredAliasBase, length, romCopy, firstEntry);
+			ReadU32Smart(reader, data, dataLen, endian, val1 + 4, discoveredAliasBase, length, romCopy, secondEntry);
+			ReadU32Smart(reader, data, dataLen, endian, val1 + 8, discoveredAliasBase, length, romCopy, thirdEntry);
 
 			// Check if array is uninitialized (all entries are the same value like 0x0ff59ff0)
 			// This indicates the array is populated at runtime, not in the binary
@@ -2300,9 +2783,9 @@ static void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, cons
 					break;
 
 				uint32_t entry1 = 0, entry2 = 0;
-				ReadU32Smart(reader, data, dataLen, endian, entryAddr, discoveredAliasBase, romCopy, entry1);
+				ReadU32Smart(reader, data, dataLen, endian, entryAddr, discoveredAliasBase, length, romCopy, entry1);
 				if (!isIdentity)
-					ReadU32Smart(reader, data, dataLen, endian, entryAddr + 4, discoveredAliasBase, romCopy, entry2);
+					ReadU32Smart(reader, data, dataLen, endian, entryAddr + 4, discoveredAliasBase, length, romCopy, entry2);
 
 				uint64_t virtAddr, physAddr;
 				uint32_t descriptor;
@@ -2499,7 +2982,7 @@ static uint64_t ResolveVectorEntry(BinaryReader& reader, const uint8_t* data, ui
 	BNEndianness endian, uint64_t vectorOffset, uint64_t imageBase, uint64_t length)
 {
 	uint32_t instr = 0;
-	ReadU32At(reader, data, dataLen, endian, vectorOffset, instr);
+	ReadU32At(reader, data, dataLen, endian, vectorOffset, instr, length);
 
 	// LDR PC, [PC, #imm] - 0xE59FF0xx
 	if ((instr & 0xFFFFF000) == 0xE59FF000)
@@ -2511,7 +2994,7 @@ static uint64_t ResolveVectorEntry(BinaryReader& reader, const uint8_t* data, ui
 		if (pointerAddr + 4 <= length)
 		{
 			uint32_t handlerAddr = 0;
-			ReadU32At(reader, data, dataLen, endian, pointerAddr, handlerAddr);
+			ReadU32At(reader, data, dataLen, endian, pointerAddr, handlerAddr, length);
 			// Mask off Thumb bit if present
 			return handlerAddr & ~1u;
 		}
@@ -2573,7 +3056,7 @@ static void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
 		uint32_t instr = 0;
-		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr);
+		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr, ctx.length);
 		uint64_t instrAddr = ctx.imageBase + offset;
 		// Only type literal pools referenced from code.
 		if (!ctx.view->IsOffsetCodeSemantics(instrAddr))
@@ -2596,7 +3079,7 @@ static void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 			if (literalOffset + 4 <= ctx.length)
 			{
 				uint32_t value = 0;
-				ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, literalOffset, value);
+				ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, literalOffset, value, ctx.length);
 
 				uint64_t literalAddr = ctx.imageBase + literalOffset;
 				// Avoid typing data inside discovered functions to reduce accidental code suppression.
@@ -2673,12 +3156,12 @@ static void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 		uint64_t offset = addr - ctx.imageBase;
 		uint32_t word0 = 0;
 		uint32_t word1 = 0;
-		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0))
+		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0, ctx.length))
 		{
 			decodeFailed++;
 			continue;
 		}
-		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1))
+		if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1, ctx.length))
 		{
 			decodeFailed++;
 			continue;
@@ -2749,12 +3232,12 @@ static void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 			uint64_t offset = addr - ctx.imageBase;
 			uint32_t word0 = 0;
 			uint32_t word1 = 0;
-			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0))
+			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, word0, ctx.length))
 			{
 				decodeFailed++;
 				break;
 			}
-			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1))
+			if (!ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset + 4, word1, ctx.length))
 			{
 				decodeFailed++;
 				break;
@@ -2814,7 +3297,7 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
 		uint32_t instr = 0;
-		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr);
+		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr, ctx.length);
 
 		// ADD PC, PC, Rn (computed jump for switch tables)
 		if ((instr & 0x0FFFF010) == 0x008FF000)
@@ -2825,7 +3308,7 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 			for (int i = 1; i <= 16 && offset >= (uint64_t)(i * 4); i++)
 			{
 				uint32_t scanInstr = 0;
-				ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset - (i * 4), scanInstr);
+				ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset - (i * 4), scanInstr, ctx.length);
 
 				// ADD Rx, PC, #imm (table base calculation)
 				if ((scanInstr & 0x0FFF0000) == 0x028F0000)
@@ -2860,7 +3343,7 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 					if (entryFileOffset + 4 > ctx.length)
 						break;
 					uint32_t entryValue = 0;
-					ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, entryFileOffset, entryValue);
+					ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, entryFileOffset, entryValue, ctx.length);
 					if (entryValue > 0x100000)
 						break;
 					validEntries++;
@@ -2897,15 +3380,24 @@ bool Armv5FirmwareView::Init()
 	bool enablePrologueScan = false;
 	bool enableCallTargetScan = false;
 	bool enablePointerTargetScan = false;
+	bool enableOrphanCodeScan = true;
 	bool enableLiteralPoolTyping = false;
 	bool enableClearAutoDataOnCodeRefs = false;
 	bool enableVerboseLogging = false;
-	bool disablePointerSweep = true;
-	bool disableLinearSweep = true;
+	bool disablePointerSweep = false;
+	bool disableLinearSweep = false;
 	bool enableInvalidFunctionCleanup = false;
 	uint32_t cleanupMaxSizeBytes = 8;
 	bool cleanupRequireZeroRefs = true;
 	bool cleanupRequirePcWriteStart = true;
+	uint32_t orphanMinValidInstr = 4;
+	uint32_t orphanMinBodyInstr = 2;
+	uint32_t orphanMinSpacingBytes = 0x80;
+	uint32_t orphanMaxPerPage = 6;
+	bool orphanRequirePrologue = true;
+	bool enablePartialLinearSweep = true;
+	bool skipFirmwareScans = true;
+	bool useModuleWorkflow = true;
 	FirmwareScanTuning tuning{};
 
 	// Get load settings if available
@@ -2923,6 +3415,24 @@ bool Armv5FirmwareView::Init()
 			enableCallTargetScan = settings->Get<bool>("loader.armv5.firmware.scanCallTargets", this);
 		if (settings->Contains("loader.armv5.firmware.scanPointerTargets"))
 			enablePointerTargetScan = settings->Get<bool>("loader.armv5.firmware.scanPointerTargets", this);
+		if (settings->Contains("loader.armv5.firmware.scanOrphanCode"))
+			enableOrphanCodeScan = settings->Get<bool>("loader.armv5.firmware.scanOrphanCode", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinValidInstr"))
+			orphanMinValidInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinValidInstr", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinBodyInstr"))
+			orphanMinBodyInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinBodyInstr", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinSpacingBytes"))
+			orphanMinSpacingBytes = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinSpacingBytes", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMaxPerPage"))
+			orphanMaxPerPage = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMaxPerPage", this);
+		if (settings->Contains("loader.armv5.firmware.orphanRequirePrologue"))
+			orphanRequirePrologue = settings->Get<bool>("loader.armv5.firmware.orphanRequirePrologue", this);
+		if (settings->Contains("loader.armv5.firmware.partialLinearSweep"))
+			enablePartialLinearSweep = settings->Get<bool>("loader.armv5.firmware.partialLinearSweep", this);
+		if (settings->Contains("loader.armv5.firmware.skipFirmwareScans"))
+			skipFirmwareScans = settings->Get<bool>("loader.armv5.firmware.skipFirmwareScans", this);
+		if (settings->Contains("loader.armv5.firmware.useModuleWorkflow"))
+			useModuleWorkflow = settings->Get<bool>("loader.armv5.firmware.useModuleWorkflow", this);
 		if (settings->Contains("loader.armv5.firmware.typeLiteralPools"))
 			enableLiteralPoolTyping = settings->Get<bool>("loader.armv5.firmware.typeLiteralPools", this);
 		if (settings->Contains("loader.armv5.firmware.clearAutoDataOnCodeRefs"))
@@ -2962,6 +3472,28 @@ bool Armv5FirmwareView::Init()
 		tuning.minValidInstr = 1;
 	if (tuning.minPointerRun == 0)
 		tuning.minPointerRun = 1;
+
+	// Emit a single consolidated settings line to make log triage reproducible.
+	// This mirrors the effective values after defaults + user overrides are applied.
+	if (enableVerboseLogging)
+	{
+		m_logger->LogInfo(
+			"Firmware settings: prologue_scan=%d call_scan=%d pointer_scan=%d orphan_scan=%d "
+			"orphan_min_valid=%u orphan_min_body=%u orphan_min_spacing=0x%x orphan_max_per_page=%u "
+			"orphan_require_prologue=%d partial_linear_sweep=%d skip_firmware_scans=%d module_workflow=%d "
+			"raw_ptr_tables=%d raw_ptr_min_run=%u raw_ptr_require_refs=%d raw_ptr_allow_in_code=%d "
+			"call_scan_require_in_func=%d disable_pointer_sweep=%d disable_linear_sweep=%d "
+			"cleanup_invalid=%d cleanup_max_size=%u cleanup_zero_refs=%d cleanup_pc_write=%d "
+			"type_literal_pools=%d clear_auto_data_on_code_refs=%d scan_min_valid=%u scan_min_body=%u scan_max_literal_run=%u",
+			enablePrologueScan, enableCallTargetScan, enablePointerTargetScan, enableOrphanCodeScan,
+			orphanMinValidInstr, orphanMinBodyInstr, orphanMinSpacingBytes, orphanMaxPerPage,
+			orphanRequirePrologue, enablePartialLinearSweep, skipFirmwareScans, useModuleWorkflow,
+			tuning.scanRawPointerTables, tuning.minPointerRun, tuning.requirePointerTableCodeRefs, tuning.allowPointerTablesInCode,
+			tuning.requireCallInFunction, disablePointerSweep, disableLinearSweep,
+			enableInvalidFunctionCleanup, cleanupMaxSizeBytes, cleanupRequireZeroRefs, cleanupRequirePcWriteStart,
+			enableLiteralPoolTyping, enableClearAutoDataOnCodeRefs,
+			tuning.minValidInstr, tuning.minBodyInstr, tuning.maxLiteralRun);
+	}
 
 	// Handle platform override from settings
 	if (settings && settings->Contains("loader.platform"))
@@ -3036,12 +3568,25 @@ bool Armv5FirmwareView::Init()
 		SetDefaultPlatform(m_plat);
 	}
 
+	// Use module workflow if enabled to insert firmware scans into the analysis pipeline
+	if (useModuleWorkflow)
+		Settings::Instance()->Set("analysis.workflows.moduleWorkflow", "armv5.module.firmware", this);
+
 	// Disable core pointer sweep if requested to avoid excessive false positives on raw firmware blobs.
 	if (disablePointerSweep)
 		Settings::Instance()->Set("analysis.pointerSweep.autorun", false, this);
+	else
+		Settings::Instance()->Set("analysis.pointerSweep.autorun", true, this);
 
-	// Disable linear sweep for firmware-driven discovery so our scans are the source of truth.
-	if (disableLinearSweep)
+	// Partial linear sweep option: leave auto linear sweep enabled but limit it to faster tier
+	if (enablePartialLinearSweep)
+	{
+		Settings::Instance()->Set("triage.linearSweep", "full", this);
+		Settings::Instance()->Set("analysis.linearSweep.autorun", true, this);
+		Settings::Instance()->Set("analysis.linearSweep.controlFlowGraph", false, this);
+		Settings::Instance()->Set("analysis.signatureMatcher.autorun", false, this);
+	}
+	else if (disableLinearSweep)
 	{
 		Settings::Instance()->Set("analysis.linearSweep.autorun", false, this);
 		Settings::Instance()->Set("analysis.linearSweep.controlFlowGraph", false, this);
@@ -3108,7 +3653,7 @@ bool Armv5FirmwareView::Init()
 		// Check if we have LDR PC vectors - they use a pointer table after the vectors
 		// Define the pointer table entries as data
 		uint32_t firstInstr = 0;
-		ReadU32At(reader, fileData, fileDataLen, m_endian, 0, firstInstr);
+		ReadU32At(reader, fileData, fileDataLen, m_endian, 0, firstInstr, length);
 		if ((firstInstr & 0xFFFFF000) == 0xE59FF000)
 		{
 			// LDR PC style - there's a pointer table
@@ -3118,7 +3663,7 @@ bool Armv5FirmwareView::Init()
 				// Calculate where this vector's pointer should be
 				// Each vector is at offset i*4, PC is i*4+8, so pointer is at i*4+8+offset
 				uint32_t vecInstr = 0;
-				ReadU32At(reader, fileData, fileDataLen, m_endian, i * 4, vecInstr);
+				ReadU32At(reader, fileData, fileDataLen, m_endian, i * 4, vecInstr, length);
 				if ((vecInstr & 0xFFFFF000) == 0xE59FF000)
 				{
 					uint32_t vecOffset = vecInstr & 0xFFF;
@@ -3155,14 +3700,14 @@ bool Armv5FirmwareView::Init()
 	// Add vector table entries and handler functions for analysis
 	if (m_plat)
 	{
-		m_seededFunctions.clear();
+		std::set<uint64_t> seededFunctions;
 
 		// Add vector table entries as functions (they contain LDR PC or B instructions)
 		for (int i = 0; i < 8; i++)
 		{
 			uint64_t vectorAddr = imageBase + (i * 4);
 			if (AddFunctionForAnalysis(m_plat, vectorAddr, false))
-				m_seededFunctions.insert(vectorAddr);
+				seededFunctions.insert(vectorAddr);
 		}
 
 		// Add resolved handler functions
@@ -3171,7 +3716,7 @@ bool Armv5FirmwareView::Init()
 			if (handlerAddrs[i] != 0 && handlerAddrs[i] >= imageBase && handlerAddrs[i] < imageBase + length)
 			{
 				if (AddFunctionForAnalysis(m_plat, handlerAddrs[i], false))
-					m_seededFunctions.insert(handlerAddrs[i]);
+					seededFunctions.insert(handlerAddrs[i]);
 				DefineAutoSymbol(new Symbol(FunctionSymbol, handlerNames[i], handlerAddrs[i], GlobalBinding));
 
 				m_logger->LogDebug("Added handler function: %s at 0x%llx",
@@ -3209,7 +3754,7 @@ bool Armv5FirmwareView::Init()
 				for (int instrIdx = 0; instrIdx < 4; instrIdx++)
 				{
 					uint32_t instr = 0;
-					ReadU32At(reader, fileData, fileDataLen, m_endian, handlerOffset + (instrIdx * 4), instr);
+					ReadU32At(reader, fileData, fileDataLen, m_endian, handlerOffset + (instrIdx * 4), instr, length);
 
 					// LDR PC, [Rn, #imm] - jump through MMIO vector
 					// Encoding: cond 0101 U0W1 Rn 1111 imm12 (W=0, L=1, Rd=PC)
@@ -3223,7 +3768,7 @@ bool Armv5FirmwareView::Init()
 						if (cleanupAddr >= imageBase && cleanupAddr < imageBase + length)
 						{
 							if (AddFunctionForAnalysis(m_plat, cleanupAddr, false))
-								m_seededFunctions.insert(cleanupAddr);
+								seededFunctions.insert(cleanupAddr);
 
 							const char* cleanupName = (vecIdx == 6) ? "irq_return" : "fiq_return";
 							DefineAutoSymbol(new Symbol(FunctionSymbol, cleanupName, cleanupAddr, GlobalBinding));
@@ -3267,144 +3812,175 @@ bool Armv5FirmwareView::Init()
 			AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
 		});
 
-		// Define literal pool entries as data to avoid disassembling them as code
-		if (enableLiteralPoolTyping)
+		if (!skipFirmwareScans && !useModuleWorkflow)
 		{
-			FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-				m_arch, m_plat, m_logger, enableVerboseLogging, this};
-			timePass("Literal pool typing", [&]()
+			// Define literal pool entries as data to avoid disassembling them as code
+			if (enableLiteralPoolTyping)
 			{
-				TypeLiteralPoolEntries(scanCtx);
-			});
+				FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+					m_arch, m_plat, m_logger, enableVerboseLogging, this};
+				timePass("Literal pool typing", [&]()
+				{
+					TypeLiteralPoolEntries(scanCtx);
+				});
+				if (enableClearAutoDataOnCodeRefs)
+				{
+					timePass("Clear auto data on code refs", [&]()
+					{
+						ClearAutoDataOnCodeReferences(scanCtx);
+					});
+				}
+			}
+
+			// Scan for common function entry patterns to seed recursive descent analysis.
+			// These entry points are then expanded via call graph traversal.
+			Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
+			if (enablePrologueScan)
+			{
+				timePass("Function prologue scan", [&]()
+				{
+						ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
+							m_arch, thumbArch, m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
+				});
+			}
+
+			// Scan for pointer targets in data that reference executable code.
 			if (enableClearAutoDataOnCodeRefs)
 			{
-				timePass("Clear auto data on code refs", [&]()
+				FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+					m_arch, m_plat, m_logger, enableVerboseLogging, this};
+				timePass("Clear auto data in function entry blocks (pre-analysis)", [&]()
 				{
-					ClearAutoDataOnCodeReferences(scanCtx);
+						ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
+				});
+			}
+
+			bool callScanRanPreAnalysis = false;
+			if (enableCallTargetScan)
+			{
+				timePass("Call target scan (pre-analysis)", [&]()
+				{
+					ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+						m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
+				});
+				callScanRanPreAnalysis = true;
+			}
+
+			if ((enablePointerTargetScan || enableCallTargetScan || enableOrphanCodeScan) && !m_postAnalysisScanEvent)
+			{
+				m_logger->LogInfo("Deferring pointer/call/orphan target scan until analysis completes");
+				bool postPointerScan = enablePointerTargetScan;
+				bool postCallScan = enableCallTargetScan && !callScanRanPreAnalysis;
+				bool postOrphanScan = enableOrphanCodeScan;
+				bool postClearAutoData = enableClearAutoDataOnCodeRefs;
+				bool postVerbose = enableVerboseLogging;
+				FirmwareScanTuning postTuning = tuning;
+				bool postCleanupInvalid = enableInvalidFunctionCleanup;
+				uint32_t postCleanupMaxSize = cleanupMaxSizeBytes;
+				bool postCleanupZeroRefs = cleanupRequireZeroRefs;
+				bool postCleanupPcWrite = cleanupRequirePcWriteStart;
+				m_postAnalysisScanEvent = AddAnalysisCompletionEvent([this, postPointerScan, postCallScan,
+					postOrphanScan, postClearAutoData, postVerbose, postTuning, postCleanupInvalid,
+					postCleanupMaxSize, postCleanupZeroRefs, postCleanupPcWrite, orphanMinValidInstr,
+					orphanMinBodyInstr, orphanMinSpacingBytes, orphanMaxPerPage, orphanRequirePrologue]()
+				{
+					if (m_postAnalysisScansDone)
+						return;
+					m_postAnalysisScansDone = true;
+
+					uint64_t imageBase = GetStart();
+					uint64_t length = GetLength();
+					if (!length)
+						return;
+
+					uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
+					DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
+					const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
+					uint64_t fileDataLen = fileBuf.GetLength();
+					if (!fileData || fileDataLen == 0)
+						return;
+
+					BinaryReader reader(GetParentView());
+					reader.SetEndianness(m_endian);
+
+					/*
+					 * Timing helper for post-analysis scans (runs after core analysis completes).
+					 * These timers let us verify whether "phase 3" time is dominated by our scans
+					 * or by core Binary Ninja analysis.
+					 */
+					auto timePostPass = [&](const char* label, auto&& fn)
+					{
+						if (!postVerbose)
+						{
+							fn();
+							return;
+						}
+
+						auto start = std::chrono::steady_clock::now();
+						fn();
+						double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+							std::chrono::steady_clock::now() - start).count();
+						m_logger->LogInfo("Firmware post-analysis timing: %s took %.3f s", label, seconds);
+					};
+
+					std::set<uint64_t> addedFunctions;
+					if (postPointerScan)
+					{
+						timePostPass("Pointer target scan", [&]()
+						{
+							ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+								m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
+						});
+					}
+					if (postCallScan)
+					{
+						timePostPass("Call target scan", [&]()
+						{
+							ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+								m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
+						});
+					}
+					if (postOrphanScan)
+					{
+						timePostPass("Orphan code block scan", [&]()
+						{
+							ScanForOrphanCodeBlocks(this, fileData, fileDataLen, m_endian, imageBase, length,
+								m_plat, m_logger, postVerbose, postTuning, orphanMinValidInstr, orphanMinBodyInstr,
+								orphanMinSpacingBytes, orphanMaxPerPage, orphanRequirePrologue, &addedFunctions);
+						});
+					}
+
+					if (!addedFunctions.empty())
+						m_seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
+
+					if (postClearAutoData && !addedFunctions.empty())
+					{
+						FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+							m_arch, m_plat, m_logger, postVerbose, this};
+						timePostPass("Clear auto data in function entry blocks (post-analysis)", [&]()
+						{
+							ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
+						});
+					}
+
+					if (postCleanupInvalid)
+					{
+						std::set<uint64_t> protectedStarts = m_seededFunctions;
+						if (!addedFunctions.empty())
+							protectedStarts.insert(addedFunctions.begin(), addedFunctions.end());
+						timePostPass("Cleanup invalid functions", [&]()
+						{
+							CleanupInvalidFunctions(this, fileData, fileDataLen, m_endian, imageBase, length,
+								m_logger, postVerbose, postTuning, postCleanupMaxSize,
+								postCleanupZeroRefs, postCleanupPcWrite, m_entryPoint, protectedStarts);
+						});
+					}
 				});
 			}
 		}
 
-		// Scan for common function entry patterns to seed recursive descent analysis.
-		// These entry points are then expanded via call graph traversal.
-		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
-		if (enablePrologueScan)
-		{
-			timePass("Function prologue scan", [&]()
-			{
-					ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
-						m_arch, thumbArch, m_plat, m_logger, enableVerboseLogging, tuning, &m_seededFunctions);
-			});
-		}
-
-		// Scan for pointer targets in data that reference executable code.
-		if (enableClearAutoDataOnCodeRefs)
-		{
-			FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-				m_arch, m_plat, m_logger, enableVerboseLogging, this};
-			timePass("Clear auto data in function entry blocks (pre-analysis)", [&]()
-			{
-					ClearAutoDataInFunctionEntryBlocks(scanCtx, &m_seededFunctions);
-			});
-		}
-
-		if ((enablePointerTargetScan || enableCallTargetScan) && !m_postAnalysisScanEvent)
-		{
-			m_logger->LogInfo("Deferring pointer/call target scan until analysis completes");
-			bool postPointerScan = enablePointerTargetScan;
-			bool postCallScan = enableCallTargetScan;
-			bool postClearAutoData = enableClearAutoDataOnCodeRefs;
-			bool postVerbose = enableVerboseLogging;
-			FirmwareScanTuning postTuning = tuning;
-			bool postCleanupInvalid = enableInvalidFunctionCleanup;
-			uint32_t postCleanupMaxSize = cleanupMaxSizeBytes;
-			bool postCleanupZeroRefs = cleanupRequireZeroRefs;
-			bool postCleanupPcWrite = cleanupRequirePcWriteStart;
-			m_postAnalysisScanEvent = AddAnalysisCompletionEvent([this, postPointerScan, postCallScan,
-				postClearAutoData, postVerbose, postTuning, postCleanupInvalid,
-				postCleanupMaxSize, postCleanupZeroRefs, postCleanupPcWrite]()
-			{
-				if (m_postAnalysisScansDone)
-					return;
-				m_postAnalysisScansDone = true;
-
-				uint64_t imageBase = GetStart();
-				uint64_t length = GetLength();
-				if (!length)
-					return;
-
-				uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
-				DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
-				const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
-				uint64_t fileDataLen = fileBuf.GetLength();
-				if (!fileData || fileDataLen == 0)
-					return;
-
-				BinaryReader reader(GetParentView());
-				reader.SetEndianness(m_endian);
-
-				/*
-				 * Timing helper for post-analysis scans (runs after core analysis completes).
-				 * These timers let us verify whether "phase 3" time is dominated by our scans
-				 * or by core Binary Ninja analysis.
-				 */
-				auto timePostPass = [&](const char* label, auto&& fn)
-				{
-					if (!postVerbose)
-					{
-						fn();
-						return;
-					}
-
-					auto start = std::chrono::steady_clock::now();
-					fn();
-					double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
-						std::chrono::steady_clock::now() - start).count();
-					m_logger->LogInfo("Firmware post-analysis timing: %s took %.3f s", label, seconds);
-				};
-
-				std::set<uint64_t> addedFunctions;
-				if (postPointerScan)
-				{
-					timePostPass("Pointer target scan", [&]()
-					{
-						ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-							m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
-					});
-				}
-				if (postCallScan)
-				{
-					timePostPass("Call target scan", [&]()
-					{
-						ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-							m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
-					});
-				}
-
-				if (!addedFunctions.empty())
-					m_seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
-
-				if (postClearAutoData && !addedFunctions.empty())
-				{
-					FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-						m_arch, m_plat, m_logger, postVerbose, this};
-					timePostPass("Clear auto data in function entry blocks (post-analysis)", [&]()
-					{
-						ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
-					});
-				}
-
-				if (postCleanupInvalid)
-				{
-					timePostPass("Cleanup invalid functions", [&]()
-					{
-						CleanupInvalidFunctions(this, fileData, fileDataLen, m_endian, imageBase, length,
-							m_logger, postVerbose, postTuning, postCleanupMaxSize,
-							postCleanupZeroRefs, postCleanupPcWrite, m_entryPoint, m_seededFunctions);
-					});
-				}
-			});
-		}
+		if (!seededFunctions.empty())
+			m_seededFunctions.insert(seededFunctions.begin(), seededFunctions.end());
 
 		// NOTE: Exception handlers are named (irq_handler, fiq_handler, etc.) but we
 		// don't auto-apply the irq-handler calling convention. Users can apply it
@@ -3412,6 +3988,298 @@ bool Armv5FirmwareView::Init()
 	}
 
 	return true;
+}
+
+void Armv5FirmwareView::RunFirmwareWorkflowScans()
+{
+	if (AnalysisIsAborted())
+		return;
+	if (GetAnalysisInfo().state != IdleState)
+		return;
+	if (m_postAnalysisScansDone)
+	{
+		m_logger->LogInfo("Firmware workflow scan: skipped (already done)");
+		return;
+	}
+	m_postAnalysisScansDone = true;
+
+	if (m_parseOnly)
+	{
+		m_logger->LogInfo("Firmware workflow scan: skipped (parse-only view)");
+		return;
+	}
+
+	if (!m_plat || !m_arch)
+	{
+		m_logger->LogInfo("Firmware workflow scan: skipped (missing platform/arch)");
+		return;
+	}
+	if (AnalysisIsAborted())
+	{
+		m_logger->LogInfo("Firmware workflow scan: skipped (analysis aborted)");
+		return;
+	}
+
+	m_logger->LogInfo("Firmware workflow scan: start");
+
+	uint64_t length = GetLength();
+	if (!length)
+		return;
+
+	/*
+	 * Mirror the firmware scan settings used during Init(), but run them here
+	 * as a workflow activity so we can align with Binary Ninja's analysis pipeline.
+	 */
+	bool enablePrologueScan = false;
+	bool enableCallTargetScan = false;
+	bool enablePointerTargetScan = false;
+	bool enableOrphanCodeScan = true;
+	bool enableLiteralPoolTyping = false;
+	bool enableClearAutoDataOnCodeRefs = false;
+	bool enableVerboseLogging = false;
+	bool enableInvalidFunctionCleanup = false;
+	uint32_t cleanupMaxSizeBytes = 8;
+	bool cleanupRequireZeroRefs = true;
+	bool cleanupRequirePcWriteStart = true;
+	uint32_t orphanMinValidInstr = 4;
+	uint32_t orphanMinBodyInstr = 2;
+	uint32_t orphanMinSpacingBytes = 0x80;
+	uint32_t orphanMaxPerPage = 8;
+	bool orphanRequirePrologue = false;
+	bool skipFirmwareScans = true;
+	bool useModuleWorkflow = true;
+	FirmwareScanTuning tuning{};
+
+	Ref<Settings> settings = GetLoadSettings(GetTypeName());
+	if (settings)
+	{
+		if (settings->Contains("loader.armv5.firmware.scanPrologues"))
+			enablePrologueScan = settings->Get<bool>("loader.armv5.firmware.scanPrologues", this);
+		if (settings->Contains("loader.armv5.firmware.scanCallTargets"))
+			enableCallTargetScan = settings->Get<bool>("loader.armv5.firmware.scanCallTargets", this);
+		if (settings->Contains("loader.armv5.firmware.scanPointerTargets"))
+			enablePointerTargetScan = settings->Get<bool>("loader.armv5.firmware.scanPointerTargets", this);
+		if (settings->Contains("loader.armv5.firmware.scanOrphanCode"))
+			enableOrphanCodeScan = settings->Get<bool>("loader.armv5.firmware.scanOrphanCode", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinValidInstr"))
+			orphanMinValidInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinValidInstr", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinBodyInstr"))
+			orphanMinBodyInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinBodyInstr", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMinSpacingBytes"))
+			orphanMinSpacingBytes = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMinSpacingBytes", this);
+		if (settings->Contains("loader.armv5.firmware.orphanMaxPerPage"))
+			orphanMaxPerPage = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.orphanMaxPerPage", this);
+		if (settings->Contains("loader.armv5.firmware.orphanRequirePrologue"))
+			orphanRequirePrologue = settings->Get<bool>("loader.armv5.firmware.orphanRequirePrologue", this);
+		if (settings->Contains("loader.armv5.firmware.skipFirmwareScans"))
+			skipFirmwareScans = settings->Get<bool>("loader.armv5.firmware.skipFirmwareScans", this);
+		if (settings->Contains("loader.armv5.firmware.useModuleWorkflow"))
+			useModuleWorkflow = settings->Get<bool>("loader.armv5.firmware.useModuleWorkflow", this);
+		if (settings->Contains("loader.armv5.firmware.typeLiteralPools"))
+			enableLiteralPoolTyping = settings->Get<bool>("loader.armv5.firmware.typeLiteralPools", this);
+		if (settings->Contains("loader.armv5.firmware.clearAutoDataOnCodeRefs"))
+			enableClearAutoDataOnCodeRefs = settings->Get<bool>("loader.armv5.firmware.clearAutoDataOnCodeRefs", this);
+		if (settings->Contains("loader.armv5.firmware.verboseLogging"))
+			enableVerboseLogging = settings->Get<bool>("loader.armv5.firmware.verboseLogging", this);
+		if (settings->Contains("loader.armv5.firmware.scanMinValidInstr"))
+			tuning.minValidInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.scanMinValidInstr", this);
+		if (settings->Contains("loader.armv5.firmware.scanMinBodyInstr"))
+			tuning.minBodyInstr = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.scanMinBodyInstr", this);
+		if (settings->Contains("loader.armv5.firmware.scanMaxLiteralRun"))
+			tuning.maxLiteralRun = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.scanMaxLiteralRun", this);
+		if (settings->Contains("loader.armv5.firmware.scanRawPointerTables"))
+			tuning.scanRawPointerTables = settings->Get<bool>("loader.armv5.firmware.scanRawPointerTables", this);
+		if (settings->Contains("loader.armv5.firmware.rawPointerTableMinRun"))
+			tuning.minPointerRun = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.rawPointerTableMinRun", this);
+		if (settings->Contains("loader.armv5.firmware.rawPointerTableRequireCodeRefs"))
+			tuning.requirePointerTableCodeRefs = settings->Get<bool>("loader.armv5.firmware.rawPointerTableRequireCodeRefs", this);
+		if (settings->Contains("loader.armv5.firmware.rawPointerTableAllowInCode"))
+			tuning.allowPointerTablesInCode = settings->Get<bool>("loader.armv5.firmware.rawPointerTableAllowInCode", this);
+		if (settings->Contains("loader.armv5.firmware.callScanRequireInFunction"))
+			tuning.requireCallInFunction = settings->Get<bool>("loader.armv5.firmware.callScanRequireInFunction", this);
+		if (settings->Contains("loader.armv5.firmware.cleanupInvalidFunctions"))
+			enableInvalidFunctionCleanup = settings->Get<bool>("loader.armv5.firmware.cleanupInvalidFunctions", this);
+		if (settings->Contains("loader.armv5.firmware.cleanupInvalidMaxSize"))
+			cleanupMaxSizeBytes = (uint32_t)settings->Get<uint64_t>("loader.armv5.firmware.cleanupInvalidMaxSize", this);
+		if (settings->Contains("loader.armv5.firmware.cleanupInvalidRequireZeroRefs"))
+			cleanupRequireZeroRefs = settings->Get<bool>("loader.armv5.firmware.cleanupInvalidRequireZeroRefs", this);
+		if (settings->Contains("loader.armv5.firmware.cleanupInvalidRequirePcWrite"))
+			cleanupRequirePcWriteStart = settings->Get<bool>("loader.armv5.firmware.cleanupInvalidRequirePcWrite", this);
+	}
+
+	if (tuning.minValidInstr == 0)
+		tuning.minValidInstr = 1;
+	if (tuning.minPointerRun == 0)
+		tuning.minPointerRun = 1;
+
+	if (skipFirmwareScans)
+	{
+		m_logger->LogInfo("Firmware workflow scan skipped (skipFirmwareScans enabled)");
+		return;
+	}
+
+	if (!useModuleWorkflow)
+	{
+		m_logger->LogInfo("Firmware workflow scan skipped (module workflow disabled)");
+		return;
+	}
+	if (AnalysisIsAborted())
+	{
+		m_logger->LogInfo("Firmware workflow scan skipped (analysis aborted)");
+		return;
+	}
+
+	uint64_t imageBase = GetStart();
+	uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
+	DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
+	const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
+	uint64_t fileDataLen = fileBuf.GetLength();
+	if (!fileData || fileDataLen == 0)
+		return;
+
+	BinaryReader reader(GetParentView());
+	reader.SetEndianness(m_endian);
+
+	std::set<uint64_t> seededFunctions = m_seededFunctions;
+
+	auto timePass = [&](const char* label, auto&& fn)
+	{
+		if (!enableVerboseLogging)
+		{
+			fn();
+			return;
+		}
+
+		auto start = std::chrono::steady_clock::now();
+		fn();
+		double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+			std::chrono::steady_clock::now() - start).count();
+		m_logger->LogInfo("Firmware workflow timing: %s took %.3f s", label, seconds);
+	};
+
+	if (enableLiteralPoolTyping)
+	{
+		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+			m_arch, m_plat, m_logger, enableVerboseLogging, this};
+		timePass("Literal pool typing", [&]()
+		{
+			TypeLiteralPoolEntries(scanCtx);
+		});
+		if (enableClearAutoDataOnCodeRefs)
+		{
+			timePass("Clear auto data on code refs", [&]()
+			{
+				ClearAutoDataOnCodeReferences(scanCtx);
+			});
+		}
+	}
+
+	if (enablePrologueScan)
+	{
+		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
+		timePass("Function prologue scan", [&]()
+		{
+			ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
+				m_arch, thumbArch, m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
+		});
+	}
+
+	if (enableClearAutoDataOnCodeRefs)
+	{
+		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+			m_arch, m_plat, m_logger, enableVerboseLogging, this};
+		timePass("Clear auto data in function entry blocks", [&]()
+		{
+			ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
+		});
+	}
+
+	if (enableCallTargetScan)
+	{
+		timePass("Call target scan", [&]()
+		{
+			ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+				m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
+		});
+	}
+
+	std::set<uint64_t> addedFunctions;
+	if (enablePointerTargetScan)
+	{
+		timePass("Pointer target scan", [&]()
+		{
+			ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
+				m_plat, m_logger, enableVerboseLogging, tuning, &addedFunctions);
+		});
+	}
+
+	if (enableOrphanCodeScan)
+	{
+		timePass("Orphan code block scan", [&]()
+		{
+			ScanForOrphanCodeBlocks(this, fileData, fileDataLen, m_endian, imageBase, length,
+				m_plat, m_logger, enableVerboseLogging, tuning, orphanMinValidInstr, orphanMinBodyInstr,
+				orphanMinSpacingBytes, orphanMaxPerPage, orphanRequirePrologue, &addedFunctions);
+		});
+	}
+
+	if (!addedFunctions.empty())
+		seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
+
+	if (enableClearAutoDataOnCodeRefs && !addedFunctions.empty())
+	{
+		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
+			m_arch, m_plat, m_logger, enableVerboseLogging, this};
+		timePass("Clear auto data in new function entry blocks", [&]()
+		{
+			ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
+		});
+	}
+
+	if (enableInvalidFunctionCleanup)
+	{
+		std::set<uint64_t> protectedStarts = seededFunctions;
+		timePass("Cleanup invalid functions", [&]()
+		{
+			CleanupInvalidFunctions(this, fileData, fileDataLen, m_endian, imageBase, length,
+				m_logger, enableVerboseLogging, tuning, cleanupMaxSizeBytes,
+				cleanupRequireZeroRefs, cleanupRequirePcWriteStart, m_entryPoint, protectedStarts);
+		});
+	}
+
+	m_logger->LogInfo("Firmware workflow scan: done");
+}
+
+void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view)
+{
+	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+	if (!view)
+	{
+		if (logger)
+			logger->LogInfo("Firmware workflow scan: no BinaryView");
+		return;
+	}
+	if (view->GetTypeName() != "ARMv5 Firmware")
+	{
+		if (logger)
+			logger->LogInfo("Firmware workflow scan: wrong view type %s", view->GetTypeName().c_str());
+		return;
+	}
+	Armv5FirmwareView* firmwareView = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+		auto& map = FirmwareViewMap();
+		auto it = map.find(view->GetObject());
+		if (it != map.end())
+			firmwareView = it->second;
+	}
+	if (!firmwareView)
+	{
+		if (logger)
+			logger->LogInfo("Firmware workflow scan: view map lookup failed");
+		return;
+	}
+	firmwareView->RunFirmwareWorkflowScans();
 }
 
 
@@ -3615,6 +4483,77 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView* data)
 		"default" : true,
 		"description" : "Discover function entry points referenced by data pointers."
 		})");
+	settings->RegisterSetting("loader.armv5.firmware.scanOrphanCode",
+		R"({
+		"title" : "Scan for orphan code blocks",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Discover unreachable functions post-analysis by finding orphaned code blocks and basic block boundaries."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.orphanMinValidInstr",
+		R"({
+		"title" : "Orphan scan min valid instructions",
+		"type" : "number",
+		"default" : 6,
+		"min" : 1,
+		"max" : 16,
+		"description" : "Minimum consecutive valid ARM instructions required for an orphan code candidate."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.orphanMinBodyInstr",
+		R"({
+		"title" : "Orphan scan min body instructions",
+		"type" : "number",
+		"default" : 2,
+		"min" : 0,
+		"max" : 16,
+		"description" : "Minimum valid instructions after the candidate prologue when validating orphan code."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.orphanMinSpacingBytes",
+		R"({
+		"title" : "Orphan scan min spacing bytes",
+		"type" : "number",
+		"default" : 128,
+		"min" : 0,
+		"max" : 4096,
+		"description" : "Minimum spacing between orphan functions added during the post-analysis scan."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.orphanMaxPerPage",
+		R"({
+		"title" : "Orphan scan max per 4KB page",
+		"type" : "number",
+		"default" : 6,
+		"min" : 0,
+		"max" : 64,
+		"description" : "Maximum orphan functions to add per 4KB page (0 disables the cap)."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.partialLinearSweep",
+		R"({
+		"title" : "Partial linear sweep",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Enable Binary Ninja's partial linear sweep (no CFG pass) alongside the firmware scans."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.skipFirmwareScans",
+		R"({
+		"title" : "Skip firmware scans",
+		"type" : "boolean",
+		"default" : false,
+		"description" : "Disable the firmware-specific pointer/orphan/call scans so only the core sweep runs."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.useModuleWorkflow",
+		R"({
+		"title" : "Use module workflow for firmware scans",
+		"type" : "boolean",
+		"default" : false,
+		"description" : "Run firmware scans via a module workflow activity (armv5.module.firmware) instead of the analysis completion event."
+		})");
+	settings->RegisterSetting("loader.armv5.firmware.orphanRequirePrologue",
+		R"({
+		"title" : "Orphan scan require prologue",
+		"type" : "boolean",
+		"default" : true,
+		"description" : "Require a prologue-like instruction at the candidate start to reduce false positives."
+		})");
 	settings->RegisterSetting("loader.armv5.firmware.scanRawPointerTables",
 		R"({
 		"title" : "Scan raw pointer tables",
@@ -3656,14 +4595,14 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView* data)
 		R"({
 		"title" : "Disable core pointer sweep",
 		"type" : "boolean",
-		"default" : true,
+		"default" : false,
 		"description" : "Disable Binary Ninja's core pointer sweep (analysis.pointerSweep.autorun) to reduce false positives in raw firmware blobs."
 		})");
 	settings->RegisterSetting("loader.armv5.firmware.disableLinearSweep",
 		R"({
 		"title" : "Disable core linear sweep",
 		"type" : "boolean",
-		"default" : true,
+		"default" : false,
 		"description" : "Disable Binary Ninja's core linear sweep so firmware scans drive function discovery."
 		})");
 	settings->RegisterSetting("loader.armv5.firmware.cleanupInvalidFunctions",
@@ -3714,7 +4653,7 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView* data)
 		R"({
 		"title" : "Verbose firmware analysis logging",
 		"type" : "boolean",
-		"default" : false,
+		"default" : true,
 		"description" : "Emit per-pass summary logs for firmware analysis heuristics without enabling global debug logging."
 		})");
 	settings->RegisterSetting("loader.armv5.firmware.scanMinValidInstr",

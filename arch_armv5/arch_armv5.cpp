@@ -67,6 +67,16 @@ static bool IsRelatedCondition(Condition orig, Condition candidate)
   }
 }
 
+static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
+{
+  if (!analysisContext)
+    return;
+  auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+  if (logger)
+    logger->LogInfo("Firmware workflow activity: invoked");
+  RunArmv5FirmwareWorkflowScans(analysisContext->GetBinaryView());
+}
+
 /*
  * Check if an instruction can be followed by more coalesced conditional instructions
  * Returns false for branches and instructions writing to PC
@@ -5082,6 +5092,30 @@ extern "C"
   {
     RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
     InitArmv5FirmwareViewType();
+
+    // Register a module workflow that runs ARMv5 firmware scans after core analysis.
+    Ref<Workflow> firmwareWorkflow = Workflow::Get("core.module.metaAnalysis")->Clone("armv5.module.firmware");
+    firmwareWorkflow->RegisterActivity(R"~({
+      "title": "ARMv5 Firmware Scan",
+      "name": "analysis.armv5.firmwareScan",
+      "role": "action",
+      "description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
+      "eligibility": {
+        "runOnce": true,
+        "auto": { "default": true },
+        "predicates": [
+          {
+            "type": "viewType",
+            "value": ["ARMv5 Firmware"]
+          }
+        ]
+      },
+      "dependencies": {
+        "downstream": ["core.module.update"]
+      }
+    })~", &RunArmv5FirmwareWorkflow);
+    firmwareWorkflow->Insert("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
+    Workflow::RegisterWorkflow(firmwareWorkflow);
     return true;
   }
 }
