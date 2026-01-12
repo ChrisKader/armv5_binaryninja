@@ -454,8 +454,6 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 
 Armv5FirmwareView::~Armv5FirmwareView()
 {
-	if (m_postAnalysisScanEvent)
-		m_postAnalysisScanEvent->Cancel();
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 		auto& map = FirmwareViewMap();
@@ -3397,7 +3395,6 @@ bool Armv5FirmwareView::Init()
 	bool orphanRequirePrologue = true;
 	bool enablePartialLinearSweep = true;
 	bool skipFirmwareScans = true;
-	bool useModuleWorkflow = true;
 	FirmwareScanTuning tuning{};
 
 	// Get load settings if available
@@ -3431,8 +3428,6 @@ bool Armv5FirmwareView::Init()
 			enablePartialLinearSweep = settings->Get<bool>("loader.armv5.firmware.partialLinearSweep", this);
 		if (settings->Contains("loader.armv5.firmware.skipFirmwareScans"))
 			skipFirmwareScans = settings->Get<bool>("loader.armv5.firmware.skipFirmwareScans", this);
-		if (settings->Contains("loader.armv5.firmware.useModuleWorkflow"))
-			useModuleWorkflow = settings->Get<bool>("loader.armv5.firmware.useModuleWorkflow", this);
 		if (settings->Contains("loader.armv5.firmware.typeLiteralPools"))
 			enableLiteralPoolTyping = settings->Get<bool>("loader.armv5.firmware.typeLiteralPools", this);
 		if (settings->Contains("loader.armv5.firmware.clearAutoDataOnCodeRefs"))
@@ -3480,14 +3475,14 @@ bool Armv5FirmwareView::Init()
 		m_logger->LogInfo(
 			"Firmware settings: prologue_scan=%d call_scan=%d pointer_scan=%d orphan_scan=%d "
 			"orphan_min_valid=%u orphan_min_body=%u orphan_min_spacing=0x%x orphan_max_per_page=%u "
-			"orphan_require_prologue=%d partial_linear_sweep=%d skip_firmware_scans=%d module_workflow=%d "
+			"orphan_require_prologue=%d partial_linear_sweep=%d skip_firmware_scans=%d "
 			"raw_ptr_tables=%d raw_ptr_min_run=%u raw_ptr_require_refs=%d raw_ptr_allow_in_code=%d "
 			"call_scan_require_in_func=%d disable_pointer_sweep=%d disable_linear_sweep=%d "
 			"cleanup_invalid=%d cleanup_max_size=%u cleanup_zero_refs=%d cleanup_pc_write=%d "
 			"type_literal_pools=%d clear_auto_data_on_code_refs=%d scan_min_valid=%u scan_min_body=%u scan_max_literal_run=%u",
 			enablePrologueScan, enableCallTargetScan, enablePointerTargetScan, enableOrphanCodeScan,
 			orphanMinValidInstr, orphanMinBodyInstr, orphanMinSpacingBytes, orphanMaxPerPage,
-			orphanRequirePrologue, enablePartialLinearSweep, skipFirmwareScans, useModuleWorkflow,
+			orphanRequirePrologue, enablePartialLinearSweep, skipFirmwareScans,
 			tuning.scanRawPointerTables, tuning.minPointerRun, tuning.requirePointerTableCodeRefs, tuning.allowPointerTablesInCode,
 			tuning.requireCallInFunction, disablePointerSweep, disableLinearSweep,
 			enableInvalidFunctionCleanup, cleanupMaxSizeBytes, cleanupRequireZeroRefs, cleanupRequirePcWriteStart,
@@ -3567,10 +3562,6 @@ bool Armv5FirmwareView::Init()
 		SetDefaultArchitecture(m_arch);
 		SetDefaultPlatform(m_plat);
 	}
-
-	// Use module workflow if enabled to insert firmware scans into the analysis pipeline
-	if (useModuleWorkflow)
-		Settings::Instance()->Set("analysis.workflows.moduleWorkflow", "armv5.module.firmware", this);
 
 	// Disable core pointer sweep if requested to avoid excessive false positives on raw firmware blobs.
 	if (disablePointerSweep)
@@ -3812,171 +3803,9 @@ bool Armv5FirmwareView::Init()
 			AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
 		});
 
-		if (!skipFirmwareScans && !useModuleWorkflow)
+		if (!skipFirmwareScans && enableVerboseLogging)
 		{
-			// Define literal pool entries as data to avoid disassembling them as code
-			if (enableLiteralPoolTyping)
-			{
-				FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-					m_arch, m_plat, m_logger, enableVerboseLogging, this};
-				timePass("Literal pool typing", [&]()
-				{
-					TypeLiteralPoolEntries(scanCtx);
-				});
-				if (enableClearAutoDataOnCodeRefs)
-				{
-					timePass("Clear auto data on code refs", [&]()
-					{
-						ClearAutoDataOnCodeReferences(scanCtx);
-					});
-				}
-			}
-
-			// Scan for common function entry patterns to seed recursive descent analysis.
-			// These entry points are then expanded via call graph traversal.
-			Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
-			if (enablePrologueScan)
-			{
-				timePass("Function prologue scan", [&]()
-				{
-						ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
-							m_arch, thumbArch, m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
-				});
-			}
-
-			// Scan for pointer targets in data that reference executable code.
-			if (enableClearAutoDataOnCodeRefs)
-			{
-				FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-					m_arch, m_plat, m_logger, enableVerboseLogging, this};
-				timePass("Clear auto data in function entry blocks (pre-analysis)", [&]()
-				{
-						ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
-				});
-			}
-
-			bool callScanRanPreAnalysis = false;
-			if (enableCallTargetScan)
-			{
-				timePass("Call target scan (pre-analysis)", [&]()
-				{
-					ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-						m_plat, m_logger, enableVerboseLogging, tuning, &seededFunctions);
-				});
-				callScanRanPreAnalysis = true;
-			}
-
-			if ((enablePointerTargetScan || enableCallTargetScan || enableOrphanCodeScan) && !m_postAnalysisScanEvent)
-			{
-				m_logger->LogInfo("Deferring pointer/call/orphan target scan until analysis completes");
-				bool postPointerScan = enablePointerTargetScan;
-				bool postCallScan = enableCallTargetScan && !callScanRanPreAnalysis;
-				bool postOrphanScan = enableOrphanCodeScan;
-				bool postClearAutoData = enableClearAutoDataOnCodeRefs;
-				bool postVerbose = enableVerboseLogging;
-				FirmwareScanTuning postTuning = tuning;
-				bool postCleanupInvalid = enableInvalidFunctionCleanup;
-				uint32_t postCleanupMaxSize = cleanupMaxSizeBytes;
-				bool postCleanupZeroRefs = cleanupRequireZeroRefs;
-				bool postCleanupPcWrite = cleanupRequirePcWriteStart;
-				m_postAnalysisScanEvent = AddAnalysisCompletionEvent([this, postPointerScan, postCallScan,
-					postOrphanScan, postClearAutoData, postVerbose, postTuning, postCleanupInvalid,
-					postCleanupMaxSize, postCleanupZeroRefs, postCleanupPcWrite, orphanMinValidInstr,
-					orphanMinBodyInstr, orphanMinSpacingBytes, orphanMaxPerPage, orphanRequirePrologue]()
-				{
-					if (m_postAnalysisScansDone)
-						return;
-					m_postAnalysisScansDone = true;
-
-					uint64_t imageBase = GetStart();
-					uint64_t length = GetLength();
-					if (!length)
-						return;
-
-					uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
-					DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
-					const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
-					uint64_t fileDataLen = fileBuf.GetLength();
-					if (!fileData || fileDataLen == 0)
-						return;
-
-					BinaryReader reader(GetParentView());
-					reader.SetEndianness(m_endian);
-
-					/*
-					 * Timing helper for post-analysis scans (runs after core analysis completes).
-					 * These timers let us verify whether "phase 3" time is dominated by our scans
-					 * or by core Binary Ninja analysis.
-					 */
-					auto timePostPass = [&](const char* label, auto&& fn)
-					{
-						if (!postVerbose)
-						{
-							fn();
-							return;
-						}
-
-						auto start = std::chrono::steady_clock::now();
-						fn();
-						double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
-							std::chrono::steady_clock::now() - start).count();
-						m_logger->LogInfo("Firmware post-analysis timing: %s took %.3f s", label, seconds);
-					};
-
-					std::set<uint64_t> addedFunctions;
-					if (postPointerScan)
-					{
-						timePostPass("Pointer target scan", [&]()
-						{
-							ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-								m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
-						});
-					}
-					if (postCallScan)
-					{
-						timePostPass("Call target scan", [&]()
-						{
-							ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-								m_plat, m_logger, postVerbose, postTuning, &addedFunctions);
-						});
-					}
-					if (postOrphanScan)
-					{
-						timePostPass("Orphan code block scan", [&]()
-						{
-							ScanForOrphanCodeBlocks(this, fileData, fileDataLen, m_endian, imageBase, length,
-								m_plat, m_logger, postVerbose, postTuning, orphanMinValidInstr, orphanMinBodyInstr,
-								orphanMinSpacingBytes, orphanMaxPerPage, orphanRequirePrologue, &addedFunctions);
-						});
-					}
-
-					if (!addedFunctions.empty())
-						m_seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
-
-					if (postClearAutoData && !addedFunctions.empty())
-					{
-						FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-							m_arch, m_plat, m_logger, postVerbose, this};
-						timePostPass("Clear auto data in function entry blocks (post-analysis)", [&]()
-						{
-							ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
-						});
-					}
-
-					if (postCleanupInvalid)
-					{
-						std::set<uint64_t> protectedStarts = m_seededFunctions;
-						if (!addedFunctions.empty())
-							protectedStarts.insert(addedFunctions.begin(), addedFunctions.end());
-						timePostPass("Cleanup invalid functions", [&]()
-						{
-							CleanupInvalidFunctions(this, fileData, fileDataLen, m_endian, imageBase, length,
-								m_logger, postVerbose, postTuning, postCleanupMaxSize,
-								postCleanupZeroRefs, postCleanupPcWrite, m_entryPoint, protectedStarts);
-						});
-					}
-				});
-			}
+			m_logger->LogInfo("Firmware scans scheduled via module workflow activity");
 		}
 
 		if (!seededFunctions.empty())
@@ -3994,7 +3823,8 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 {
 	if (AnalysisIsAborted())
 		return;
-	if (GetAnalysisInfo().state != IdleState)
+	BNAnalysisState state = GetAnalysisInfo().state;
+	if (state == InitialState || state == HoldState)
 		return;
 	if (m_postAnalysisScansDone)
 	{
@@ -4047,7 +3877,6 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 	uint32_t orphanMaxPerPage = 8;
 	bool orphanRequirePrologue = false;
 	bool skipFirmwareScans = true;
-	bool useModuleWorkflow = true;
 	FirmwareScanTuning tuning{};
 
 	Ref<Settings> settings = GetLoadSettings(GetTypeName());
@@ -4073,8 +3902,6 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 			orphanRequirePrologue = settings->Get<bool>("loader.armv5.firmware.orphanRequirePrologue", this);
 		if (settings->Contains("loader.armv5.firmware.skipFirmwareScans"))
 			skipFirmwareScans = settings->Get<bool>("loader.armv5.firmware.skipFirmwareScans", this);
-		if (settings->Contains("loader.armv5.firmware.useModuleWorkflow"))
-			useModuleWorkflow = settings->Get<bool>("loader.armv5.firmware.useModuleWorkflow", this);
 		if (settings->Contains("loader.armv5.firmware.typeLiteralPools"))
 			enableLiteralPoolTyping = settings->Get<bool>("loader.armv5.firmware.typeLiteralPools", this);
 		if (settings->Contains("loader.armv5.firmware.clearAutoDataOnCodeRefs"))
@@ -4118,11 +3945,6 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 		return;
 	}
 
-	if (!useModuleWorkflow)
-	{
-		m_logger->LogInfo("Firmware workflow scan skipped (module workflow disabled)");
-		return;
-	}
 	if (AnalysisIsAborted())
 	{
 		m_logger->LogInfo("Firmware workflow scan skipped (analysis aborted)");
@@ -4246,7 +4068,6 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 				cleanupRequireZeroRefs, cleanupRequirePcWriteStart, m_entryPoint, protectedStarts);
 		});
 	}
-
 	m_logger->LogInfo("Firmware workflow scan: done");
 }
 
@@ -4539,13 +4360,6 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView* data)
 		"type" : "boolean",
 		"default" : false,
 		"description" : "Disable the firmware-specific pointer/orphan/call scans so only the core sweep runs."
-		})");
-	settings->RegisterSetting("loader.armv5.firmware.useModuleWorkflow",
-		R"({
-		"title" : "Use module workflow for firmware scans",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Run firmware scans via a module workflow activity (armv5.module.firmware) instead of the analysis completion event."
 		})");
 	settings->RegisterSetting("loader.armv5.firmware.orphanRequirePrologue",
 		R"({

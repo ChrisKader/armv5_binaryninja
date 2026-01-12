@@ -69,12 +69,24 @@ static bool IsRelatedCondition(Condition orig, Condition candidate)
 
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
 {
+  auto view = analysisContext->GetBinaryView();
+  auto platform = view->GetDefaultPlatform();
+  if (!platform)
+  return;
   if (!analysisContext)
-    return;
-  auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
-  if (logger)
-    logger->LogInfo("Firmware workflow activity: invoked");
-  RunArmv5FirmwareWorkflowScans(analysisContext->GetBinaryView());
+  return;
+  auto platformName = platform->GetName();
+  if (platformName.find("armv5") != std::string::npos)
+  {
+    try
+    {
+      RunArmv5FirmwareWorkflowScans(view);
+    }
+    catch (std::exception& e)
+    {
+      LogErrorForException(e, "Armv5 Firmware Workflow failed with uncaugt exception: %s", e.what());
+    }
+  }
 }
 
 /*
@@ -5093,8 +5105,8 @@ extern "C"
     RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
     InitArmv5FirmwareViewType();
 
-    // Register a module workflow that runs ARMv5 firmware scans after core analysis.
-    Ref<Workflow> firmwareWorkflow = Workflow::Get("core.module.metaAnalysis")->Clone("armv5.module.firmware");
+    // Register a module workflow activity that runs ARMv5 firmware scans alongside core analysis.
+    Ref<Workflow> firmwareWorkflow = Workflow::Get("core.module.metaAnalysis")->Clone();
     firmwareWorkflow->RegisterActivity(R"~({
       "title": "ARMv5 Firmware Scan",
       "name": "analysis.armv5.firmwareScan",
