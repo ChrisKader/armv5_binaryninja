@@ -314,7 +314,8 @@ namespace
 		if (!view || !view->GetObject())
 			return false;
 		bool result = false;
-		ExecuteOnMainThreadAndWait([&]() {
+
+		ExecuteOnMainThreadAndWait([view, &fwSettings, &plan, &logger, &result]() {
 			if (!view || !view->GetObject())
 				return;
 			if (BNIsShutdownRequested())
@@ -469,7 +470,7 @@ namespace
 		FirmwareScanContext scanCtx{
 			reader, fileData, fileDataLen, view->GetDefaultEndianness(), imageBase, length,
 			view->GetDefaultArchitecture(), view->GetDefaultPlatform(),
-			logger, fwSettings.enableVerboseLogging, view.GetPtr(), &plan
+			logger, fwSettings.enableVerboseLogging, view, &plan
 		};
 		auto refreshViewForPhase = [&]() -> bool {
 			view = resolveView();
@@ -515,7 +516,7 @@ namespace
 		{
 			Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
 			timePass("Function prologue scan", [&]() {
-				ScanForFunctionPrologues(view.GetPtr(), fileData, fileDataLen, view->GetDefaultEndianness(),
+				ScanForFunctionPrologues(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultArchitecture(), thumbArch, view->GetDefaultPlatform(),
 					logger, fwSettings.enableVerboseLogging, tuning, &seededFunctions, &plan);
 			});
@@ -550,7 +551,7 @@ namespace
 		if (fwSettings.enableCallTargetScan)
 		{
 			timePass("Call target scan", [&]() {
-				ScanForCallTargets(view.GetPtr(), fileData, fileDataLen, view->GetDefaultEndianness(),
+				ScanForCallTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
 					tuning, &seededFunctions, &plan);
 			});
@@ -572,7 +573,7 @@ namespace
 		if (fwSettings.enablePointerTargetScan)
 		{
 			timePass("Pointer target scan", [&]() {
-				ScanForPointerTargets(view.GetPtr(), fileData, fileDataLen, view->GetDefaultEndianness(),
+				ScanForPointerTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
 					tuning, &addedFunctions, &plan);
 			});
@@ -594,7 +595,7 @@ namespace
 		if (fwSettings.enableOrphanCodeScan)
 		{
 			timePass("Orphan code block scan", [&]() {
-				ScanForOrphanCodeBlocks(view.GetPtr(), fileData, fileDataLen, view->GetDefaultEndianness(),
+				ScanForOrphanCodeBlocks(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
 					tuning, fwSettings.orphanMinValidInstr, fwSettings.orphanMinBodyInstr,
 					fwSettings.orphanMinSpacingBytes, fwSettings.orphanMaxPerPage,
@@ -628,7 +629,7 @@ namespace
 		{
 			std::set<uint64_t> protectedStarts = seededFunctions;
 			timePass("Cleanup invalid functions", [&]() {
-				CleanupInvalidFunctions(view.GetPtr(), fileData, fileDataLen, view->GetDefaultEndianness(),
+				CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
 					fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
 					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, &plan);

@@ -18,9 +18,9 @@ using namespace std;
 using namespace BinaryNinja;
 using namespace armv5;
 
-static bool IsAddressWithinView(const BinaryView* view, uint64_t addr, uint64_t size = 4)
+static bool IsAddressWithinView(const Ref<BinaryView>& view, uint64_t addr, uint64_t size = 4)
 {
-	if (!view)
+	if (!view || !view->GetObject())
 		return false;
 	uint64_t length = view->GetLength();
 	if (length < size)
@@ -40,7 +40,7 @@ static void LogFirmwareActionSkip(Logger* logger, const char* action, uint64_t a
 		action, (unsigned long long)addr, reason);
 }
 
-static bool EnsureAddressInsideView(const BinaryView* view, Logger* logger,
+static bool EnsureAddressInsideView(const Ref<BinaryView>& view, Logger* logger,
 	const char* action, uint64_t addr, uint64_t size = 4)
 {
 	if (IsAddressWithinView(view, addr, size))
@@ -49,15 +49,15 @@ static bool EnsureAddressInsideView(const BinaryView* view, Logger* logger,
 	return false;
 }
 
-static inline bool ScanShouldAbort(const BinaryView* view)
+static inline bool ScanShouldAbort(const Ref<BinaryView>& view)
 {
 	if (BNIsShutdownRequested())
 		return true;
-	if (!view)
+	if (!view || !view->GetObject())
 		return true;
-	if (IsFirmwareViewClosing(view))
+	if (IsFirmwareViewClosing(view.GetPtr()))
 		return true;
-	if (IsFirmwareViewScanCancelled(view))
+	if (IsFirmwareViewScanCancelled(view.GetPtr()))
 		return true;
 	// Note: AnalysisIsAborted() is checked at phase boundaries in ShouldCancel(),
 	// not here. Checking it here causes all scans to abort when maxFunctionUpdateCount
@@ -184,8 +184,10 @@ static const FirmwareActionPolicy& GetFirmwareActionPolicy()
 	return policy;
 }
 
-static bool HasExplicitCodeSemantics(BinaryView* view)
+static bool HasExplicitCodeSemantics(const Ref<BinaryView>& view)
 {
+	if (!view || !view->GetObject())
+		return false;
 	auto sections = view->GetSections();
 	for (auto& section : sections)
 	{
@@ -366,7 +368,7 @@ static bool IsAllowedPcWriteStart(const Instruction& instr)
 	return false;
 }
 
-static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* data, uint64_t dataLen,
+static bool ValidateFirmwareFunctionCandidate(const Ref<BinaryView>& view, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t imageBase, uint64_t length, uint64_t addr,
 	const FirmwareScanTuning& tuning, bool requireBodyInstr, bool allowPcWriteStart)
 {
@@ -611,7 +613,7 @@ static bool LooksLikeReturnThunk(const uint8_t* data, uint64_t dataLen, BNEndian
  *
  * Returns the number of function prologues found.
  */
-size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
+size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Architecture> armArch, Ref<Architecture> thumbArch, Ref<Platform> plat, Ref<Logger> logger,
 	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
@@ -973,7 +975,7 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
  *
  * Returns the number of call targets found.
  */
-size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
+size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
 	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
@@ -1381,7 +1383,7 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
  *
  * Returns the number of pointer targets found.
  */
-size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
+size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
 	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
@@ -1840,7 +1842,7 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
  *
  * Returns the number of orphan functions found and added.
  */
-size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
+size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
 	uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes, uint32_t maxPerPage,
@@ -2134,7 +2136,7 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 	return orphansFound;
 }
 
-size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t dataLen,
+size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t imageBase, uint64_t length, Ref<Logger> logger, bool verboseLog,
 	const FirmwareScanTuning& tuning, uint32_t maxSizeBytes, bool requireZeroRefs,
 	bool requirePcWriteStart, uint64_t entryPoint, const std::set<uint64_t>& protectedStarts,

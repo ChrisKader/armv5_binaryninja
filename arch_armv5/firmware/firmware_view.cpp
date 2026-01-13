@@ -586,7 +586,7 @@ bool Armv5FirmwareView::Init()
 
 		timePass("MMU analysis", [&]()
 		{
-			AnalyzeMMUConfiguration(this, reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
+			AnalyzeMMUConfiguration(Ref<BinaryView>(this), reader, fileData, fileDataLen, m_endian, imageBase, length, m_logger);
 		});
 
 		if (!fwSettings.skipFirmwareScans && fwSettings.enableVerboseLogging)

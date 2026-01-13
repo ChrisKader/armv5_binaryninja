@@ -226,7 +226,7 @@ static bool ReadU32Smart(BinaryReader& reader, const uint8_t* data, uint64_t dat
 // Analyze MMU configuration to discover memory regions
 // Looks for MCR p15, 0, Rx, c2, c0, 0 (write to TTBR) and parses the translation table
 // When translation table is uninitialized, discovers config arrays through static analysis
-void AnalyzeMMUConfiguration(BinaryView* view, BinaryReader& reader, const uint8_t* data,
+void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length, Ref<Logger> logger)
 {
 	uint64_t ttbrValue = 0;
