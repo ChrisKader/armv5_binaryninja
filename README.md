@@ -4,12 +4,12 @@ A Binary Ninja architecture plugin providing disassembly, instruction rendering,
 
 ## Features
 
-- **ARM Mode**: Full 32-bit ARMv5 instruction set
-- **Thumb Mode**: Original 16-bit Thumb (not Thumb-2)
-- **VFPv2**: Basic floating-point operations
-- **DSP Extensions**: SMUL, SMLA, saturating arithmetic
-- **IL Lifting**: Complete LLIL support for analysis
-- **Firmware Detection**: Automatic vector table parsing for bare-metal binaries
+- ARM Mode: Full 32-bit ARMv5 instruction set
+- Thumb Mode: Original 16-bit Thumb (not Thumb-2)
+- VFPv2: Basic floating-point operations
+- DSP Extensions: SMUL, SMLA, saturating arithmetic
+- IL Lifting: Complete LLIL support for analysis
+- Firmware Detection: Automatic vector table parsing for bare-metal binaries
 
 ### Supported Processors
 
@@ -85,26 +85,72 @@ BN_USER_DIRECTORY=~/.binaryninja-dev python3 -m pytest test/ -v
 
 ```
 armv5_binaryninja/
-├── arch_armv5/           # Main plugin source
-│   ├── arch_armv5.cpp    # Architecture plugin interface
-│   ├── firmware/         # Firmware BinaryViewType
-│   │   ├── firmware_view.cpp/h
-│   │   ├── firmware_scans.cpp
-│   │   ├── firmware_vectors.cpp
-│   │   ├── firmware_mmu.cpp
-│   │   ├── firmware_settings.cpp/h
-│   │   └── firmware_internal.h
-│   ├── il/               # LLIL lifting
-│   │   └── il.cpp/h
-│   ├── relocations/      # Relocation handling
-│   │   └── relocations.cpp/h
-│   ├── armv5_disasm/     # ARM instruction decoder (C)
-│   └── thumb_disasm/     # Thumb decoder (spec-generated)
-├── test/                 # Test suite
-├── data/                 # Test binaries
-├── binaryninja-api/      # Binary Ninja API (submodule)
-└── docs/                 # Documentation
+|-- arch_armv5/                        # Main plugin source
+|   |-- arch_armv5.cpp/h               # Plugin registration and wiring
+|   |-- arch/
+|   |   |-- armv5_architecture.cpp/h   # ARM mode architecture implementation
+|   |   `-- arm_common.cpp             # ArmCommonArchitecture methods
+|   |-- conventions/
+|   |   `-- calling_conventions.cpp/h  # Calling convention definitions/registration
+|   |-- recognizers/
+|   |   `-- function_recognizers.cpp/h # Function recognizers (ARM/Thumb thunks)
+|   |-- platforms/
+|   |   `-- platform_recognizers.cpp/h # ELF/raw platform detection
+|   |-- firmware/                      # Firmware BinaryViewType
+|   |   |-- firmware_view.cpp/h
+|   |   |-- firmware_scans.cpp
+|   |   |-- firmware_vectors.cpp
+|   |   |-- firmware_mmu.cpp
+|   |   |-- firmware_settings.cpp/h
+|   |   `-- firmware_internal.h
+|   |-- relocations/                   # Relocation handling
+|   |   `-- relocations.cpp/h
+|   |-- il/                            # LLIL lifting
+|   |   `-- il.cpp/h
+|   |-- armv5_disasm/                  # ARM instruction decoder (C)
+|   `-- thumb_disasm/                  # Thumb decoder (spec-generated)
+|-- test/                              # Test suite
+|-- data/                              # Test binaries
+|-- binaryninja-api/                   # Binary Ninja API (submodule)
+`-- docs/                              # Documentation
 ```
+
+## Architecture Module
+
+### Key Classes
+
+| Class | Description |
+|-------|-------------|
+| `ArmCommonArchitecture` | Base class with shared ARM/Thumb functionality |
+| `Armv5Architecture` | 32-bit ARM mode (architecture name: `armv5`) |
+| `ThumbArchitecture` | 16-bit Thumb mode (architecture name: `armv5t`) |
+| `Armv5FirmwareView` | Custom BinaryViewType for bare-metal firmware |
+
+### Calling Conventions
+
+| Convention | Description |
+|------------|-------------|
+| `aapcs` | ARM EABI (default) - r0-r3 args, r0 return |
+| `cdecl` | Compatibility alias for AAPCS |
+| `apcs` | Legacy ATPCS - 4-byte stack alignment |
+| `irq-handler` | For interrupt handlers - all GPRs caller-saved |
+| `task-entry` | RTOS task entry - r0/r1 as argc/argv |
+| `linux-syscall` | Linux syscall - r7=syscall#, r0-r6 args |
+
+### Firmware View Features
+
+The `Armv5FirmwareView` provides automatic analysis for bare-metal binaries:
+
+- Vector table detection (LDR PC or B instruction patterns)
+- Exception handler function creation
+- IRQ/FIQ return handler detection
+- MMIO region identification
+- Jump table detection
+- Literal pool typing
+
+## Instruction Coverage and Lifting Status
+
+See [INSTRUCTIONS.md](INSTRUCTIONS.md) for the full coverage matrix and tracking notes.
 
 ## License
 
@@ -112,5 +158,5 @@ This project is provided under the same license as the Binary Ninja API.
 
 ## References
 
-- [ARM Architecture Reference Manual (ARMv5)](https://developer.arm.com/documentation/ddi0100/i)
-- [Binary Ninja API Documentation](https://api.binary.ninja/)
+- ARM Architecture Reference Manual (ARMv5), DDI 0100I
+- Binary Ninja API Documentation

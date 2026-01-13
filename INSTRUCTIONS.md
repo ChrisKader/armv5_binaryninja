@@ -330,8 +330,8 @@ All ARMv5 instructions are now fully supported with complete disassembly and IL 
 
 When adding instruction support:
 
-1. Add disassembly in `armv5_disasm/armv5.c` (ARM) or `thumb_disasm/` (Thumb)
-2. Add IL lifting in `il/il.cpp` (ARM) or `thumb_disasm/il_thumb.cpp` (Thumb)
+1. Add disassembly in `arch_armv5/armv5_disasm/armv5.c` (ARM) or `arch_armv5/thumb_disasm/` (Thumb)
+2. Add IL lifting in `arch_armv5/il/il.cpp` (ARM) or `arch_armv5/thumb_disasm/il_thumb.cpp` (Thumb)
 3. Add tests in `test/` directory
 4. Update this document
 

@@ -46,6 +46,14 @@ set(ARCH_ARMV5_DIR ${CMAKE_SOURCE_DIR}/arch_armv5)
 file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/*.cpp
     ${ARCH_ARMV5_DIR}/*.h
+    ${ARCH_ARMV5_DIR}/arch/*.cpp
+    ${ARCH_ARMV5_DIR}/arch/*.h
+    ${ARCH_ARMV5_DIR}/conventions/*.cpp
+    ${ARCH_ARMV5_DIR}/conventions/*.h
+    ${ARCH_ARMV5_DIR}/recognizers/*.cpp
+    ${ARCH_ARMV5_DIR}/recognizers/*.h
+    ${ARCH_ARMV5_DIR}/platforms/*.cpp
+    ${ARCH_ARMV5_DIR}/platforms/*.h
     ${ARCH_ARMV5_DIR}/firmware/*.cpp
     ${ARCH_ARMV5_DIR}/firmware/*.h
     ${ARCH_ARMV5_DIR}/il/*.cpp
