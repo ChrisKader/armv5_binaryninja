@@ -4,7 +4,139 @@
 
 #include "firmware_settings.h"
 
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
 using namespace BinaryNinja;
+
+static std::vector<std::string> SplitScanList(const char* value)
+{
+	std::vector<std::string> tokens;
+	if (!value)
+		return tokens;
+	std::string current;
+	for (const char* p = value; *p; ++p)
+	{
+		char c = *p;
+		if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+		{
+			if (!current.empty())
+			{
+				tokens.emplace_back(current);
+				current.clear();
+			}
+			continue;
+		}
+		current.push_back(c);
+	}
+	if (!current.empty())
+		tokens.emplace_back(current);
+	return tokens;
+}
+
+static std::string NormalizeToken(std::string token)
+{
+	for (char& ch : token)
+	{
+		if (ch == '-')
+			ch = '_';
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return token;
+}
+
+static void DisableFirmwareScanByToken(FirmwareSettings& settings, const std::string& token)
+{
+	if (token == "all")
+	{
+		settings.skipFirmwareScans = true;
+		settings.enablePrologueScan = false;
+		settings.enableCallTargetScan = false;
+		settings.enablePointerTargetScan = false;
+		settings.enableOrphanCodeScan = false;
+		settings.enableLiteralPoolTyping = false;
+		settings.enableClearAutoDataOnCodeRefs = false;
+		settings.enableInvalidFunctionCleanup = false;
+		return;
+	}
+	if (token == "skip" || token == "skip_scans" || token == "skip_firmware_scans")
+	{
+		settings.skipFirmwareScans = true;
+		return;
+	}
+	if (token == "prologue" || token == "prologues" || token == "prologue_scan" || token == "scan_prologues")
+	{
+		settings.enablePrologueScan = false;
+		return;
+	}
+	if (token == "call" || token == "calls" || token == "call_scan" || token == "scan_call_targets"
+		|| token == "call_targets" || token == "call_target")
+	{
+		settings.enableCallTargetScan = false;
+		return;
+	}
+	if (token == "pointer" || token == "pointers" || token == "pointer_scan" || token == "scan_pointer_targets"
+		|| token == "pointer_targets" || token == "pointer_target")
+	{
+		settings.enablePointerTargetScan = false;
+		return;
+	}
+	if (token == "orphan" || token == "orphans" || token == "orphan_scan" || token == "scan_orphan_code"
+		|| token == "orphan_code")
+	{
+		settings.enableOrphanCodeScan = false;
+		return;
+	}
+	if (token == "literal" || token == "literals" || token == "literal_pools" || token == "literal_pool"
+		|| token == "type_literal_pools")
+	{
+		settings.enableLiteralPoolTyping = false;
+		return;
+	}
+	if (token == "clear_auto" || token == "clear_auto_data" || token == "clear_auto_data_on_code_refs")
+	{
+		settings.enableClearAutoDataOnCodeRefs = false;
+		return;
+	}
+	if (token == "cleanup" || token == "cleanup_invalid" || token == "cleanup_invalid_functions")
+	{
+		settings.enableInvalidFunctionCleanup = false;
+		return;
+	}
+	if (token == "pointer_sweep" || token == "disable_pointer_sweep")
+	{
+		settings.disablePointerSweep = true;
+		return;
+	}
+	if (token == "linear_sweep" || token == "disable_linear_sweep")
+	{
+		settings.disableLinearSweep = true;
+		return;
+	}
+	if (token == "partial_linear_sweep")
+	{
+		settings.enablePartialLinearSweep = false;
+		return;
+	}
+}
+
+static void ApplyFirmwareEnvOverrides(FirmwareSettings& settings)
+{
+	const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
+	if (!disableScans || disableScans[0] == '\0')
+		return;
+
+	auto tokens = SplitScanList(disableScans);
+	for (auto& token : tokens)
+	{
+		auto normalized = NormalizeToken(token);
+		if (!normalized.empty())
+			DisableFirmwareScanByToken(settings, normalized);
+	}
+}
 
 static void NormalizeFirmwareSettings(FirmwareSettings& settings)
 {
@@ -46,6 +178,7 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 	FirmwareSettings result = DefaultFirmwareSettings(mode);
 	if (!settings)
 	{
+		ApplyFirmwareEnvOverrides(result);
 		NormalizeFirmwareSettings(result);
 		return result;
 	}
@@ -107,6 +240,7 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 	if (settings->Contains(FirmwareSettingKeys::kCleanupInvalidRequirePcWrite))
 		result.cleanupRequirePcWriteStart = settings->Get<bool>(FirmwareSettingKeys::kCleanupInvalidRequirePcWrite, view);
 
+	ApplyFirmwareEnvOverrides(result);
 	NormalizeFirmwareSettings(result);
 	return result;
 }

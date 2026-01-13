@@ -147,6 +147,7 @@ The `Armv5FirmwareView` provides automatic analysis for bare-metal binaries:
 - MMIO region identification
 - Jump table detection
 - Literal pool typing
+- Firmware workflow passes now validate target addresses before mutating functions, data, or symbols and log skipped actions in `bnlog.log`. When stability is a concern, disable those passes with `BN_ARMV5_FIRMWARE_DISABLE_SCANS=all` or suppress mutations via `BN_ARMV5_FIRMWARE_DISABLE_ACTIONS=all`.
 
 ## Instruction Coverage and Lifting Status
 

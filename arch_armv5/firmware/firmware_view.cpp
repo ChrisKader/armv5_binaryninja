@@ -9,6 +9,7 @@
 #include "firmware_settings.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -482,6 +483,13 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 		return;
 	}
 
+	const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
+	if (disableScans && disableScans[0] != '\0')
+		m_logger->LogInfo("Firmware workflow env override: BN_ARMV5_FIRMWARE_DISABLE_SCANS=%s", disableScans);
+	const char* disableActions = getenv("BN_ARMV5_FIRMWARE_DISABLE_ACTIONS");
+	if (disableActions && disableActions[0] != '\0')
+		m_logger->LogInfo("Firmware workflow env override: BN_ARMV5_FIRMWARE_DISABLE_ACTIONS=%s", disableActions);
+
 	m_logger->LogInfo("Firmware workflow scan: start");
 
 	uint64_t length = GetLength();
@@ -645,12 +653,16 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view)
 		return;
 	}
 	Armv5FirmwareView* firmwareView = nullptr;
+	Ref<BinaryView> viewRef;
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 		auto& map = FirmwareViewMap();
 		auto it = map.find(view->GetObject());
 		if (it != map.end())
+		{
 			firmwareView = it->second;
+			viewRef = firmwareView;
+		}
 	}
 	if (!firmwareView)
 	{

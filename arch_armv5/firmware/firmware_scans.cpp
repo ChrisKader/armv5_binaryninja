@@ -5,6 +5,8 @@
 #include "firmware_internal.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -14,6 +16,126 @@
 using namespace std;
 using namespace BinaryNinja;
 using namespace armv5;
+
+static bool IsAddressWithinView(const BinaryView* view, uint64_t addr, uint64_t size = 4)
+{
+	if (!view)
+		return false;
+	uint64_t length = view->GetLength();
+	if (length < size)
+		return false;
+	uint64_t start = view->GetStart();
+	if (addr < start)
+		return false;
+	uint64_t offset = addr - start;
+	return offset <= length - size;
+}
+
+static void LogFirmwareActionSkip(Logger* logger, const char* action, uint64_t addr, const char* reason)
+{
+	if (!logger)
+		return;
+	logger->LogDebug("Firmware workflow: skip %s at 0x%llx (%s)",
+		action, (unsigned long long)addr, reason);
+}
+
+static bool EnsureAddressInsideView(const BinaryView* view, Logger* logger,
+	const char* action, uint64_t addr, uint64_t size = 4)
+{
+	if (IsAddressWithinView(view, addr, size))
+		return true;
+	LogFirmwareActionSkip(logger, action, addr, "outside view bounds");
+	return false;
+}
+
+struct FirmwareActionPolicy
+{
+	bool allowAddFunction = true;
+	bool allowDefineData = true;
+	bool allowClearData = true;
+	bool allowDefineSymbol = true;
+	bool allowRemoveFunction = true;
+};
+
+static FirmwareActionPolicy ParseFirmwareActionPolicy()
+{
+	FirmwareActionPolicy policy;
+	const char* env = getenv("BN_ARMV5_FIRMWARE_DISABLE_ACTIONS");
+	if (!env || env[0] == '\0')
+		return policy;
+
+	auto normalize = [](std::string token) {
+		for (char& ch : token)
+		{
+			if (ch == '-')
+				ch = '_';
+			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		}
+		return token;
+	};
+
+	std::string current;
+	auto applyToken = [&](const std::string& raw) {
+		if (raw.empty())
+			return;
+		auto token = normalize(raw);
+		if (token == "all")
+		{
+			policy.allowAddFunction = false;
+			policy.allowDefineData = false;
+			policy.allowClearData = false;
+			policy.allowDefineSymbol = false;
+			policy.allowRemoveFunction = false;
+			return;
+		}
+		if (token == "add_function" || token == "add_functions")
+		{
+			policy.allowAddFunction = false;
+			return;
+		}
+		if (token == "define_data" || token == "define_data_variable" || token == "define_data_variables")
+		{
+			policy.allowDefineData = false;
+			return;
+		}
+		if (token == "clear_data" || token == "undefine_data" || token == "undefine_data_variable"
+			|| token == "undefine_data_variables")
+		{
+			policy.allowClearData = false;
+			return;
+		}
+		if (token == "define_symbol" || token == "define_symbols")
+		{
+			policy.allowDefineSymbol = false;
+			return;
+		}
+		if (token == "remove_function" || token == "remove_functions")
+		{
+			policy.allowRemoveFunction = false;
+			return;
+		}
+	};
+
+	for (const char* p = env; *p; ++p)
+	{
+		char c = *p;
+		if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+		{
+			applyToken(current);
+			current.clear();
+			continue;
+		}
+		current.push_back(c);
+	}
+	applyToken(current);
+	return policy;
+}
+
+static const FirmwareActionPolicy& GetFirmwareActionPolicy()
+{
+	static FirmwareActionPolicy policy = ParseFirmwareActionPolicy();
+	return policy;
+}
 
 static bool HasExplicitCodeSemantics(BinaryView* view)
 {
@@ -452,6 +574,8 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	size_t skippedNonCode = 0;
 	size_t skippedInvalidCandidate = 0;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
+		Logger* log = logger ? logger.GetPtr() : nullptr;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 
 	// Minimum offset to start scanning (skip vector table area)
@@ -478,7 +602,8 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 				skippedInvalidCandidate++;
 				return;
 			}
-			if (view->AddFunctionForAnalysis(plat, funcAddr, true))
+			if (EnsureAddressInsideView(view, log, "AddFunction", funcAddr) &&
+				actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, funcAddr, true))
 			{
 				if (seededFunctions)
 					seededFunctions->insert(funcAddr);
@@ -789,9 +914,11 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	size_t skipDuplicate = 0;
 	size_t skipInvalidCandidate = 0;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
+		Logger* log = logger ? logger.GetPtr() : nullptr;
 
 	// Helper to add a function if not already added and target is valid
 	auto addFunction = [&](uint64_t funcAddr, const char* source, bool requireBoundary) {
@@ -899,7 +1026,8 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 
 		if (addedAddrs.find(alignedAddr) == addedAddrs.end())
 		{
-			if (view->AddFunctionForAnalysis(plat, alignedAddr, true))
+			if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
+				actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
 			{
 				if (seededFunctions)
 					seededFunctions->insert(alignedAddr);
@@ -1157,10 +1285,12 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	size_t rawSkipInvalidTarget = 0;
 	size_t rawSkipJumpTableRefs = 0;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	uint64_t imageEnd = imageBase + length;
 	uint8_t minHigh = (uint8_t)(imageBase >> 24);
 	uint8_t maxHigh = (uint8_t)((imageEnd - 1) >> 24);
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
+		Logger* log = logger ? logger.GetPtr() : nullptr;
 
 	auto addFunction = [&](uint64_t funcAddr) {
 		uint64_t alignedAddr = funcAddr & ~3ULL;
@@ -1204,7 +1334,8 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 		}
 		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
 			return;
-		if (view->AddFunctionForAnalysis(plat, alignedAddr, true))
+		if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
+			actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
 		{
 			if (seededFunctions)
 				seededFunctions->insert(alignedAddr);
@@ -1402,7 +1533,11 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 			{
 				Ref<Type> ptrType = Type::PointerType(view->GetDefaultArchitecture(), Type::VoidType());
 				Ref<Type> tableType = Type::ArrayType(ptrType, count);
-				view->DefineDataVariable(tableAddr, tableType);
+				if (actionPolicy.allowDefineData &&
+					EnsureAddressInsideView(view, log, "DefineDataVariable", tableAddr))
+				{
+					view->DefineDataVariable(tableAddr, tableType);
+				}
 			}
 
 			for (uint32_t i = 0; i < count; i++)
@@ -1544,10 +1679,12 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 	size_t skipPaddingRun = 0;
 	size_t skipNoPrologue = 0;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	std::set<uint64_t> addedAddrs;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 	uint64_t lastAddedAddr = 0;
 	std::unordered_map<uint64_t, uint32_t> pageCounts;
+		Logger* log = logger ? logger.GetPtr() : nullptr;
 
 	auto isStrongPrologue = [&](uint32_t instr) -> bool {
 		uint32_t cond = (instr >> 28) & 0xF;
@@ -1605,7 +1742,8 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 		}
 		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
 			return;
-		if (view->AddFunctionForAnalysis(plat, alignedAddr, true))
+		if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
+			actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
 		{
 			if (seededFunctions)
 				seededFunctions->insert(alignedAddr);
@@ -1755,6 +1893,7 @@ size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t d
 	size_t skipValid = 0;
 	size_t skipNoData = 0;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	FirmwareScanTuning cleanupTuning = tuning;
 	cleanupTuning.minValidInstr = 1;
 	cleanupTuning.minBodyInstr = 0;
@@ -1839,8 +1978,11 @@ size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t d
 
 	for (const auto& func : toRemove)
 	{
-		view->RemoveAnalysisFunction(func, true);
-		removed++;
+		if (actionPolicy.allowRemoveFunction)
+		{
+			view->RemoveAnalysisFunction(func, true);
+			removed++;
+		}
 	}
 
 	logger->LogInfo("Cleanup invalid functions: removed=%zu candidates=%zu scanned=%zu",
@@ -1889,6 +2031,9 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 {
 	ctx.logger->LogDebug("Typing literal pool entries...");
 
+		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	Ref<Type> ptrType = Type::PointerType(ctx.arch, Type::VoidType());
 	Ref<Type> u32Type = Type::IntegerType(4, false);
 	uint32_t entriesTyped = 0;
@@ -1956,8 +2101,12 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 					((value & 3) == 0 && value >= ctx.imageBase && value < ctx.ImageEnd()))
 					entryType = ptrType;
 
-				ctx.view->DefineDataVariable(literalAddr, entryType);
-				entriesTyped++;
+				if (actionPolicy.allowDefineData &&
+					EnsureAddressInsideView(ctx.view, log, "DefineDataVariable", literalAddr))
+				{
+					ctx.view->DefineDataVariable(literalAddr, entryType);
+					entriesTyped++;
+				}
 			}
 		}
 	}
@@ -1981,6 +2130,8 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 	uint32_t decodeFailed = 0;
 	ctx.logger->LogDebug("Clearing auto data at code-referenced addresses...");
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
+		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	auto dataVars = ctx.view->GetDataVariables();
 	for (const auto& entry : dataVars)
 	{
@@ -2027,8 +2178,12 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 			continue;
 		}
 
-		ctx.view->UndefineDataVariable(addr, false);
-		cleared++;
+		if (actionPolicy.allowClearData &&
+			EnsureAddressInsideView(ctx.view, log, "UndefineDataVariable", addr))
+		{
+			ctx.view->UndefineDataVariable(addr, false);
+			cleared++;
+		}
 	}
 
 	ctx.logger->LogInfo("Cleared %u auto data variables at code-referenced addresses", cleared);
@@ -2048,6 +2203,8 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 	uint32_t decodeFailed = 0;
 	const size_t maxInstrs = 16;
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
+		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	std::vector<uint64_t> targets;
 	if (seededFunctions && !seededFunctions->empty())
 	{
@@ -2107,8 +2264,12 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 			if (ctx.view->GetDataVariableAtAddress(addr, dataVar) &&
 				dataVar.address == addr && dataVar.autoDiscovered)
 			{
-				ctx.view->UndefineDataVariable(addr, false);
-				cleared++;
+		if (actionPolicy.allowClearData &&
+			EnsureAddressInsideView(ctx.view, log, "UndefineDataVariable", addr))
+		{
+			ctx.view->UndefineDataVariable(addr, false);
+			cleared++;
+		}
 			}
 
 			if ((instr0.operation == armv5::ARMV5_B) &&
@@ -2137,7 +2298,9 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 {
 	ctx.logger->LogDebug("Scanning for jump tables...");
 
+	const auto& actionPolicy = GetFirmwareActionPolicy();
 	Ref<Type> uint32Type = Type::IntegerType(4, false);
+		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
@@ -2197,12 +2360,20 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 				if (validEntries > 0)
 				{
 					Ref<Type> arrayType = Type::ArrayType(uint32Type, validEntries);
+				if (actionPolicy.allowDefineData &&
+					EnsureAddressInsideView(ctx.view, log, "DefineUserDataVariable", tableBase))
+				{
 					ctx.view->DefineUserDataVariable(tableBase, arrayType);
+				}
 
-					char symName[32];
-					snprintf(symName, sizeof(symName), "switch_table_%llx",
-						(unsigned long long)tableBase);
+				char symName[32];
+				snprintf(symName, sizeof(symName), "switch_table_%llx",
+					(unsigned long long)tableBase);
+				if (actionPolicy.allowDefineSymbol &&
+					EnsureAddressInsideView(ctx.view, log, "DefineAutoSymbol", tableBase))
+				{
 					ctx.view->DefineAutoSymbol(new Symbol(DataSymbol, symName, tableBase, LocalBinding));
+				}
 
 					ctx.logger->LogDebug("Defined switch table at 0x%llx with %u entries",
 						(unsigned long long)tableBase, validEntries);
@@ -2211,5 +2382,3 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 		}
 	}
 }
-
-

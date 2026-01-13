@@ -2,6 +2,7 @@
  * ARMv5 Architecture Plugin Registration
  */
 
+#include <cctype>
 #include <cstdlib>
 #include <exception>
 #include <string>
@@ -18,6 +19,41 @@
 using namespace BinaryNinja;
 using namespace std;
 
+static bool FirmwareWorkflowDisabledByEnv()
+{
+  const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
+  if (!disableScans || disableScans[0] == '\0')
+    return false;
+  string token;
+  auto checkToken = [&](const string& raw) -> bool {
+    if (raw.empty())
+      return false;
+    string normalized;
+    normalized.reserve(raw.size());
+    for (char ch : raw)
+    {
+      if (ch == '-')
+        ch = '_';
+      normalized.push_back(static_cast<char>(tolower(static_cast<unsigned char>(ch))));
+    }
+    return (normalized == "all" || normalized == "skip" || normalized == "skip_scans"
+      || normalized == "skip_firmware_scans");
+  };
+  for (const char* p = disableScans; *p; ++p)
+  {
+    char c = *p;
+    if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+    {
+      if (checkToken(token))
+        return true;
+      token.clear();
+      continue;
+    }
+    token.push_back(c);
+  }
+  return checkToken(token);
+}
+
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
 {
   if (!analysisContext)
@@ -33,6 +69,8 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
   {
     try
     {
+      if (FirmwareWorkflowDisabledByEnv())
+        return;
       RunArmv5FirmwareWorkflowScans(view);
     }
     catch (std::exception& e)
@@ -102,6 +140,7 @@ extern "C"
           "predicates": [
             {
               "type": "viewType",
+              "operator": "in",
               "value": ["ARMv5 Firmware"]
             }
           ]
@@ -110,7 +149,7 @@ extern "C"
           "downstream": ["core.module.update"]
         }
       })~", &RunArmv5FirmwareWorkflow);
-      firmwareWorkflow->Insert("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
+      firmwareWorkflow->InsertAfter("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
       Workflow::RegisterWorkflow(firmwareWorkflow);
     }
     else
