@@ -46,6 +46,12 @@ set(ARCH_ARMV5_DIR ${CMAKE_SOURCE_DIR}/arch_armv5)
 file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/*.cpp
     ${ARCH_ARMV5_DIR}/*.h
+    ${ARCH_ARMV5_DIR}/firmware/*.cpp
+    ${ARCH_ARMV5_DIR}/firmware/*.h
+    ${ARCH_ARMV5_DIR}/il/*.cpp
+    ${ARCH_ARMV5_DIR}/il/*.h
+    ${ARCH_ARMV5_DIR}/relocations/*.cpp
+    ${ARCH_ARMV5_DIR}/relocations/*.h
     ${ARCH_ARMV5_DIR}/armv5_disasm/armv5.c
     ${ARCH_ARMV5_DIR}/armv5_disasm/armv5.h
     ${ARCH_ARMV5_DIR}/thumb_disasm/*.cpp

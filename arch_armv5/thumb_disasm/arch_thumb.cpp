@@ -10,7 +10,7 @@
 #include "arch_armv5.h"
 #include "spec.h"
 #include "disassembler.h"
-#include "il.h"
+#include "il/il.h"
 
 using namespace BinaryNinja;
 using namespace armv5;

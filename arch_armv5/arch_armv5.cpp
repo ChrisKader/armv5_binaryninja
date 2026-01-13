@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <queue>
@@ -20,8 +21,9 @@
 #include "binaryninjaapi.h"
 #include "lowlevelilinstruction.h"
 #include "arch_armv5.h"
-#include "il.h"
-#include "armv5_firmware.h"
+#include "relocations/relocations.h"
+#include "il/il.h"
+#include "firmware/firmware_view.h"
 
 using namespace BinaryNinja;
 using namespace armv5;
@@ -69,12 +71,14 @@ static bool IsRelatedCondition(Condition orig, Condition candidate)
 
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
 {
+  if (!analysisContext)
+    return;
   auto view = analysisContext->GetBinaryView();
+  if (!view)
+    return;
   auto platform = view->GetDefaultPlatform();
   if (!platform)
-  return;
-  if (!analysisContext)
-  return;
+    return;
   auto platformName = platform->GetName();
   if (platformName.find("armv5") != std::string::npos)
   {
@@ -128,453 +132,6 @@ static bool CanCoalesceAfterInstruction(Instruction &instr)
   default:
     return true;
   }
-}
-
-// We ned MachoArmRelocationType, PeArmRelocationType, PeRelocationType
-
-enum ElfArmRelocationType : uint32_t
-{
-  R_ARM_NONE = 0,
-  R_ARM_PC24 = 1,
-  R_ARM_ABS32 = 2,
-  R_ARM_REL32 = 3,
-  R_ARM_LDR_PC_G0 = 4,
-  R_ARM_ABS16 = 5,
-  R_ARM_ABS12 = 6,
-  R_ARM_THM_ABS5 = 7,
-  R_ARM_ABS8 = 8,
-  R_ARM_SBREL32 = 9,
-  R_ARM_THM_CALL = 10,
-  R_ARM_THM_PC8 = 11,
-  R_ARM_BREL_ADJ = 12,
-  R_ARM_TLS_DESC = 13,
-  R_ARM_THM_SWI8 = 14,
-  R_ARM_XPC25 = 15,
-  R_ARM_THM_XPC22 = 16,
-  R_ARM_TLS_DTPMOD32 = 17,
-  R_ARM_TLS_DTPOFF32 = 18,
-  R_ARM_TLS_TPOFF32 = 19,
-  R_ARM_COPY = 20,
-  R_ARM_GLOB_DAT = 21,
-  R_ARM_JUMP_SLOT = 22,
-  R_ARM_RELATIVE = 23,
-  R_ARM_GOTOFF32 = 24,
-  R_ARM_BASE_PREL = 25,
-  R_ARM_GOT_BREL = 26,
-  R_ARM_PLT32 = 27,
-  R_ARM_CALL = 28,
-  R_ARM_JUMP24 = 29,
-  R_ARM_THM_JUMP24 = 30,
-  R_ARM_BASE_ABS = 31,
-  R_ARM_ALU_PCREL_7_0 = 32,
-  R_ARM_ALU_PCREL_15_8 = 33,
-  R_ARM_ALU_PCREL_23_15 = 34,
-  R_ARM_LDR_SBREL_11_0_NC = 35,
-  R_ARM_ALU_SBREL_19_12_NC = 36,
-  R_ARM_ALU_SBREL_27_20_CK = 37,
-  R_ARM_TARGET1 = 38,
-  R_ARM_SBREL31 = 39,
-  R_ARM_V4BX = 40,
-  R_ARM_TARGET2 = 41,
-  R_ARM_PREL31 = 42,
-  R_ARM_MOVW_ABS_NC = 43,
-  R_ARM_MOVT_ABS = 44,
-  R_ARM_MOVW_PREL_NC = 45,
-  R_ARM_MOVT_PREL = 46,
-  R_ARM_THM_MOVW_ABS_NC = 47,
-  R_ARM_THM_MOVT_ABS = 48,
-  R_ARM_THM_MOVW_PREL_NC = 49,
-  R_ARM_THM_MOVT_PREL = 50,
-  R_ARM_THM_JUMP19 = 51,
-  R_ARM_THM_JUMP6 = 52,
-  R_ARM_THM_ALU_PREL_11_0 = 53,
-  R_ARM_THM_PC12 = 54,
-  R_ARM_ABS32_NOI = 55,
-  R_ARM_REL32_NOI = 56,
-  R_ARM_ALU_PC_G0_NC = 57,
-  R_ARM_ALU_PC_G0 = 58,
-  R_ARM_ALU_PC_G1_NC = 59,
-  R_ARM_ALU_PC_G1 = 60,
-  R_ARM_ALU_PC_G2 = 61,
-  R_ARM_LDR_PC_G1 = 62,
-  R_ARM_LDR_PC_G2 = 63,
-  R_ARM_LDRS_PC_G0 = 64,
-  R_ARM_LDRS_PC_G1 = 65,
-  R_ARM_LDRS_PC_G2 = 66,
-  R_ARM_LDC_PC_G0 = 67,
-  R_ARM_LDC_PC_G1 = 68,
-  R_ARM_LDC_PC_G2 = 69,
-  R_ARM_ALU_SB_G0_NC = 70,
-  R_ARM_ALU_SB_G0 = 71,
-  R_ARM_ALU_SB_G1_NC = 72,
-  R_ARM_ALU_SB_G1 = 73,
-  R_ARM_ALU_SB_G2 = 74,
-  R_ARM_LDR_SB_G0 = 75,
-  R_ARM_LDR_SB_G1 = 76,
-  R_ARM_LDR_SB_G2 = 77,
-  R_ARM_LDRS_SB_G0 = 78,
-  R_ARM_LDRS_SB_G1 = 79,
-  R_ARM_LDRS_SB_G2 = 80,
-  R_ARM_LDC_SB_G0 = 81,
-  R_ARM_LDC_SB_G1 = 82,
-  R_ARM_LDC_SB_G2 = 83,
-  R_ARM_MOVW_BREL_NC = 84,
-  R_ARM_MOVT_BREL = 85,
-  R_ARM_MOVW_BREL = 86,
-  R_ARM_THM_MOVW_BREL_NC = 87,
-  R_ARM_THM_MOVT_BREL = 88,
-  R_ARM_THM_MOVW_BREL = 89,
-  R_ARM_TLS_GOTDESC = 90,
-  R_ARM_TLS_CALL = 91,
-  R_ARM_TLS_DESCSEQ = 92,
-  R_ARM_THM_TLS_CALL = 93,
-  R_ARM_PLT32_ABS = 94,
-  R_ARM_GOT_ABS = 95,
-  R_ARM_GOT_PREL = 96,
-  R_ARM_GOT_BREL12 = 97,
-  R_ARM_GOTOFF12 = 98,
-  R_ARM_GOTRELAX = 99,
-  R_ARM_GNU_VTENTRY = 100,
-  R_ARM_GNU_VTINHERIT = 101,
-  R_ARM_THM_JUMP11 = 102,
-  R_ARM_THM_JUMP8 = 103,
-  R_ARM_TLS_GD32 = 104,
-  R_ARM_TLS_LDM32 = 105,
-  R_ARM_TLS_LDO32 = 106,
-  R_ARM_TLS_IE32 = 107,
-  R_ARM_TLS_LE32 = 108,
-  R_ARM_TLS_LDO12 = 109,
-  R_ARM_TLS_LE12 = 110,
-  R_ARM_TLS_IE12GP = 111,
-  R_ARM_PRIVATE_0 = 112,
-  R_ARM_PRIVATE_1 = 113,
-  R_ARM_PRIVATE_2 = 114,
-  R_ARM_PRIVATE_3 = 115,
-  R_ARM_PRIVATE_4 = 116,
-  R_ARM_PRIVATE_5 = 117,
-  R_ARM_PRIVATE_6 = 118,
-  R_ARM_PRIVATE_7 = 119,
-  R_ARM_PRIVATE_8 = 120,
-  R_ARM_PRIVATE_9 = 121,
-  R_ARM_PRIVATE_10 = 122,
-  R_ARM_PRIVATE_11 = 123,
-  R_ARM_PRIVATE_12 = 124,
-  R_ARM_PRIVATE_13 = 125,
-  R_ARM_PRIVATE_14 = 126,
-  R_ARM_PRIVATE_15 = 127,
-  R_ARM_ME_TOO = 128,
-  R_ARM_THM_TLS_DESCSEQ16 = 129,
-  R_ARM_THM_TLS_DESCSEQ32 = 130,
-  R_ARM_THM_GOT_BREL12 = 131,
-  R_ARM_THM_ALU_ABS_G0_NC = 132,
-  R_ARM_THM_ALU_ABS_G1_NC = 133,
-  R_ARM_THM_ALU_ABS_G2_NC = 134,
-  R_ARM_THM_ALU_ABS_G3 = 135,
-  R_ARM_IRELATIVE = 160,
-  R_ARM_RXPC25 = 249,
-  R_ARM_RSBREL32 = 250,
-  R_ARM_THM_RPC22 = 251,
-  R_ARM_RREL32 = 252,
-  R_ARM_RABS32 = 253,
-  R_ARM_RPC24 = 254,
-  R_ARM_RBASE = 255
-};
-
-static const char *GetRelocationString(ElfArmRelocationType rel)
-{
-  static map<ElfArmRelocationType, const char *> relocTable =
-      {
-          {R_ARM_NONE, "R_ARM_NONE"},
-          {R_ARM_PC24, "R_ARM_PC24"},
-          {R_ARM_ABS32, "R_ARM_ABS32"},
-          {R_ARM_REL32, "R_ARM_REL32"},
-          {R_ARM_LDR_PC_G0, "R_ARM_LDR_PC_G0"},
-          {R_ARM_ABS16, "R_ARM_ABS16"},
-          {R_ARM_ABS12, "R_ARM_ABS12"},
-          {R_ARM_THM_ABS5, "R_ARM_THM_ABS5"},
-          {R_ARM_ABS8, "R_ARM_ABS8"},
-          {R_ARM_SBREL32, "R_ARM_SBREL32"},
-          {R_ARM_THM_CALL, "R_ARM_THM_CALL"},
-          {R_ARM_THM_PC8, "R_ARM_THM_PC8"},
-          {R_ARM_BREL_ADJ, "R_ARM_BREL_ADJ"},
-          {R_ARM_TLS_DESC, "R_ARM_TLS_DESC"},
-          {R_ARM_THM_SWI8, "R_ARM_THM_SWI8"},
-          {R_ARM_XPC25, "R_ARM_XPC25"},
-          {R_ARM_THM_XPC22, "R_ARM_THM_XPC22"},
-          {R_ARM_TLS_DTPMOD32, "R_ARM_TLS_DTPMOD32"},
-          {R_ARM_TLS_DTPOFF32, "R_ARM_TLS_DTPOFF32"},
-          {R_ARM_TLS_TPOFF32, "R_ARM_TLS_TPOFF32"},
-          {R_ARM_COPY, "R_ARM_COPY"},
-          {R_ARM_GLOB_DAT, "R_ARM_GLOB_DAT"},
-          {R_ARM_JUMP_SLOT, "R_ARM_JUMP_SLOT"},
-          {R_ARM_RELATIVE, "R_ARM_RELATIVE"},
-          {R_ARM_GOTOFF32, "R_ARM_GOTOFF32"},
-          {R_ARM_BASE_PREL, "R_ARM_BASE_PREL"},
-          {R_ARM_GOT_BREL, "R_ARM_GOT_BREL"},
-          {R_ARM_PLT32, "R_ARM_PLT32"},
-          {R_ARM_CALL, "R_ARM_CALL"},
-          {R_ARM_JUMP24, "R_ARM_JUMP24"},
-          {R_ARM_THM_JUMP24, "R_ARM_THM_JUMP24"},
-          {R_ARM_BASE_ABS, "R_ARM_BASE_ABS"},
-          {R_ARM_ALU_PCREL_7_0, "R_ARM_ALU_PCREL_7_0"},
-          {R_ARM_ALU_PCREL_15_8, "R_ARM_ALU_PCREL_15_8"},
-          {R_ARM_ALU_PCREL_23_15, "R_ARM_ALU_PCREL_23_15"},
-          {R_ARM_LDR_SBREL_11_0_NC, "R_ARM_LDR_SBREL_11_0_NC"},
-          {R_ARM_ALU_SBREL_19_12_NC, "R_ARM_ALU_SBREL_19_12_NC"},
-          {R_ARM_ALU_SBREL_27_20_CK, "R_ARM_ALU_SBREL_27_20_CK"},
-          {R_ARM_TARGET1, "R_ARM_TARGET1"},
-          {R_ARM_SBREL31, "R_ARM_SBREL31"},
-          {R_ARM_V4BX, "R_ARM_V4BX"},
-          {R_ARM_TARGET2, "R_ARM_TARGET2"},
-          {R_ARM_PREL31, "R_ARM_PREL31"},
-          {R_ARM_MOVW_ABS_NC, "R_ARM_MOVW_ABS_NC"},
-          {R_ARM_MOVT_ABS, "R_ARM_MOVT_ABS"},
-          {R_ARM_MOVW_PREL_NC, "R_ARM_MOVW_PREL_NC"},
-          {R_ARM_MOVT_PREL, "R_ARM_MOVT_PREL"},
-          {R_ARM_THM_MOVW_ABS_NC, "R_ARM_THM_MOVW_ABS_NC"},
-          {R_ARM_THM_MOVT_ABS, "R_ARM_THM_MOVT_ABS"},
-          {R_ARM_THM_MOVW_PREL_NC, "R_ARM_THM_MOVW_PREL_NC"},
-          {R_ARM_THM_MOVT_PREL, "R_ARM_THM_MOVT_PREL"},
-          {R_ARM_THM_JUMP19, "R_ARM_THM_JUMP19"},
-          {R_ARM_THM_JUMP6, "R_ARM_THM_JUMP6"},
-          {R_ARM_THM_ALU_PREL_11_0, "R_ARM_THM_ALU_PREL_11_0"},
-          {R_ARM_THM_PC12, "R_ARM_THM_PC12"},
-          {R_ARM_ABS32_NOI, "R_ARM_ABS32_NOI"},
-          {R_ARM_REL32_NOI, "R_ARM_REL32_NOI"},
-          {R_ARM_ALU_PC_G0_NC, "R_ARM_ALU_PC_G0_NC"},
-          {R_ARM_ALU_PC_G0, "R_ARM_ALU_PC_G0"},
-          {R_ARM_ALU_PC_G1_NC, "R_ARM_ALU_PC_G1_NC"},
-          {R_ARM_ALU_PC_G1, "R_ARM_ALU_PC_G1"},
-          {R_ARM_ALU_PC_G2, "R_ARM_ALU_PC_G2"},
-          {R_ARM_LDR_PC_G1, "R_ARM_LDR_PC_G1"},
-          {R_ARM_LDR_PC_G2, "R_ARM_LDR_PC_G2"},
-          {R_ARM_LDRS_PC_G0, "R_ARM_LDRS_PC_G0"},
-          {R_ARM_LDRS_PC_G1, "R_ARM_LDRS_PC_G1"},
-          {R_ARM_LDRS_PC_G2, "R_ARM_LDRS_PC_G2"},
-          {R_ARM_LDC_PC_G0, "R_ARM_LDC_PC_G0"},
-          {R_ARM_LDC_PC_G1, "R_ARM_LDC_PC_G1"},
-          {R_ARM_LDC_PC_G2, "R_ARM_LDC_PC_G2"},
-          {R_ARM_ALU_SB_G0_NC, "R_ARM_ALU_SB_G0_NC"},
-          {R_ARM_ALU_SB_G0, "R_ARM_ALU_SB_G0"},
-          {R_ARM_ALU_SB_G1_NC, "R_ARM_ALU_SB_G1_NC"},
-          {R_ARM_ALU_SB_G1, "R_ARM_ALU_SB_G1"},
-          {R_ARM_ALU_SB_G2, "R_ARM_ALU_SB_G2"},
-          {R_ARM_LDR_SB_G0, "R_ARM_LDR_SB_G0"},
-          {R_ARM_LDR_SB_G1, "R_ARM_LDR_SB_G1"},
-          {R_ARM_LDR_SB_G2, "R_ARM_LDR_SB_G2"},
-          {R_ARM_LDRS_SB_G0, "R_ARM_LDRS_SB_G0"},
-          {R_ARM_LDRS_SB_G1, "R_ARM_LDRS_SB_G1"},
-          {R_ARM_LDRS_SB_G2, "R_ARM_LDRS_SB_G2"},
-          {R_ARM_LDC_SB_G0, "R_ARM_LDC_SB_G0"},
-          {R_ARM_LDC_SB_G1, "R_ARM_LDC_SB_G1"},
-          {R_ARM_LDC_SB_G2, "R_ARM_LDC_SB_G2"},
-          {R_ARM_MOVW_BREL_NC, "R_ARM_MOVW_BREL_NC"},
-          {R_ARM_MOVT_BREL, "R_ARM_MOVT_BREL"},
-          {R_ARM_MOVW_BREL, "R_ARM_MOVW_BREL"},
-          {R_ARM_THM_MOVW_BREL_NC, "R_ARM_THM_MOVW_BREL_NC"},
-          {R_ARM_THM_MOVT_BREL, "R_ARM_THM_MOVT_BREL"},
-          {R_ARM_THM_MOVW_BREL, "R_ARM_THM_MOVW_BREL"},
-          {R_ARM_TLS_GOTDESC, "R_ARM_TLS_GOTDESC"},
-          {R_ARM_TLS_CALL, "R_ARM_TLS_CALL"},
-          {R_ARM_TLS_DESCSEQ, "R_ARM_TLS_DESCSEQ"},
-          {R_ARM_THM_TLS_CALL, "R_ARM_THM_TLS_CALL"},
-          {R_ARM_PLT32_ABS, "R_ARM_PLT32_ABS"},
-          {R_ARM_GOT_ABS, "R_ARM_GOT_ABS"},
-          {R_ARM_GOT_PREL, "R_ARM_GOT_PREL"},
-          {R_ARM_GOT_BREL12, "R_ARM_GOT_BREL12"},
-          {R_ARM_GOTOFF12, "R_ARM_GOTOFF12"},
-          {R_ARM_GOTRELAX, "R_ARM_GOTRELAX"},
-          {R_ARM_GNU_VTENTRY, "R_ARM_GNU_VTENTRY"},
-          {R_ARM_GNU_VTINHERIT, "R_ARM_GNU_VTINHERIT"},
-          {R_ARM_THM_JUMP11, "R_ARM_THM_JUMP11"},
-          {R_ARM_THM_JUMP8, "R_ARM_THM_JUMP8"},
-          {R_ARM_TLS_GD32, "R_ARM_TLS_GD32"},
-          {R_ARM_TLS_LDM32, "R_ARM_TLS_LDM32"},
-          {R_ARM_TLS_LDO32, "R_ARM_TLS_LDO32"},
-          {R_ARM_TLS_IE32, "R_ARM_TLS_IE32"},
-          {R_ARM_TLS_LE32, "R_ARM_TLS_LE32"},
-          {R_ARM_TLS_LDO12, "R_ARM_TLS_LDO12"},
-          {R_ARM_TLS_LE12, "R_ARM_TLS_LE12"},
-          {R_ARM_TLS_IE12GP, "R_ARM_TLS_IE12GP"},
-          {R_ARM_PRIVATE_0, "R_ARM_PRIVATE_0"},
-          {R_ARM_PRIVATE_1, "R_ARM_PRIVATE_1"},
-          {R_ARM_PRIVATE_2, "R_ARM_PRIVATE_2"},
-          {R_ARM_PRIVATE_3, "R_ARM_PRIVATE_3"},
-          {R_ARM_PRIVATE_4, "R_ARM_PRIVATE_4"},
-          {R_ARM_PRIVATE_5, "R_ARM_PRIVATE_5"},
-          {R_ARM_PRIVATE_6, "R_ARM_PRIVATE_6"},
-          {R_ARM_PRIVATE_7, "R_ARM_PRIVATE_7"},
-          {R_ARM_PRIVATE_8, "R_ARM_PRIVATE_8"},
-          {R_ARM_PRIVATE_9, "R_ARM_PRIVATE_9"},
-          {R_ARM_PRIVATE_10, "R_ARM_PRIVATE_10"},
-          {R_ARM_PRIVATE_11, "R_ARM_PRIVATE_11"},
-          {R_ARM_PRIVATE_12, "R_ARM_PRIVATE_12"},
-          {R_ARM_PRIVATE_13, "R_ARM_PRIVATE_13"},
-          {R_ARM_PRIVATE_14, "R_ARM_PRIVATE_14"},
-          {R_ARM_PRIVATE_15, "R_ARM_PRIVATE_15"},
-          {R_ARM_ME_TOO, "R_ARM_ME_TOO"},
-          {R_ARM_THM_TLS_DESCSEQ16, "R_ARM_THM_TLS_DESCSEQ16"},
-          {R_ARM_THM_TLS_DESCSEQ32, "R_ARM_THM_TLS_DESCSEQ32"},
-          {R_ARM_THM_GOT_BREL12, "R_ARM_THM_GOT_BREL12"},
-          {R_ARM_THM_ALU_ABS_G0_NC, "R_ARM_THM_ALU_ABS_G0_NC"},
-          {R_ARM_THM_ALU_ABS_G1_NC, "R_ARM_THM_ALU_ABS_G1_NC"},
-          {R_ARM_THM_ALU_ABS_G2_NC, "R_ARM_THM_ALU_ABS_G2_NC"},
-          {R_ARM_THM_ALU_ABS_G3, "R_ARM_THM_ALU_ABS_G3"},
-          {R_ARM_IRELATIVE, "R_ARM_IRELATIVE"},
-          {R_ARM_RXPC25, "R_ARM_RXPC25"},
-          {R_ARM_RSBREL32, "R_ARM_RSBREL32"},
-          {R_ARM_THM_RPC22, "R_ARM_THM_RPC22"},
-          {R_ARM_RREL32, "R_ARM_RREL32"},
-          {R_ARM_RABS32, "R_ARM_RABS32"},
-          {R_ARM_RPC24, "R_ARM_RPC24"},
-          {R_ARM_RBASE, "R_ARM_RBASE"}};
-  auto it = relocTable.find(rel);
-  if (it != relocTable.end())
-    return it->second;
-  return "Unknown ARM relocation";
-}
-
-// GetRelocationString for MachoArmRelocationType, PeArmRelocationType, PeRelocationType
-
-/*
- * ARMv5 Calling Convention (AAPCS-like)
- * Standard ARM calling convention used by most ARM compilers.
- */
-static bool IsELFDataRelocation(ElfArmRelocationType reloc)
-{
-  static map<ElfArmRelocationType, bool> isDataMap =
-      {
-          {R_ARM_NONE, false},
-          {R_ARM_PC24, false},
-          {R_ARM_ABS32, true},
-          {R_ARM_REL32, true},
-          {R_ARM_LDR_PC_G0, false},
-          {R_ARM_ABS16, true},
-          {R_ARM_ABS12, false},
-          {R_ARM_THM_ABS5, false},
-          {R_ARM_ABS8, true},
-          {R_ARM_SBREL32, true},
-          {R_ARM_THM_CALL, false},
-          {R_ARM_THM_PC8, false},
-          {R_ARM_BREL_ADJ, true},
-          {R_ARM_TLS_DESC, true},
-          {R_ARM_THM_SWI8, false},
-          {R_ARM_XPC25, false},
-          {R_ARM_THM_XPC22, false},
-          {R_ARM_TLS_DTPMOD32, true},
-          {R_ARM_TLS_DTPOFF32, true},
-          {R_ARM_TLS_TPOFF32, true},
-          {R_ARM_COPY, true},
-          {R_ARM_GLOB_DAT, true},
-          {R_ARM_JUMP_SLOT, true},
-          {R_ARM_RELATIVE, true},
-          {R_ARM_GOTOFF32, true},
-          {R_ARM_BASE_PREL, true},
-          {R_ARM_GOT_BREL, true},
-          {R_ARM_PLT32, false},
-          {R_ARM_CALL, false},
-          {R_ARM_JUMP24, false},
-          {R_ARM_THM_JUMP24, false},
-          {R_ARM_BASE_ABS, true},
-          {R_ARM_ALU_PCREL_7_0, false},
-          {R_ARM_ALU_PCREL_15_8, false},
-          {R_ARM_ALU_PCREL_23_15, false},
-          {R_ARM_LDR_SBREL_11_0_NC, false},
-          {R_ARM_ALU_SBREL_19_12_NC, false},
-          {R_ARM_ALU_SBREL_27_20_CK, false},
-          {R_ARM_TARGET1, false},
-          {R_ARM_SBREL31, true},
-          {R_ARM_V4BX, false},
-          {R_ARM_TARGET2, false},
-          {R_ARM_PREL31, true},
-          {R_ARM_MOVW_ABS_NC, false},
-          {R_ARM_MOVT_ABS, false},
-          {R_ARM_MOVW_PREL_NC, false},
-          {R_ARM_MOVT_PREL, false},
-          {R_ARM_THM_MOVW_ABS_NC, false},
-          {R_ARM_THM_MOVT_ABS, false},
-          {R_ARM_THM_MOVW_PREL_NC, false},
-          {R_ARM_THM_MOVT_PREL, false},
-          {R_ARM_THM_JUMP19, false},
-          {R_ARM_THM_JUMP6, false},
-          {R_ARM_THM_ALU_PREL_11_0, false},
-          {R_ARM_THM_PC12, false},
-          {R_ARM_ABS32_NOI, true},
-          {R_ARM_REL32_NOI, true},
-          {R_ARM_ALU_PC_G0_NC, false},
-          {R_ARM_ALU_PC_G0, false},
-          {R_ARM_ALU_PC_G1_NC, false},
-          {R_ARM_ALU_PC_G1, false},
-          {R_ARM_ALU_PC_G2, false},
-          {R_ARM_LDR_PC_G1, false},
-          {R_ARM_LDR_PC_G2, false},
-          {R_ARM_LDRS_PC_G0, false},
-          {R_ARM_LDRS_PC_G1, false},
-          {R_ARM_LDRS_PC_G2, false},
-          {R_ARM_LDC_PC_G0, false},
-          {R_ARM_LDC_PC_G1, false},
-          {R_ARM_LDC_PC_G2, false},
-          {R_ARM_ALU_SB_G0_NC, false},
-          {R_ARM_ALU_SB_G0, false},
-          {R_ARM_ALU_SB_G1_NC, false},
-          {R_ARM_ALU_SB_G1, false},
-          {R_ARM_ALU_SB_G2, false},
-          {R_ARM_LDR_SB_G0, false},
-          {R_ARM_LDR_SB_G1, false},
-          {R_ARM_LDR_SB_G2, false},
-          {R_ARM_LDRS_SB_G0, false},
-          {R_ARM_LDRS_SB_G1, false},
-          {R_ARM_LDRS_SB_G2, false},
-          {R_ARM_LDC_SB_G0, false},
-          {R_ARM_LDC_SB_G1, false},
-          {R_ARM_LDC_SB_G2, false},
-          {R_ARM_MOVW_BREL_NC, false},
-          {R_ARM_MOVT_BREL, false},
-          {R_ARM_MOVW_BREL, false},
-          {R_ARM_THM_MOVW_BREL_NC, false},
-          {R_ARM_THM_MOVT_BREL, false},
-          {R_ARM_THM_MOVW_BREL, false},
-          {R_ARM_TLS_GOTDESC, true},
-          {R_ARM_TLS_CALL, false},
-          {R_ARM_TLS_DESCSEQ, false},
-          {R_ARM_THM_TLS_CALL, false},
-          {R_ARM_PLT32_ABS, true},
-          {R_ARM_GOT_ABS, true},
-          {R_ARM_GOT_PREL, true},
-          {R_ARM_GOT_BREL12, false},
-          {R_ARM_GOTOFF12, false},
-          {R_ARM_GOTRELAX, false},
-          {R_ARM_GNU_VTENTRY, true},
-          {R_ARM_GNU_VTINHERIT, true},
-          {R_ARM_THM_JUMP11, false},
-          {R_ARM_THM_JUMP8, false},
-          {R_ARM_TLS_GD32, true},
-          {R_ARM_TLS_LDM32, true},
-          {R_ARM_TLS_LDO32, true},
-          {R_ARM_TLS_IE32, true},
-          {R_ARM_TLS_LE32, false},
-          {R_ARM_TLS_LDO12, false},
-          {R_ARM_TLS_LE12, false},
-          {R_ARM_TLS_IE12GP, false},
-          {R_ARM_ME_TOO, false},
-          {R_ARM_THM_TLS_DESCSEQ16, false},
-          {R_ARM_THM_TLS_DESCSEQ32, false},
-          {R_ARM_THM_GOT_BREL12, false},
-          {R_ARM_THM_ALU_ABS_G0_NC, false},
-          {R_ARM_THM_ALU_ABS_G1_NC, false},
-          {R_ARM_THM_ALU_ABS_G2_NC, false},
-          {R_ARM_THM_ALU_ABS_G3, false},
-          {R_ARM_IRELATIVE, false},
-          {R_ARM_RXPC25, false},
-          {R_ARM_RSBREL32, false},
-          {R_ARM_THM_RPC22, false},
-          {R_ARM_RREL32, false},
-          {R_ARM_RABS32, false},
-          {R_ARM_RPC24, false},
-          {R_ARM_RBASE, false}};
-  if (!isDataMap.count(reloc))
-    return false;
-  return isDataMap.at(reloc);
 }
 
 /* Intrinsic names table removed - using switch statement in GetIntrinsicName like ARMv7 */
@@ -4148,435 +3705,10 @@ public:
 };
 
 /*
- * Byte swap helper for big endian support
- */
-static uint32_t bswap32(uint32_t x)
-{
-  return ((x & 0xff000000) >> 24) |
-         ((x & 0x00ff0000) >> 8) |
-         ((x & 0x0000ff00) << 8) |
-         ((x & 0x000000ff) << 24);
-}
-
-/*
- * ELF Relocation Handler for ARMv5
- */
-class Armv5ElfRelocationHandler : public RelocationHandler
-{
-public:
-  virtual bool ApplyRelocation(Ref<BinaryView> view, Ref<Architecture> arch, Ref<Relocation> reloc,
-                               uint8_t *dest, size_t len) override
-  {
-    (void)view;
-    BNRelocationInfo info = reloc->GetInfo();
-    if (len < info.size)
-      return false;
-    Ref<Symbol> sym = reloc->GetSymbol();
-    uint32_t target = (uint32_t)reloc->GetTarget();
-    uint32_t *dest32 = (uint32_t *)dest;
-
-    auto swap = [&arch](uint32_t x)
-    { return (arch->GetEndianness() == LittleEndian) ? x : bswap32(x); };
-    switch (info.nativeType)
-    {
-    case R_ARM_COPY:
-    case R_ARM_GLOB_DAT:
-    case R_ARM_JUMP_SLOT:
-    case R_ARM_BASE_PREL:
-    case R_ARM_GOT_BREL:
-      dest32[0] = swap(target);
-      break;
-    case R_ARM_RELATIVE:
-    case R_ARM_ABS32:
-      dest32[0] = swap(swap(dest32[0]) + target);
-      break;
-    case R_ARM_REL32:
-      dest32[0] = swap((uint32_t)((target + (info.implicitAddend ? swap(dest32[0]) : info.addend)) - reloc->GetAddress()));
-      break;
-    case R_ARM_CALL:
-    {
-      if (target & 1)
-      {
-        LogError("Unsupported relocation R_ARM_CALL to thumb target");
-        break;
-      }
-      struct _bl
-      {
-        int32_t imm : 24;
-        uint32_t group1 : 4;
-        uint32_t cond : 4;
-      };
-      _bl *bl = (_bl *)dest32;
-      int64_t newTarget = (target + (info.implicitAddend ? ((bl->imm << 2) + 8) : info.addend)) - reloc->GetAddress();
-      if ((newTarget - 8) > 0x3ffffff)
-      {
-        LogError("Unsupported relocation R_ARM_CALL @ 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
-        break;
-      }
-      bl->imm = (newTarget - 8) >> 2;
-      break;
-    }
-    case R_ARM_THM_CALL:
-    case R_ARM_THM_JUMP24:
-    {
-#pragma pack(push, 1)
-      union _thumb32_bl_hw1
-      {
-        uint16_t word;
-        struct
-        {
-          uint16_t offHi : 10;
-          uint16_t sign : 1;
-          uint16_t group : 5;
-        };
-      };
-
-      union _thumb32_bl_hw2
-      {
-        uint16_t word;
-        struct
-        {
-          uint16_t offLo : 11;
-          uint16_t j2 : 1;
-          uint16_t thumb : 1;
-          uint16_t j1 : 1;
-          uint16_t i2 : 1;
-          uint16_t i1 : 1;
-        };
-      };
-#pragma pack(pop)
-
-      _thumb32_bl_hw1 *bl_hw1 = (_thumb32_bl_hw1 *)dest;
-      _thumb32_bl_hw2 *bl_hw2 = (_thumb32_bl_hw2 *)(dest + 2);
-      int32_t curTarget = (bl_hw2->offLo << 1) | (bl_hw1->offHi << 12) | (bl_hw1->sign ? (0xffc << 20) : 0);
-      int32_t newTarget = (int32_t)((target + (info.implicitAddend ? curTarget : info.addend)) - reloc->GetAddress());
-
-      bl_hw1->sign = newTarget < 0 ? 1 : 0;
-      bl_hw1->offHi = newTarget >> 12;
-      bl_hw2->offLo = newTarget >> 1;
-      break;
-    }
-    case R_ARM_PREL31:
-    {
-      dest32[0] = (info.implicitAddend ? dest32[0] : (uint32_t)info.addend) + (target & ~1) - (uint32_t)reloc->GetAddress();
-      break;
-    }
-    case R_ARM_PC24:
-    case R_ARM_JUMP24:
-    {
-      if (target & 1)
-      {
-        LogError("Unsupported relocation R_ARM_JUMP24 to thumb target");
-        break;
-      }
-      struct _b
-      {
-        int32_t imm : 24;
-        uint32_t group1 : 4;
-        uint32_t cond : 4;
-      };
-      _b *b = (_b *)dest32;
-      int64_t newTarget = (target + (info.implicitAddend ? ((b->imm << 2) + 8) : info.addend)) - reloc->GetAddress();
-      if ((newTarget - 8) > 0x3ffffff)
-      {
-        LogError("Unsupported relocation R_ARM_JUMP24 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
-        break;
-      }
-      b->imm = (newTarget - 8) >> 2;
-      break;
-    }
-    case R_ARM_MOVW_ABS_NC:
-    {
-      struct _mov
-      {
-        uint32_t imm12 : 12;
-        uint32_t rd : 4;
-        uint32_t imm4 : 4;
-        uint32_t group2 : 8;
-        uint32_t cond : 4;
-      };
-      _mov *mov = (_mov *)dest32;
-      int64_t newTarget = (target + (info.implicitAddend ? (mov->imm4 << 12 | mov->imm12) : info.addend));
-      mov->imm12 = newTarget & 0xfff;
-      mov->imm4 = (newTarget >> 12) & 0xf;
-      break;
-    }
-    case R_ARM_MOVT_ABS:
-    {
-      struct _mov
-      {
-        uint32_t imm12 : 12;
-        uint32_t rd : 4;
-        uint32_t imm4 : 4;
-        uint32_t group2 : 8;
-        uint32_t cond : 4;
-      };
-      _mov *mov = (_mov *)dest32;
-      int64_t newTarget = (target + (info.implicitAddend ? (mov->imm4 << 12 | mov->imm12) : info.addend));
-      mov->imm12 = (newTarget >> 16) & 0xfff;
-      mov->imm4 = (newTarget >> 28) & 0xf;
-      break;
-    }
-    case R_ARM_THM_MOVW_ABS_NC:
-    case R_ARM_THM_MOVT_ABS:
-    {
-#pragma pack(push, 1)
-      struct _mov
-      {
-        uint32_t imm4 : 4;
-        uint32_t group2 : 6;
-        uint32_t i : 1;
-        uint32_t group3 : 5;
-        uint32_t imm8 : 8;
-        uint32_t rd : 4;
-        uint32_t imm3 : 3;
-        uint32_t group1_15 : 1;
-      };
-      union _target
-      {
-        struct
-        {
-          uint16_t imm8 : 8;
-          uint16_t imm3 : 3;
-          uint16_t i : 1;
-          uint16_t imm4 : 4;
-        };
-        uint16_t word;
-      };
-#pragma pack(pop)
-      _mov *mov = (_mov *)dest32;
-      int16_t addend = mov->imm8 | (mov->imm3 << 8) | (mov->i << (8 + 3)) | (mov->imm4 << (8 + 3 + 1));
-      int64_t newTarget = target + addend;
-      _target t;
-      if (info.nativeType == R_ARM_THM_MOVW_ABS_NC)
-      {
-        t.word = (newTarget & 0xffff);
-      }
-      else
-      {
-        t.word = (newTarget >> 16) & 0xffff;
-      }
-      mov->imm8 = t.imm8;
-      mov->imm3 = t.imm3;
-      mov->imm4 = t.imm4;
-      mov->i = t.i;
-      break;
-    }
-    case R_ARM_TLS_DTPMOD32:
-      dest32[0] = 0;
-      break;
-    case R_ARM_TLS_DTPOFF32:
-    {
-      if (sym)
-        dest32[0] = sym->GetAddress();
-      break;
-    }
-    default:
-      return RelocationHandler::ApplyRelocation(view, arch, reloc, dest, len);
-    }
-    return true;
-  }
-
-  virtual bool GetRelocationInfo(Ref<BinaryView> view, Ref<Architecture> arch,
-                                 vector<BNRelocationInfo> &result) override
-  {
-    (void)view;
-    (void)arch;
-    set<uint64_t> relocTypes;
-    for (auto &reloc : result)
-    {
-      reloc.type = StandardRelocationType;
-      reloc.size = 4;
-      reloc.pcRelative = false;
-      reloc.dataRelocation = IsELFDataRelocation((ElfArmRelocationType)reloc.nativeType);
-      switch (reloc.nativeType)
-      {
-      case R_ARM_NONE:
-        reloc.type = IgnoredRelocation;
-        reloc.pcRelative = true;
-        break;
-      case R_ARM_PREL31:
-      case R_ARM_RELATIVE:
-        reloc.pcRelative = true;
-        break;
-      case R_ARM_ABS32:
-      case R_ARM_BASE_PREL:
-      case R_ARM_GOT_BREL:
-        break;
-      case R_ARM_CALL:
-      case R_ARM_JUMP24:
-      case R_ARM_THM_CALL:
-      case R_ARM_THM_JUMP24:
-        reloc.pcRelative = true;
-        break;
-      case R_ARM_COPY:
-        reloc.type = ELFCopyRelocationType;
-        break;
-      case R_ARM_GLOB_DAT:
-        reloc.type = ELFGlobalRelocationType;
-        break;
-      case R_ARM_JUMP_SLOT:
-        reloc.type = ELFJumpSlotRelocationType;
-        break;
-      case R_ARM_THM_MOVW_ABS_NC:
-      case R_ARM_THM_MOVT_ABS:
-      case R_ARM_MOVW_ABS_NC:
-      case R_ARM_MOVT_ABS:
-        break;
-      case R_ARM_REL32:
-        reloc.pcRelative = true;
-        break;
-      case R_ARM_IRELATIVE:
-        reloc.baseRelative = true;
-        reloc.type = ELFJumpSlotRelocationType;
-        break;
-      case R_ARM_TLS_DTPMOD32:
-        reloc.symbolIndex = 0;
-        break;
-      case R_ARM_TLS_DTPOFF32:
-        break;
-      case R_ARM_PC24:
-        reloc.pcRelative = true;
-        reloc.baseRelative = false;
-        reloc.hasSign = false;
-        reloc.size = 3;
-        reloc.truncateSize = 3;
-        break;
-      case R_ARM_V4BX:
-        reloc.type = IgnoredRelocation;
-        break;
-      case R_ARM_SBREL31:
-      case R_ARM_LDR_PC_G0:
-      case R_ARM_ABS16:
-      case R_ARM_ABS12:
-      case R_ARM_ABS8:
-      case R_ARM_SBREL32:
-      case R_ARM_BREL_ADJ:
-      case R_ARM_TLS_DESC:
-      case R_ARM_XPC25:
-      case R_ARM_TLS_TPOFF32:
-      case R_ARM_GOTOFF32:
-      case R_ARM_PLT32:
-      case R_ARM_BASE_ABS:
-      case R_ARM_ALU_PCREL_7_0:
-      case R_ARM_ALU_PCREL_15_8:
-      case R_ARM_ALU_PCREL_23_15:
-      case R_ARM_LDR_SBREL_11_0_NC:
-      case R_ARM_ALU_SBREL_19_12_NC:
-      case R_ARM_ALU_SBREL_27_20_CK:
-      case R_ARM_TARGET1:
-      case R_ARM_TARGET2:
-      case R_ARM_MOVW_PREL_NC:
-      case R_ARM_MOVT_PREL:
-      case R_ARM_ABS32_NOI:
-      case R_ARM_REL32_NOI:
-      case R_ARM_ALU_PC_G0_NC:
-      case R_ARM_ALU_PC_G0:
-      case R_ARM_ALU_PC_G1_NC:
-      case R_ARM_ALU_PC_G1:
-      case R_ARM_ALU_PC_G2:
-      case R_ARM_LDR_PC_G1:
-      case R_ARM_LDR_PC_G2:
-      case R_ARM_LDRS_PC_G0:
-      case R_ARM_LDRS_PC_G1:
-      case R_ARM_LDRS_PC_G2:
-      case R_ARM_LDC_PC_G0:
-      case R_ARM_LDC_PC_G1:
-      case R_ARM_LDC_PC_G2:
-      case R_ARM_ALU_SB_G0_NC:
-      case R_ARM_ALU_SB_G0:
-      case R_ARM_ALU_SB_G1_NC:
-      case R_ARM_ALU_SB_G1:
-      case R_ARM_ALU_SB_G2:
-      case R_ARM_LDR_SB_G0:
-      case R_ARM_LDR_SB_G1:
-      case R_ARM_LDR_SB_G2:
-      case R_ARM_LDRS_SB_G0:
-      case R_ARM_LDRS_SB_G1:
-      case R_ARM_LDRS_SB_G2:
-      case R_ARM_LDC_SB_G0:
-      case R_ARM_LDC_SB_G1:
-      case R_ARM_LDC_SB_G2:
-      case R_ARM_MOVW_BREL_NC:
-      case R_ARM_MOVT_BREL:
-      case R_ARM_MOVW_BREL:
-
-      case R_ARM_THM_ABS5:
-      case R_ARM_THM_PC8:
-      case R_ARM_THM_SWI8:
-      case R_ARM_THM_XPC22:
-      case R_ARM_THM_MOVW_PREL_NC:
-      case R_ARM_THM_MOVT_PREL:
-      case R_ARM_THM_JUMP19:
-      case R_ARM_THM_JUMP6:
-      case R_ARM_THM_ALU_PREL_11_0:
-      case R_ARM_THM_PC12:
-      case R_ARM_THM_MOVW_BREL_NC:
-      case R_ARM_THM_MOVT_BREL:
-      case R_ARM_THM_MOVW_BREL:
-      case R_ARM_THM_JUMP11:
-      case R_ARM_THM_JUMP8:
-      case R_ARM_THM_TLS_DESCSEQ16:
-      case R_ARM_THM_TLS_DESCSEQ32:
-      case R_ARM_THM_RPC22:
-
-      case R_ARM_TLS_GOTDESC:
-      case R_ARM_TLS_CALL:
-      case R_ARM_TLS_DESCSEQ:
-      case R_ARM_THM_TLS_CALL:
-      case R_ARM_PLT32_ABS:
-      case R_ARM_GOT_ABS:
-      case R_ARM_GOT_PREL:
-      case R_ARM_GOT_BREL12:
-      case R_ARM_GOTOFF12:
-      case R_ARM_GOTRELAX:
-      case R_ARM_GNU_VTENTRY:
-      case R_ARM_GNU_VTINHERIT:
-      case R_ARM_TLS_GD32:
-      case R_ARM_TLS_LDM32:
-      case R_ARM_TLS_LDO32:
-      case R_ARM_TLS_LE32:
-      case R_ARM_TLS_LDO12:
-      case R_ARM_TLS_LE12:
-      case R_ARM_TLS_IE12GP:
-      case R_ARM_ME_TOO:
-      case R_ARM_RXPC25:
-      case R_ARM_RSBREL32:
-      case R_ARM_RREL32:
-      case R_ARM_RABS32:
-      case R_ARM_RPC24:
-      case R_ARM_RBASE:
-      default:
-        reloc.type = UnhandledRelocation;
-        relocTypes.insert(reloc.nativeType);
-        break;
-      }
-    }
-    for (auto &reloc : relocTypes)
-      LogWarn("Unsupported ELF relocation: %s", GetRelocationString((ElfArmRelocationType)reloc));
-    return true;
-  }
-};
-
-/*
- * Parse .ARM.attributes section to extract Tag_CPU_arch
+ * Parse ARM .ARM.attributes to get Tag_CPU_arch for an ELF binary.
  *
- * The .ARM.attributes section is a non-loadable ELF section (SHF_ALLOC not set),
- * so it's not mapped into the BinaryView's address space. We must parse the
- * ELF section headers directly from the parent (raw) view to find it.
- *
- * The .ARM.attributes section format (from ARM ABI):
- * - byte: format version ('A' = 0x41)
- * - subsections:
- *   - uint32_t: subsection length (including tag and length)
- *   - string: vendor name (null-terminated, "aeabi" for standard)
- *   - sub-subsections:
- *     - byte: tag (1 = Tag_File for file-scope attributes)
- *     - uint32_t: size
- *     - attributes: tag-value pairs (ULEB128 encoded)
- *
- * Tag_CPU_arch values (Tag 6):
- *   0 = Pre-v4
+ * Tag_CPU_arch values:
+ *   0 = pre-v4
  *   1 = ARMv4
  *   2 = ARMv4T
  *   3 = ARMv5T
@@ -5071,17 +4203,13 @@ static void RegisterArmv5Architecture(const char *armName, const char *thumbName
   }
 
   /* Register ELF relocation handler for both architectures */
-  armv5->RegisterRelocationHandler("ELF", new Armv5ElfRelocationHandler());
+  RegisterArmv5ElfRelocationHandlers(armv5, thumb);
   /*
       Missing:
       armv5->RegisterRelocationHandler("Mach-O", new ArmMachORelocationHandler());
       armv5->RegisterRelocationHandler("PE", new ArmPERelocationHandler());
       armv5->RegisterRelocationHandler("COFF", new ArmCOFFRelocationHandler());
-  */
 
-  thumb->RegisterRelocationHandler("ELF", new Armv5ElfRelocationHandler());
-  /*
-      Missing:
       thumb->RegisterRelocationHandler("Mach-O", new ArmMachORelocationHandler());
       thumb->RegisterRelocationHandler("COFF", new ArmCOFFRelocationHandler());
   */
@@ -5105,29 +4233,37 @@ extern "C"
     RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
     InitArmv5FirmwareViewType();
 
-    // Register a module workflow activity that runs ARMv5 firmware scans alongside core analysis.
-    Ref<Workflow> firmwareWorkflow = Workflow::Get("core.module.metaAnalysis")->Clone();
-    firmwareWorkflow->RegisterActivity(R"~({
-      "title": "ARMv5 Firmware Scan",
-      "name": "analysis.armv5.firmwareScan",
-      "role": "action",
-      "description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
-      "eligibility": {
-        "runOnce": true,
-        "auto": { "default": true },
-        "predicates": [
-          {
-            "type": "viewType",
-            "value": ["ARMv5 Firmware"]
-          }
-        ]
-      },
-      "dependencies": {
-        "downstream": ["core.module.update"]
-      }
-    })~", &RunArmv5FirmwareWorkflow);
-    firmwareWorkflow->Insert("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
-    Workflow::RegisterWorkflow(firmwareWorkflow);
+    const char* disableWorkflow = getenv("BN_ARMV5_DISABLE_WORKFLOW");
+    if (!disableWorkflow || disableWorkflow[0] == '\0')
+    {
+      // Register a module workflow activity that runs ARMv5 firmware scans alongside core analysis.
+      Ref<Workflow> firmwareWorkflow = Workflow::Get("core.module.metaAnalysis")->Clone();
+      firmwareWorkflow->RegisterActivity(R"~({
+        "title": "ARMv5 Firmware Scan",
+        "name": "analysis.armv5.firmwareScan",
+        "role": "action",
+        "description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
+        "eligibility": {
+          "runOnce": true,
+          "auto": { "default": true },
+          "predicates": [
+            {
+              "type": "viewType",
+              "value": ["ARMv5 Firmware"]
+            }
+          ]
+        },
+        "dependencies": {
+          "downstream": ["core.module.update"]
+        }
+      })~", &RunArmv5FirmwareWorkflow);
+      firmwareWorkflow->Insert("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
+      Workflow::RegisterWorkflow(firmwareWorkflow);
+    }
+    else
+    {
+      LogInfo("ARMv5 firmware workflow disabled via BN_ARMV5_DISABLE_WORKFLOW");
+    }
     return true;
   }
 }

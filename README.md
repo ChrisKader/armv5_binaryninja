@@ -87,7 +87,17 @@ BN_USER_DIRECTORY=~/.binaryninja-dev python3 -m pytest test/ -v
 armv5_binaryninja/
 ├── arch_armv5/           # Main plugin source
 │   ├── arch_armv5.cpp    # Architecture plugin interface
-│   ├── il.cpp            # LLIL lifting
+│   ├── firmware/         # Firmware BinaryViewType
+│   │   ├── firmware_view.cpp/h
+│   │   ├── firmware_scans.cpp
+│   │   ├── firmware_vectors.cpp
+│   │   ├── firmware_mmu.cpp
+│   │   ├── firmware_settings.cpp/h
+│   │   └── firmware_internal.h
+│   ├── il/               # LLIL lifting
+│   │   └── il.cpp/h
+│   ├── relocations/      # Relocation handling
+│   │   └── relocations.cpp/h
 │   ├── armv5_disasm/     # ARM instruction decoder (C)
 │   └── thumb_disasm/     # Thumb decoder (spec-generated)
 ├── test/                 # Test suite

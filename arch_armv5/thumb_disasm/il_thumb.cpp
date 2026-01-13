@@ -1,7 +1,7 @@
 #include <stdarg.h>
 #include "binaryninjaapi.h"
 #include "lowlevelilinstruction.h"
-#include "il.h"
+#include "il/il.h"
 #include "spec.h"
 #include "disassembler.h"
 
@@ -371,7 +371,7 @@ static ExprId GetMemoryAddress(LowLevelILFunction& il, decomp_result* instr, siz
 }
 
 
-// Note: GetCondition is defined in il.cpp and declared in il.h
+// Note: GetCondition is defined in il/il.cpp and declared in il/il.h
 
 
 static void ConditionalJump(Architecture* arch, LowLevelILFunction& il, uint32_t cond, uint32_t t, uint32_t f)

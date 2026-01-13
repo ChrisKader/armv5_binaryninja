@@ -296,7 +296,7 @@ const char *get_register_name(enum Register reg)
         return registerString[reg];
 
     // BN temporary/SSA register IDs come through here.
-    // Use a small rotating buffer so it’s safe even with multiple calls per line.
+    // Use a small rotating buffer so it's safe even with multiple calls per line.
     static char buf[8][16];
     static int idx = 0;
     idx = (idx + 1) & 7;

@@ -1,6 +1,6 @@
 # Convenience wrapper - delegates to .build directory
 
-.PHONY: all build install clean configure
+.PHONY: all build install install_plugin clean configure
 
 all: build
 
@@ -13,6 +13,8 @@ build: configure
 
 install: build
 	@$(MAKE) -C .build install_plugin
+
+install_plugin: install
 
 clean:
 	@rm -rf .build

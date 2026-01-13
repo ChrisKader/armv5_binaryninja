@@ -7,8 +7,17 @@ This directory contains the core Binary Ninja architecture plugin implementation
 ```
 arch_armv5/
 ├── arch_armv5.cpp/h      # Architecture plugin interface
-├── armv5_firmware.cpp/h  # Custom BinaryViewType for bare-metal firmware
-├── il.cpp/h              # LLIL lifting for ARM mode
+├── firmware/
+│   ├── firmware_view.cpp/h   # Firmware BinaryViewType + registration
+│   ├── firmware_scans.cpp    # Firmware scan passes
+│   ├── firmware_vectors.cpp  # Vector table detection/resolution
+│   ├── firmware_mmu.cpp      # MMU configuration analysis
+│   ├── firmware_settings.cpp/h # Firmware settings + key registry
+│   └── firmware_internal.h   # Shared firmware helpers
+├── relocations/
+│   └── relocations.cpp/h     # ELF relocation handling
+├── il/
+│   └── il.cpp/h              # LLIL lifting for ARM mode
 ├── armv5_disasm/         # ARM instruction decoder (pure C)
 │   ├── armv5.c/h         # Decoder implementation
 │   ├── test.c            # Standalone test harness

@@ -23,6 +23,12 @@ endif()
 file(GLOB SOURCES CONFIGURE_DEPENDS
     *.cpp
     *.h
+    firmware/*.cpp
+    firmware/*.h
+    il/*.cpp
+    il/*.h
+    relocations/*.cpp
+    relocations/*.h
     armv5_disasm/armv5.c
     armv5_disasm/armv5.h
     thumb_disasm/*.cpp
