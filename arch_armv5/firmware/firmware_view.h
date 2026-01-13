@@ -25,9 +25,10 @@ namespace BinaryNinja
 	bool m_postAnalysisScansDone;
 	std::set<uint64_t> m_seededFunctions;
 	std::set<uint64_t> m_seededUserFunctions;
-	std::vector<FirmwareScanDataDefine> m_seededDataDefines;
-	std::vector<BinaryNinja::Ref<BinaryNinja::Symbol>> m_seededSymbols;
-	uint64_t m_viewId;
+		std::vector<FirmwareScanDataDefine> m_seededDataDefines;
+		std::vector<BinaryNinja::Ref<BinaryNinja::Symbol>> m_seededSymbols;
+		uint64_t m_viewId;
+		uintptr_t m_viewPtr;
 
 		virtual uint64_t PerformGetEntryPoint() const override;
 		virtual bool PerformIsExecutable() const override { return true; }

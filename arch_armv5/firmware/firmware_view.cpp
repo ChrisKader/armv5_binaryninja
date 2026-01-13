@@ -53,6 +53,12 @@ static std::unordered_map<ViewId, Armv5FirmwareView*>& FirmwareViewMap()
 	return *map;
 }
 
+static std::unordered_map<uintptr_t, ViewId>& FirmwareViewPointerMap()
+{
+	static auto* map = new std::unordered_map<uintptr_t, ViewId>();
+	return *map;
+}
+
 // Track raw BNBinaryView* pointers (as uintptr_t) of real (non-parse-only) views.
 // This is used in destruction callbacks to distinguish real views from parse-only views
 // without calling any methods on potentially-invalid objects.
@@ -90,12 +96,51 @@ static void OnFirmwareInitialAnalysisComplete(BinaryView* view)
 	ScheduleArmv5FirmwareScanJob(Ref<BinaryView>(firmwareView));
 }
 
+static void OnFirmwareViewFinalization(BinaryView* view)
+{
+	if (!view || !view->GetObject())
+		return;
+	if (view->GetTypeName() != "ARMv5 Firmware")
+		return;
+	ViewId viewId = GetViewIdFromView(view);
+	if (viewId == 0)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+		FirmwareViewClosingSet().insert(viewId);
+	}
+	CancelArmv5FirmwareScanJob(viewId);
+	SetFirmwareViewScanCancelled(viewId, true);
+}
 static void RegisterFirmwareViewDestructionCallbacks()
 {
 	static std::once_flag once;
 	std::call_once(once, []()
 	{
 		BNObjectDestructionCallbacks callbacks = {};
+		callbacks.destructBinaryView = [](void* ctxt, BNBinaryView* bnView) -> void
+		{
+			(void)ctxt;
+			if (!bnView)
+				return;
+			uintptr_t viewPtr = reinterpret_cast<uintptr_t>(bnView);
+			ViewId viewId = 0;
+			{
+				std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+				auto& ptrMap = FirmwareViewPointerMap();
+				auto it = ptrMap.find(viewPtr);
+				if (it != ptrMap.end())
+				{
+					viewId = it->second;
+					ptrMap.erase(it);
+					if (viewId != 0)
+						FirmwareViewClosingSet().insert(viewId);
+				}
+			}
+			if (viewId != 0)
+				CancelArmv5FirmwareScanJob(viewId);
+		};
+
 		// Handle FileMetadata destruction - final cleanup after all views are gone.
 		callbacks.destructFileMetadata = [](void* ctxt, BNFileMetadata* fileMetadata) -> void
 		{
@@ -125,6 +170,7 @@ void BinaryNinja::InitArmv5FirmwareViewType()
 	g_armv5FirmwareViewType = &type;
 	RegisterFirmwareViewDestructionCallbacks();
 	BinaryViewType::RegisterBinaryViewInitialAnalysisCompletionEvent(OnFirmwareInitialAnalysisComplete);
+	BinaryViewType::RegisterBinaryViewFinalizationEvent(OnFirmwareViewFinalization);
 }
 
 
@@ -148,7 +194,8 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 	m_seededUserFunctions(),
 	m_seededDataDefines(),
 	m_seededSymbols(),
-	m_viewId(0)
+	m_viewId(0),
+	m_viewPtr(0)
 {
 	CreateLogger("BinaryView");
 	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
@@ -160,6 +207,9 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 		{
 			FirmwareViewClosingSet().erase(viewId);
 			FirmwareViewMap()[viewId] = this;
+			m_viewPtr = reinterpret_cast<uintptr_t>(GetObject());
+			if (m_viewPtr != 0)
+				FirmwareViewPointerMap()[m_viewPtr] = viewId;
 		}
 	}
 }
@@ -176,6 +226,8 @@ Armv5FirmwareView::~Armv5FirmwareView()
 		auto it = FirmwareViewMap().find(m_viewId);
 		if (it != FirmwareViewMap().end() && it->second == this)
 			FirmwareViewMap().erase(it);
+		if (m_viewPtr != 0)
+			FirmwareViewPointerMap().erase(m_viewPtr);
 	}
 }
 
@@ -431,6 +483,7 @@ bool Armv5FirmwareView::Init()
 		{
 			uint64_t vectorAddr = imageBase + (i * 4);
 			seededFunctions.insert(vectorAddr);
+			m_seededUserFunctions.insert(vectorAddr);
 		}
 
 		// Collect resolved handler functions for analysis (deferred)
