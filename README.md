@@ -4,16 +4,16 @@ A Binary Ninja architecture plugin providing disassembly, instruction rendering,
 
 ## Features
 
-- ARM Mode: Full 32-bit ARMv5 instruction set
+- ARM Mode: ARMv5 core instruction set coverage (see INSTRUCTIONS.md for status)
 - Thumb Mode: Original 16-bit Thumb (not Thumb-2)
 - VFPv2: Basic floating-point operations
 - DSP Extensions: SMUL, SMLA, saturating arithmetic
-- IL Lifting: Complete LLIL support for analysis
+- IL Lifting: LLIL support for covered instructions
 - Firmware Detection: Automatic vector table parsing for bare-metal binaries
 
 ### Supported Processors
 
-ARM926EJ-S, ARM946E-S, ARM966E-S, ARM1026EJ-S, Intel XScale, and other ARMv5-compatible cores.
+Examples: ARM926EJ-S, ARM946E-S, ARM966E-S, ARM1026EJ-S, Intel XScale, and other ARMv5-compatible cores.
 
 ## Building
 

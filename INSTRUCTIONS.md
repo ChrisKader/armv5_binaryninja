@@ -1,6 +1,6 @@
 # ARMv5 Instruction Disassembly/Lifting Completion Tracking
 
-This document tracks the completion status of ARMv5 instruction support in this Binary Ninja architecture plugin.
+This document tracks the completion status of ARMv5 instruction support in this Binary Ninja architecture plugin. It is a best-effort snapshot based on current implementation and tests.
 
 Reference: [ARM Architecture Reference Manual (ARM ARM), DDI 0100I](https://developer.arm.com/documentation/ddi0100/i/)
 
@@ -322,7 +322,7 @@ Reference: [ARM Architecture Reference Manual (ARM ARM), DDI 0100I](https://deve
 | Thumb (all) | ~40 | ~40 | ~40 |
 | **Total** | **~153** | **~153** | **~153** |
 
-All ARMv5 instructions are now fully supported with complete disassembly and IL lifting.
+If you find discrepancies between this document and actual behavior, update the table or file an issue.
 
 ---
 
