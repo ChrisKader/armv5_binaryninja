@@ -34,3 +34,4 @@ ISSUES.md
 
 *.log
 .cache/
+arch_armv5/armv5.patch

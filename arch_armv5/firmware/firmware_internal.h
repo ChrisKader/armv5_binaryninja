@@ -78,7 +78,7 @@ struct FirmwareScanContext
 	BinaryNinja::Ref<BinaryNinja::Platform> plat;
 	BinaryNinja::Ref<BinaryNinja::Logger> logger;
 	bool verboseLog;
-	BinaryNinja::BinaryView* view;
+	BinaryNinja::Ref<BinaryNinja::BinaryView> view;
 	FirmwareScanPlan* plan;
 
 	uint64_t ImageEnd() const { return imageBase + length; }
@@ -88,35 +88,35 @@ uint64_t DetectImageBaseFromVectorTable(BinaryNinja::BinaryView* data);
 uint64_t ResolveVectorEntry(BinaryNinja::BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t vectorOffset, uint64_t imageBase, uint64_t length);
 
-size_t ScanForFunctionPrologues(BinaryNinja::BinaryView* view, const uint8_t* data,
+size_t ScanForFunctionPrologues(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Architecture> armArch, BinaryNinja::Ref<BinaryNinja::Architecture> thumbArch,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger,
 	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
-size_t ScanForCallTargets(BinaryNinja::BinaryView* view, const uint8_t* data,
+size_t ScanForCallTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
 	const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
-size_t ScanForPointerTargets(BinaryNinja::BinaryView* view, const uint8_t* data,
+size_t ScanForPointerTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
 	const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
-size_t ScanForOrphanCodeBlocks(BinaryNinja::BinaryView* view, const uint8_t* data,
+size_t ScanForOrphanCodeBlocks(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
 	const FirmwareScanTuning& tuning, uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes,
 	uint32_t maxPerPage, bool requirePrologue, std::set<uint64_t>* addedFunctions, FirmwareScanPlan* plan);
 
-size_t CleanupInvalidFunctions(BinaryNinja::BinaryView* view, const uint8_t* data, uint64_t dataLen,
+size_t CleanupInvalidFunctions(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t imageBase, uint64_t length, BinaryNinja::Ref<BinaryNinja::Logger> logger,
 	bool verboseLog, const FirmwareScanTuning& tuning, uint32_t maxSizeBytes, bool requireZeroRefs,
 	bool requirePcWriteStart, uint64_t entryPoint, const std::set<uint64_t>& protectedStarts,
 	FirmwareScanPlan* plan);
 
-void AnalyzeMMUConfiguration(BinaryNinja::BinaryView* view, BinaryNinja::BinaryReader& reader, const uint8_t* data,
+void AnalyzeMMUConfiguration(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, BinaryNinja::BinaryReader& reader, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Logger> logger);
 
