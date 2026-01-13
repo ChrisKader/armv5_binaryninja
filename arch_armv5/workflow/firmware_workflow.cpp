@@ -67,6 +67,11 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 		LogInfo("RunArmv5FirmwareWorkflow: no view, returning");
 		return;
 	}
+	if (!view->GetObject())
+	{
+		LogInfo("RunArmv5FirmwareWorkflow: view has no object, returning");
+		return;
+	}
 	LogInfo("RunArmv5FirmwareWorkflow: view type = %s", view->GetTypeName().c_str());
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
@@ -146,7 +151,7 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 		"role": "action",
 		"description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
 		"eligibility": {
-			"runOnce": false,
+			"runOnce": true,
 			"auto": {}
 		},
 		"dependencies": {

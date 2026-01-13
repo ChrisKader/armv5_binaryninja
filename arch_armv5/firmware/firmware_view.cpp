@@ -56,12 +56,6 @@ static std::unordered_map<ViewId, Armv5FirmwareView*>& FirmwareViewMap()
 // Track raw BNBinaryView* pointers (as uintptr_t) of real (non-parse-only) views.
 // This is used in destruction callbacks to distinguish real views from parse-only views
 // without calling any methods on potentially-invalid objects.
-static std::unordered_set<uintptr_t>& RealViewPointers()
-{
-	static auto* set = new std::unordered_set<uintptr_t>();
-	return *set;
-}
-
 static ViewId GetViewIdFromFileMetadata(const FileMetadata& file)
 {
 	return file.GetSessionId();
@@ -102,54 +96,6 @@ static void RegisterFirmwareViewDestructionCallbacks()
 	std::call_once(once, []()
 	{
 		BNObjectDestructionCallbacks callbacks = {};
-		// Handle BinaryView destruction - this fires before FileMetadata destruction.
-		// We use the raw C API to avoid creating wrapper objects during destruction
-		// (which could cause reference count issues).
-		callbacks.destructBinaryView = [](void* ctxt, BNBinaryView* bnView) -> void
-		{
-			(void)ctxt;
-			if (!bnView)
-				return;
-			// Get the view type name using raw C API
-			char* typeName = BNGetViewType(bnView);
-			if (!typeName)
-				return;
-			bool isOurView = (strcmp(typeName, "ARMv5 Firmware") == 0);
-			BNFreeString(typeName);
-			if (!isOurView)
-				return;
-
-			// Get the session ID for this view
-			BNFileMetadata* fileMeta = BNGetFileForView(bnView);
-			if (!fileMeta)
-				return;
-			uint64_t viewId = BNFileMetadataGetSessionId(fileMeta);
-
-			// Only mark as closing if this view pointer is in our RealViewPointers set.
-			// Parse-only views share the same session ID as real views, and may be destroyed
-			// AFTER the real view is created. We track real view pointers separately to
-			// distinguish them without calling any methods on potentially-invalid objects.
-			if (viewId != 0)
-			{
-				bool isRealView = false;
-				{
-					std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-					uintptr_t viewPtr = reinterpret_cast<uintptr_t>(bnView);
-					auto& realPtrs = RealViewPointers();
-					if (realPtrs.find(viewPtr) != realPtrs.end())
-					{
-						// This is a real view being destroyed, mark as closing
-						FirmwareViewClosingSet().insert(viewId);
-						realPtrs.erase(viewPtr);
-						isRealView = true;
-					}
-					// If not in RealViewPointers, this is a parse-only view - don't mark as closing
-				}
-				if (isRealView)
-					CancelArmv5FirmwareScanJob(viewId);
-			}
-		};
-
 		// Handle FileMetadata destruction - final cleanup after all views are gone.
 		callbacks.destructFileMetadata = [](void* ctxt, BNFileMetadata* fileMetadata) -> void
 		{
@@ -214,8 +160,6 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 		{
 			FirmwareViewClosingSet().erase(viewId);
 			FirmwareViewMap()[viewId] = this;
-			// Track this view's raw pointer so we can identify it in destruction callbacks
-			RealViewPointers().insert(reinterpret_cast<uintptr_t>(GetObject()));
 		}
 	}
 }
