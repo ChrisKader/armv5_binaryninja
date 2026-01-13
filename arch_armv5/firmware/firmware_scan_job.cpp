@@ -143,6 +143,21 @@ namespace
 		Ref<Platform> platform = view->GetDefaultPlatform();
 		if (!platform)
 			return false;
+		Ref<Architecture> baseArch = view->GetDefaultArchitecture();
+		auto resolvePlatformForAddress = [&](uint64_t& addr) -> Ref<Platform> {
+			Ref<Platform> targetPlat = platform;
+			if (baseArch)
+			{
+				Ref<Architecture> targetArch = baseArch->GetAssociatedArchitectureByAddress(addr);
+				if (targetArch && targetArch != baseArch)
+				{
+					Ref<Platform> related = platform->GetRelatedPlatform(targetArch);
+					if (related)
+						targetPlat = related;
+				}
+			}
+			return targetPlat;
+		};
 
 		bool prevDisabled = view->GetFunctionAnalysisUpdateDisabled();
 		view->SetFunctionAnalysisUpdateDisabled(true);
@@ -184,7 +199,23 @@ namespace
 			}
 			size_t end = min(userAddrs.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
-				view->CreateUserFunction(platform.GetPtr(), userAddrs[j]);
+			{
+				uint64_t addr = userAddrs[j];
+				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
+				if (!targetPlat)
+					targetPlat = platform;
+				Ref<Function> func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
+				if (!func)
+					func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
+				if (!func)
+				{
+					// Fall back to analysis function creation if user creation fails.
+					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+					if (logger)
+						logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
+							(unsigned long long)addr);
+				}
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
@@ -228,7 +259,13 @@ namespace
 			}
 			size_t end = min(addrs.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
-				view->AddFunctionForAnalysis(platform.GetPtr(), addrs[j], true);
+			{
+				uint64_t addr = addrs[j];
+				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
+				if (!targetPlat)
+					targetPlat = platform;
+				view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
@@ -628,6 +665,7 @@ namespace
 		if (fwSettings.enableInvalidFunctionCleanup)
 		{
 			std::set<uint64_t> protectedStarts = seededFunctions;
+			protectedStarts.insert(seededUserFunctions.begin(), seededUserFunctions.end());
 			timePass("Cleanup invalid functions", [&]() {
 				CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,

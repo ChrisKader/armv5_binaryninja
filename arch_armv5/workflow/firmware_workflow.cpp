@@ -114,24 +114,6 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 		logger->LogInfo("RunArmv5FirmwareWorkflow: done");
 }
 
-static bool Armv5FirmwareWorkflowEligible(Ref<Activity>, Ref<AnalysisContext> analysisContext)
-{
-	if (BNIsShutdownRequested())
-		return false;
-	if (!analysisContext)
-		return false;
-	auto view = analysisContext->GetBinaryView();
-	if (!view || !view->GetObject())
-		return false;
-	if (view->GetTypeName() != "ARMv5 Firmware")
-		return false;
-	if (IsFirmwareViewClosing(view.GetPtr()))
-		return false;
-	if (FirmwareWorkflowDisabledByEnv())
-		return false;
-	return true;
-}
-
 void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 {
 	auto logger = GetFirmwareWorkflowLogger();
@@ -167,20 +149,26 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 	if (logger)
 		logger->LogInfo("RegisterArmv5FirmwareWorkflow: cloned workflow, name = %s", firmwareWorkflow->GetName().c_str());
 
-	Ref<Activity> activity = firmwareWorkflow->RegisterActivity(new Activity(R"~({
+	Ref<Activity> activity = firmwareWorkflow->RegisterActivity(R"~({
 		"title": "ARMv5 Firmware Scan",
 		"name": "analysis.armv5.firmwareScan",
 		"role": "action",
 		"description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
 		"eligibility": {
-			"runOnce": true,
-			"auto": {}
+			"auto": {},
+			"runOncePerSession": true,
+			"predicates": [
+				{
+					"type": "viewType",
+					"value": ["ARMv5 Firmware"],
+					"operator": "in"
+				}
+			]
 		},
 		"dependencies": {
-				"downstream": ["core.module.update"]
-			}
-	})~",
-																																					 &RunArmv5FirmwareWorkflow, &Armv5FirmwareWorkflowEligible));
+			"downstream": ["core.module.update"]
+		}
+	})~", &RunArmv5FirmwareWorkflow);
 	if (!activity)
 	{
 		if (logger)
