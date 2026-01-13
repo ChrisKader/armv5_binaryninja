@@ -44,6 +44,7 @@ namespace FirmwareSettingKeys
 	static constexpr const char* kRawPointerTableRequireCodeRefs = "loader.armv5.firmware.rawPointerTableRequireCodeRefs";
 	static constexpr const char* kRawPointerTableAllowInCode = "loader.armv5.firmware.rawPointerTableAllowInCode";
 	static constexpr const char* kCallScanRequireInFunction = "loader.armv5.firmware.callScanRequireInFunction";
+	static constexpr const char* kMaxFunctionAdds = "loader.armv5.firmware.maxFunctionAdds";
 	static constexpr const char* kCleanupInvalidFunctions = "loader.armv5.firmware.cleanupInvalidFunctions";
 	static constexpr const char* kCleanupInvalidMaxSize = "loader.armv5.firmware.cleanupInvalidMaxSize";
 	static constexpr const char* kCleanupInvalidRequireZeroRefs = "loader.armv5.firmware.cleanupInvalidRequireZeroRefs";
@@ -72,6 +73,7 @@ struct FirmwareSettings
 	uint32_t orphanMinSpacingBytes;
 	uint32_t orphanMaxPerPage;
 	bool orphanRequirePrologue;
+	uint32_t maxFunctionAdds;
 	FirmwareScanTuning tuning;
 };
 

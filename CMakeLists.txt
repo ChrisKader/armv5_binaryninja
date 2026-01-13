@@ -56,6 +56,8 @@ file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/platforms/*.h
     ${ARCH_ARMV5_DIR}/firmware/*.cpp
     ${ARCH_ARMV5_DIR}/firmware/*.h
+    ${ARCH_ARMV5_DIR}/workflow/*.cpp
+    ${ARCH_ARMV5_DIR}/workflow/*.h
     ${ARCH_ARMV5_DIR}/il/*.cpp
     ${ARCH_ARMV5_DIR}/il/*.h
     ${ARCH_ARMV5_DIR}/relocations/*.cpp
@@ -155,14 +157,21 @@ else()
     set(PLUGIN_FILENAME "libarch_armv5.so")
 endif()
 
-# Custom install target that creates a symlink instead of copying
-add_custom_target(install_plugin
+# Build install target command list
+set(INSTALL_PLUGIN_COMMANDS
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BN_USER_PLUGINS}"
     COMMAND ${CMAKE_COMMAND} -E remove -f "${BN_USER_PLUGINS}/${PLUGIN_FILENAME}"
     COMMAND ${CMAKE_COMMAND} -E create_symlink
         "${CMAKE_SOURCE_DIR}/.build/${PLUGIN_FILENAME}"
         "${BN_USER_PLUGINS}/${PLUGIN_FILENAME}"
-    DEPENDS arch_armv5
+)
+
+set(INSTALL_PLUGIN_DEPS arch_armv5)
+
+# Custom install target that creates a symlink instead of copying
+add_custom_target(install_plugin
+    ${INSTALL_PLUGIN_COMMANDS}
+    DEPENDS ${INSTALL_PLUGIN_DEPS}
     COMMENT "Creating symlink: ${BN_USER_PLUGINS}/${PLUGIN_FILENAME} -> ${CMAKE_SOURCE_DIR}/.build/${PLUGIN_FILENAME}"
 )
 

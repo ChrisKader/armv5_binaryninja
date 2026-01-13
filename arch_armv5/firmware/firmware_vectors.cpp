@@ -33,10 +33,22 @@ uint64_t DetectImageBaseFromVectorTable(BinaryView* data)
 	for (int i = 0; i < 8; i++)
 	{
 		uint32_t vecInstr = words[i];
-		if ((vecInstr & 0xFFFFF000) == 0xE59FF000)
+		if ((vecInstr & 0xFFFFF000) == 0xE59FF000 || (vecInstr & 0xFFFFF000) == 0xE51FF000)
 		{
 			uint32_t offset = vecInstr & 0xFFF;
-			uint64_t ptr = (i * 4) + 8 + offset;
+			uint64_t base = (i * 4) + 8;
+			bool add = (vecInstr & (1u << 23)) != 0;
+			uint64_t ptr = 0;
+			if (add)
+			{
+				ptr = base + offset;
+			}
+			else
+			{
+				if (offset > base)
+					continue;
+				ptr = base - offset;
+			}
 			if (ptr + 4 <= length)
 			{
 				DataBuffer handlerBuf = data->ReadBuffer(ptr, 4);
@@ -77,10 +89,22 @@ uint64_t DetectImageBaseFromVectorTable(BinaryView* data)
 		for (int i = 0; i < 8; i++)
 		{
 			uint32_t vecInstr = words[i];
-			if ((vecInstr & 0xFFFFF000) == 0xE59FF000)
+			if ((vecInstr & 0xFFFFF000) == 0xE59FF000 || (vecInstr & 0xFFFFF000) == 0xE51FF000)
 			{
 				uint32_t offset = vecInstr & 0xFFF;
-				uint64_t ptr = (i * 4) + 8 + offset;
+				uint64_t basePtr = (i * 4) + 8;
+				bool add = (vecInstr & (1u << 23)) != 0;
+				uint64_t ptr = 0;
+				if (add)
+				{
+					ptr = basePtr + offset;
+				}
+				else
+				{
+					if (offset > basePtr)
+						continue;
+					ptr = basePtr - offset;
+				}
 				if (ptr + 4 <= length)
 				{
 					DataBuffer handlerBuf = data->ReadBuffer(ptr, 4);
@@ -126,12 +150,24 @@ uint64_t ResolveVectorEntry(BinaryReader& reader, const uint8_t* data, uint64_t 
 	uint32_t instr = 0;
 	ReadU32At(reader, data, dataLen, endian, vectorOffset, instr, length);
 
-	// LDR PC, [PC, #imm] - 0xE59FF0xx
-	if ((instr & 0xFFFFF000) == 0xE59FF000)
+	// LDR PC, [PC, #imm] - 0xE59FF0xx (U=1) or 0xE51FF0xx (U=0)
+	if ((instr & 0xFFFFF000) == 0xE59FF000 || (instr & 0xFFFFF000) == 0xE51FF000)
 	{
 		uint32_t offset = instr & 0xFFF;
 		// PC is 8 bytes ahead when executing, relative to instruction address
-		uint64_t pointerAddr = vectorOffset + 8 + offset;
+		uint64_t base = vectorOffset + 8;
+		bool add = (instr & (1u << 23)) != 0;
+		uint64_t pointerAddr = 0;
+		if (add)
+		{
+			pointerAddr = base + offset;
+		}
+		else
+		{
+			if (offset > base)
+				return 0;
+			pointerAddr = base - offset;
+		}
 
 		if (pointerAddr + 4 <= length)
 		{

@@ -6,6 +6,8 @@
  */
 
 #include "firmware_internal.h"
+#include "firmware_view.h"
+#include "firmware_scan_job.h"
 #include "firmware_settings.h"
 
 #include <chrono>
@@ -15,6 +17,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
@@ -30,10 +33,142 @@ static std::mutex& FirmwareViewMutex()
 	return *mutex;
 }
 
-static std::unordered_map<BNBinaryView*, Armv5FirmwareView*>& FirmwareViewMap()
+using ViewId = uint64_t;
+
+static std::unordered_set<ViewId>& FirmwareViewClosingSet()
 {
-	static auto* map = new std::unordered_map<BNBinaryView*, Armv5FirmwareView*>();
+	static auto* set = new std::unordered_set<ViewId>();
+	return *set;
+}
+
+static std::unordered_set<ViewId>& FirmwareViewScanCancelSet()
+{
+	static auto* set = new std::unordered_set<ViewId>();
+	return *set;
+}
+
+static std::unordered_map<ViewId, Armv5FirmwareView*>& FirmwareViewMap()
+{
+	static auto* map = new std::unordered_map<ViewId, Armv5FirmwareView*>();
 	return *map;
+}
+
+// Track raw BNBinaryView* pointers (as uintptr_t) of real (non-parse-only) views.
+// This is used in destruction callbacks to distinguish real views from parse-only views
+// without calling any methods on potentially-invalid objects.
+static std::unordered_set<uintptr_t>& RealViewPointers()
+{
+	static auto* set = new std::unordered_set<uintptr_t>();
+	return *set;
+}
+
+static ViewId GetViewIdFromFileMetadata(const FileMetadata& file)
+{
+	return file.GetSessionId();
+}
+
+static ViewId GetViewIdFromView(const BinaryView* view)
+{
+	if (!view)
+		return 0;
+	auto file = view->GetFile();
+	if (!file)
+		return 0;
+	return file->GetSessionId();
+}
+
+static void OnFirmwareInitialAnalysisComplete(BinaryView* view)
+{
+	if (!view || !view->GetObject())
+		return;
+	if (view->GetTypeName() != "ARMv5 Firmware")
+		return;
+	ViewId viewId = GetViewIdFromView(view);
+	if (viewId == 0)
+		return;
+	if (IsFirmwareViewClosingById(viewId))
+		return;
+	Armv5FirmwareView* firmwareView = GetFirmwareViewForSessionId(viewId);
+	if (!firmwareView)
+		return;
+	if (!firmwareView->TryBeginWorkflowScans())
+		return;
+	ScheduleArmv5FirmwareScanJob(Ref<BinaryView>(firmwareView));
+}
+
+static void RegisterFirmwareViewDestructionCallbacks()
+{
+	static std::once_flag once;
+	std::call_once(once, []()
+	{
+		BNObjectDestructionCallbacks callbacks = {};
+		// Handle BinaryView destruction - this fires before FileMetadata destruction.
+		// We use the raw C API to avoid creating wrapper objects during destruction
+		// (which could cause reference count issues).
+		callbacks.destructBinaryView = [](void* ctxt, BNBinaryView* bnView) -> void
+		{
+			(void)ctxt;
+			if (!bnView)
+				return;
+			// Get the view type name using raw C API
+			char* typeName = BNGetViewType(bnView);
+			if (!typeName)
+				return;
+			bool isOurView = (strcmp(typeName, "ARMv5 Firmware") == 0);
+			BNFreeString(typeName);
+			if (!isOurView)
+				return;
+
+			// Get the session ID for this view
+			BNFileMetadata* fileMeta = BNGetFileForView(bnView);
+			if (!fileMeta)
+				return;
+			uint64_t viewId = BNFileMetadataGetSessionId(fileMeta);
+
+			// Only mark as closing if this view pointer is in our RealViewPointers set.
+			// Parse-only views share the same session ID as real views, and may be destroyed
+			// AFTER the real view is created. We track real view pointers separately to
+			// distinguish them without calling any methods on potentially-invalid objects.
+			if (viewId != 0)
+			{
+				bool isRealView = false;
+				{
+					std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+					uintptr_t viewPtr = reinterpret_cast<uintptr_t>(bnView);
+					auto& realPtrs = RealViewPointers();
+					if (realPtrs.find(viewPtr) != realPtrs.end())
+					{
+						// This is a real view being destroyed, mark as closing
+						FirmwareViewClosingSet().insert(viewId);
+						realPtrs.erase(viewPtr);
+						isRealView = true;
+					}
+					// If not in RealViewPointers, this is a parse-only view - don't mark as closing
+				}
+				if (isRealView)
+					CancelArmv5FirmwareScanJob(viewId);
+			}
+		};
+
+		// Handle FileMetadata destruction - final cleanup after all views are gone.
+		callbacks.destructFileMetadata = [](void* ctxt, BNFileMetadata* fileMetadata) -> void
+		{
+			(void)ctxt;
+			if (!fileMetadata)
+				return;
+			FileMetadata file(fileMetadata);
+			ViewId viewId = GetViewIdFromFileMetadata(file);
+			{
+				std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+				FirmwareViewClosingSet().insert(viewId);
+				auto it = FirmwareViewMap().find(viewId);
+				if (it != FirmwareViewMap().end())
+					FirmwareViewMap().erase(it);
+			}
+			CancelArmv5FirmwareScanJob(viewId);
+		};
+		BNRegisterObjectDestructionCallbacks(&callbacks);
+	});
 }
 
 
@@ -42,6 +177,8 @@ void BinaryNinja::InitArmv5FirmwareViewType()
 	static Armv5FirmwareViewType type;
 	BinaryViewType::Register(&type);
 	g_armv5FirmwareViewType = &type;
+	RegisterFirmwareViewDestructionCallbacks();
+	BinaryViewType::RegisterBinaryViewInitialAnalysisCompletionEvent(OnFirmwareInitialAnalysisComplete);
 }
 
 
@@ -60,25 +197,41 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView* data, bool parseOnly): BinaryVi
 	m_entryPoint(0),
 	m_endian(LittleEndian),
 	m_addressSize(4),
-	m_postAnalysisScansDone(false)
+	m_postAnalysisScansDone(false),
+	m_seededFunctions(),
+	m_seededUserFunctions(),
+	m_seededDataDefines(),
+	m_seededSymbols(),
+	m_viewId(0)
 {
 	CreateLogger("BinaryView");
 	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-		FirmwareViewMap()[GetObject()] = this;
+		ViewId viewId = GetViewIdFromView(this);
+		m_viewId = viewId;
+		if (!m_parseOnly && viewId != 0)
+		{
+			FirmwareViewClosingSet().erase(viewId);
+			FirmwareViewMap()[viewId] = this;
+			// Track this view's raw pointer so we can identify it in destruction callbacks
+			RealViewPointers().insert(reinterpret_cast<uintptr_t>(GetObject()));
+		}
 	}
 }
 
 
 Armv5FirmwareView::~Armv5FirmwareView()
 {
+	// Do not call BinaryView APIs from the destructor. The core object has already
+	// been released by the time this runs. Cleanup happens via the object
+	// destruction callback registered in InitArmv5FirmwareViewType().
+	if (m_viewId != 0)
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-		auto& map = FirmwareViewMap();
-		auto it = map.find(GetObject());
-		if (it != map.end() && it->second == this)
-			map.erase(it);
+		auto it = FirmwareViewMap().find(m_viewId);
+		if (it != FirmwareViewMap().end() && it->second == this)
+			FirmwareViewMap().erase(it);
 	}
 }
 
@@ -294,13 +447,16 @@ bool Armv5FirmwareView::Init()
 					uint64_t ptrOffset = (i * 4) + 8 + vecOffset;
 					uint64_t ptrAddr = imageBase + ptrOffset;
 
-					// Define as pointer to code using UserDataVariable to prevent
-					// Binary Ninja from treating this area as code
-					Ref<Type> ptrType = Type::PointerType(m_arch, Type::VoidType());
-					DefineUserDataVariable(ptrAddr, ptrType);
+					if (!m_parseOnly)
+					{
+						// Define as pointer to code using UserDataVariable to prevent
+						// Binary Ninja from treating this area as code
+						Ref<Type> ptrType = Type::PointerType(m_arch, Type::VoidType());
+						m_seededDataDefines.push_back({ptrAddr, ptrType, true});
 
-					string ptrName = string(handlerNames[i]) + "_ptr";
-					DefineAutoSymbol(new Symbol(DataSymbol, ptrName, ptrAddr, GlobalBinding));
+						string ptrName = string(handlerNames[i]) + "_ptr";
+						m_seededSymbols.push_back(new Symbol(DataSymbol, ptrName, ptrAddr, GlobalBinding));
+					}
 				}
 			}
 		}
@@ -321,37 +477,38 @@ bool Armv5FirmwareView::Init()
 	if (m_parseOnly)
 		return true;
 
-	// Add vector table entries and handler functions for analysis
-	if (m_plat)
-	{
-		std::set<uint64_t> seededFunctions;
+		// Collect vector table entries and handler functions for analysis
+		if (m_plat)
+		{
+			std::set<uint64_t> seededFunctions;
 
-		// Add vector table entries as functions (they contain LDR PC or B instructions)
+		// Collect vector table entries for analysis (deferred until post-analysis scans)
 		for (int i = 0; i < 8; i++)
 		{
 			uint64_t vectorAddr = imageBase + (i * 4);
-			if (AddFunctionForAnalysis(m_plat, vectorAddr, false))
-				seededFunctions.insert(vectorAddr);
+			seededFunctions.insert(vectorAddr);
 		}
 
-		// Add resolved handler functions
-		for (int i = 0; i < 8; i++)
-		{
-			if (handlerAddrs[i] != 0 && handlerAddrs[i] >= imageBase && handlerAddrs[i] < imageBase + length)
+		// Collect resolved handler functions for analysis (deferred)
+			for (int i = 0; i < 8; i++)
 			{
-				if (AddFunctionForAnalysis(m_plat, handlerAddrs[i], false))
+				if (handlerAddrs[i] != 0 && handlerAddrs[i] >= imageBase && handlerAddrs[i] < imageBase + length)
+				{
 					seededFunctions.insert(handlerAddrs[i]);
-				DefineAutoSymbol(new Symbol(FunctionSymbol, handlerNames[i], handlerAddrs[i], GlobalBinding));
+					m_seededUserFunctions.insert(handlerAddrs[i]);
+					if (!m_parseOnly)
+						m_seededSymbols.push_back(new Symbol(FunctionSymbol, handlerNames[i], handlerAddrs[i], GlobalBinding));
 
-				m_logger->LogDebug("Added handler function: %s at 0x%llx",
+				m_logger->LogDebug("Seeded handler function: %s at 0x%llx",
 					handlerNames[i], (unsigned long long)handlerAddrs[i]);
 			}
 		}
 
-		// Add reset handler as entry point
-		if (m_entryPoint != 0)
+		// Defer entry point function creation to post-analysis scan job
+		if (m_entryPoint != 0 && m_entryPoint >= imageBase && m_entryPoint < imageBase + length)
 		{
-			AddEntryPointForAnalysis(m_plat, m_entryPoint);
+			seededFunctions.insert(m_entryPoint);
+			m_seededUserFunctions.insert(m_entryPoint);
 		}
 
 		// Special handling for IRQ/FIQ handlers that use MMIO vector tables
@@ -391,11 +548,10 @@ bool Armv5FirmwareView::Init()
 						// Verify cleanup address is within the image
 						if (cleanupAddr >= imageBase && cleanupAddr < imageBase + length)
 						{
-							if (AddFunctionForAnalysis(m_plat, cleanupAddr, false))
-								seededFunctions.insert(cleanupAddr);
+							seededFunctions.insert(cleanupAddr);
 
 							const char* cleanupName = (vecIdx == 6) ? "irq_return" : "fiq_return";
-							DefineAutoSymbol(new Symbol(FunctionSymbol, cleanupName, cleanupAddr, GlobalBinding));
+							m_seededSymbols.push_back(new Symbol(FunctionSymbol, cleanupName, cleanupAddr, GlobalBinding));
 
 							m_logger->LogDebug("Added %s cleanup function at 0x%llx",
 								cleanupName, (unsigned long long)cleanupAddr);
@@ -441,12 +597,12 @@ bool Armv5FirmwareView::Init()
 			m_logger->LogInfo("Firmware scans scheduled via module workflow activity");
 		}
 
-		if (!seededFunctions.empty())
-			m_seededFunctions.insert(seededFunctions.begin(), seededFunctions.end());
+	if (!seededFunctions.empty())
+		m_seededFunctions.insert(seededFunctions.begin(), seededFunctions.end());
 
-		// NOTE: Exception handlers are named (irq_handler, fiq_handler, etc.) but we
-		// don't auto-apply the irq-handler calling convention. Users can apply it
-		// manually if needed. This follows the pattern of other architecture plugins.
+	// NOTE: Exception handlers are named (irq_handler, fiq_handler, etc.) but we
+	// don't auto-apply the irq-handler calling convention. Users can apply it
+	// manually if needed. This follows the pattern of other architecture plugins.
 	}
 
 	return true;
@@ -454,187 +610,59 @@ bool Armv5FirmwareView::Init()
 
 void Armv5FirmwareView::RunFirmwareWorkflowScans()
 {
-	if (AnalysisIsAborted())
+	if (!GetObject())
 		return;
-	BNAnalysisState state = GetAnalysisInfo().state;
-	if (state == InitialState || state == HoldState)
-		return;
-	if (m_postAnalysisScansDone)
+	m_logger->LogInfo("Firmware workflow scan: RunFirmwareWorkflowScans invoked");
+	if (m_viewId == 0)
 	{
-		m_logger->LogInfo("Firmware workflow scan: skipped (already done)");
+		m_logger->LogInfo("Firmware workflow scan: skipped (missing view id)");
 		return;
 	}
-	m_postAnalysisScansDone = true;
-
+	if (IsFirmwareViewClosingById(m_viewId))
+	{
+		m_logger->LogInfo("Firmware workflow scan: skipped (view closing)");
+		return;
+	}
 	if (m_parseOnly)
 	{
 		m_logger->LogInfo("Firmware workflow scan: skipped (parse-only view)");
 		return;
 	}
-
-	if (!m_plat || !m_arch)
+	if (!TryBeginWorkflowScans())
 	{
-		m_logger->LogInfo("Firmware workflow scan: skipped (missing platform/arch)");
-		return;
-	}
-	if (AnalysisIsAborted())
-	{
-		m_logger->LogInfo("Firmware workflow scan: skipped (analysis aborted)");
+		m_logger->LogInfo("Firmware workflow scan: skipped (already scheduled)");
 		return;
 	}
 
-	const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
-	if (disableScans && disableScans[0] != '\0')
-		m_logger->LogInfo("Firmware workflow env override: BN_ARMV5_FIRMWARE_DISABLE_SCANS=%s", disableScans);
-	const char* disableActions = getenv("BN_ARMV5_FIRMWARE_DISABLE_ACTIONS");
-	if (disableActions && disableActions[0] != '\0')
-		m_logger->LogInfo("Firmware workflow env override: BN_ARMV5_FIRMWARE_DISABLE_ACTIONS=%s", disableActions);
+	ScheduleArmv5FirmwareScanJob(this);
+}
 
-	m_logger->LogInfo("Firmware workflow scan: start");
+bool Armv5FirmwareView::TryBeginWorkflowScans()
+{
+	if (m_postAnalysisScansDone)
+		return false;
+	m_postAnalysisScansDone = true;
+	return true;
+}
 
-	uint64_t length = GetLength();
-	if (!length)
-		return;
+const std::set<uint64_t>& Armv5FirmwareView::GetSeededFunctions() const
+{
+	return m_seededFunctions;
+}
 
-	/*
-	 * Mirror the firmware scan settings used during Init(), but run them here
-	 * as a workflow activity so we can align with Binary Ninja's analysis pipeline.
-	 */
-	Ref<Settings> settings = GetLoadSettings(GetTypeName());
-	FirmwareSettings fwSettings = LoadFirmwareSettings(settings, this, FirmwareSettingsMode::Workflow);
-	const FirmwareScanTuning& tuning = fwSettings.tuning;
+const std::set<uint64_t>& Armv5FirmwareView::GetSeededUserFunctions() const
+{
+	return m_seededUserFunctions;
+}
 
-	if (fwSettings.skipFirmwareScans)
-	{
-		m_logger->LogInfo("Firmware workflow scan skipped (skipFirmwareScans enabled)");
-		return;
-	}
+const std::vector<FirmwareScanDataDefine>& Armv5FirmwareView::GetSeededDataDefines() const
+{
+	return m_seededDataDefines;
+}
 
-	if (AnalysisIsAborted())
-	{
-		m_logger->LogInfo("Firmware workflow scan skipped (analysis aborted)");
-		return;
-	}
-
-	uint64_t imageBase = GetStart();
-	uint64_t bufferLen = (length < kMaxBufferedLength) ? length : kMaxBufferedLength;
-	DataBuffer fileBuf = GetParentView()->ReadBuffer(0, bufferLen);
-	const uint8_t* fileData = static_cast<const uint8_t*>(fileBuf.GetData());
-	uint64_t fileDataLen = fileBuf.GetLength();
-	if (!fileData || fileDataLen == 0)
-		return;
-
-	BinaryReader reader(GetParentView());
-	reader.SetEndianness(m_endian);
-
-	std::set<uint64_t> seededFunctions = m_seededFunctions;
-
-	auto timePass = [&](const char* label, auto&& fn)
-	{
-		if (!fwSettings.enableVerboseLogging)
-		{
-			fn();
-			return;
-		}
-
-		auto start = std::chrono::steady_clock::now();
-		fn();
-		double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
-			std::chrono::steady_clock::now() - start).count();
-		m_logger->LogInfo("Firmware workflow timing: %s took %.3f s", label, seconds);
-	};
-
-	if (fwSettings.enableLiteralPoolTyping)
-	{
-		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-			m_arch, m_plat, m_logger, fwSettings.enableVerboseLogging, this};
-		timePass("Literal pool typing", [&]()
-		{
-			TypeLiteralPoolEntries(scanCtx);
-		});
-		if (fwSettings.enableClearAutoDataOnCodeRefs)
-		{
-			timePass("Clear auto data on code refs", [&]()
-			{
-				ClearAutoDataOnCodeReferences(scanCtx);
-			});
-		}
-	}
-
-	if (fwSettings.enablePrologueScan)
-	{
-		Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
-		timePass("Function prologue scan", [&]()
-		{
-			ScanForFunctionPrologues(this, fileData, fileDataLen, m_endian, imageBase, length,
-				m_arch, thumbArch, m_plat, m_logger, fwSettings.enableVerboseLogging, tuning, &seededFunctions);
-		});
-	}
-
-	if (fwSettings.enableClearAutoDataOnCodeRefs)
-	{
-		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-			m_arch, m_plat, m_logger, fwSettings.enableVerboseLogging, this};
-		timePass("Clear auto data in function entry blocks", [&]()
-		{
-			ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
-		});
-	}
-
-	if (fwSettings.enableCallTargetScan)
-	{
-		timePass("Call target scan", [&]()
-		{
-			ScanForCallTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-				m_plat, m_logger, fwSettings.enableVerboseLogging, tuning, &seededFunctions);
-		});
-	}
-
-	std::set<uint64_t> addedFunctions;
-	if (fwSettings.enablePointerTargetScan)
-	{
-		timePass("Pointer target scan", [&]()
-		{
-			ScanForPointerTargets(this, fileData, fileDataLen, m_endian, imageBase, length,
-				m_plat, m_logger, fwSettings.enableVerboseLogging, tuning, &addedFunctions);
-		});
-	}
-
-	if (fwSettings.enableOrphanCodeScan)
-	{
-		timePass("Orphan code block scan", [&]()
-		{
-			ScanForOrphanCodeBlocks(this, fileData, fileDataLen, m_endian, imageBase, length,
-				m_plat, m_logger, fwSettings.enableVerboseLogging, tuning, fwSettings.orphanMinValidInstr,
-				fwSettings.orphanMinBodyInstr, fwSettings.orphanMinSpacingBytes, fwSettings.orphanMaxPerPage,
-				fwSettings.orphanRequirePrologue, &addedFunctions);
-		});
-	}
-
-	if (!addedFunctions.empty())
-		seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
-
-	if (fwSettings.enableClearAutoDataOnCodeRefs && !addedFunctions.empty())
-	{
-		FirmwareScanContext scanCtx{reader, fileData, fileDataLen, m_endian, imageBase, length,
-			m_arch, m_plat, m_logger, fwSettings.enableVerboseLogging, this};
-		timePass("Clear auto data in new function entry blocks", [&]()
-		{
-			ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
-		});
-	}
-
-	if (fwSettings.enableInvalidFunctionCleanup)
-	{
-		std::set<uint64_t> protectedStarts = seededFunctions;
-		timePass("Cleanup invalid functions", [&]()
-		{
-			CleanupInvalidFunctions(this, fileData, fileDataLen, m_endian, imageBase, length,
-				m_logger, fwSettings.enableVerboseLogging, tuning, fwSettings.cleanupMaxSizeBytes,
-				fwSettings.cleanupRequireZeroRefs, fwSettings.cleanupRequirePcWriteStart, m_entryPoint, protectedStarts);
-		});
-	}
-	m_logger->LogInfo("Firmware workflow scan: done");
+const std::vector<BinaryNinja::Ref<BinaryNinja::Symbol>>& Armv5FirmwareView::GetSeededSymbols() const
+{
+	return m_seededSymbols;
 }
 
 void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view)
@@ -646,31 +674,103 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view)
 			logger->LogInfo("Firmware workflow scan: no BinaryView");
 		return;
 	}
+	if (!view->GetObject())
+		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
 	{
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: wrong view type %s", view->GetTypeName().c_str());
 		return;
 	}
-	Armv5FirmwareView* firmwareView = nullptr;
-	Ref<BinaryView> viewRef;
-	{
-		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-		auto& map = FirmwareViewMap();
-		auto it = map.find(view->GetObject());
-		if (it != map.end())
-		{
-			firmwareView = it->second;
-			viewRef = firmwareView;
-		}
-	}
-	if (!firmwareView)
+	if (IsFirmwareViewClosing(view.GetPtr()))
 	{
 		if (logger)
-			logger->LogInfo("Firmware workflow scan: view map lookup failed");
+			logger->LogInfo("Firmware workflow scan: skipped (view closing)");
 		return;
 	}
+	Armv5FirmwareView* firmwareView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
+	if (!firmwareView)
+	{
+		auto file = view->GetFile();
+		if (file)
+		{
+			ViewId viewId = file->GetSessionId();
+			std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+			auto it = FirmwareViewMap().find(viewId);
+			if (it != FirmwareViewMap().end())
+				firmwareView = it->second;
+		}
+		if (!firmwareView)
+		{
+			if (logger)
+				logger->LogInfo("Firmware workflow scan: view lookup failed");
+			return;
+		}
+	}
 	firmwareView->RunFirmwareWorkflowScans();
+}
+
+bool BinaryNinja::IsFirmwareViewClosing(const BinaryView* view)
+{
+	if (!view)
+		return true;
+	if (!view->GetObject())
+		return true;
+	ViewId viewId = GetViewIdFromView(view);
+	if (viewId == 0)
+		return true;
+	return IsFirmwareViewClosingById(viewId);
+}
+
+bool BinaryNinja::IsFirmwareViewClosingById(uint64_t viewId)
+{
+	if (viewId == 0)
+		return true;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto& closing = FirmwareViewClosingSet();
+	return closing.find(viewId) != closing.end();
+}
+
+bool BinaryNinja::IsFirmwareViewScanCancelled(const BinaryView* view)
+{
+	if (!view)
+		return true;
+	ViewId viewId = GetViewIdFromView(view);
+	if (viewId == 0)
+		return true;
+	return IsFirmwareViewScanCancelledById(viewId);
+}
+
+bool BinaryNinja::IsFirmwareViewScanCancelledById(uint64_t viewId)
+{
+	if (viewId == 0)
+		return true;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto& cancelled = FirmwareViewScanCancelSet();
+	return cancelled.find(viewId) != cancelled.end();
+}
+
+void BinaryNinja::SetFirmwareViewScanCancelled(uint64_t viewId, bool cancelled)
+{
+	if (viewId == 0)
+		return;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto& set = FirmwareViewScanCancelSet();
+	if (cancelled)
+		set.insert(viewId);
+	else
+		set.erase(viewId);
+}
+
+Armv5FirmwareView* BinaryNinja::GetFirmwareViewForSessionId(uint64_t viewId)
+{
+	if (viewId == 0)
+		return nullptr;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto it = FirmwareViewMap().find(viewId);
+	if (it == FirmwareViewMap().end())
+		return nullptr;
+	return it->second;
 }
 
 

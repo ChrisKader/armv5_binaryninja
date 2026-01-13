@@ -1536,7 +1536,22 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
         ExprId product = il.MultDoublePrecUnsigned(4,
                                                    ReadRegisterOrPointer(il, op3, addr),
                                                    ReadRegisterOrPointer(il, op4, addr));
-        ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), product, instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE));
+        if (instr.setsFlags)
+        {
+            ConditionExecuteBlockSized(4, instr.cond, instr, il,
+                                       [&](size_t, Instruction &, LowLevelILFunction &il)
+                                       {
+                                           il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0), product));
+                                           ExprId temp = il.Register(8, LLIL_TEMP(0));
+                                           il.AddInstruction(il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), temp));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_N, il.And(8, il.LogicalShiftRight(8, temp, il.Const(1, 63)), il.Const(8, 1))));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_Z, il.CompareEqual(8, temp, il.Const(8, 0))));
+                                       });
+        }
+        else
+        {
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), product));
+        }
         break;
     }
 
@@ -1553,7 +1568,23 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
                                                    ReadRegisterOrPointer(il, op3, addr),
                                                    ReadRegisterOrPointer(il, op4, addr));
         ExprId acc = il.RegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg));
-        ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), il.Add(8, product, acc), instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE));
+        ExprId result = il.Add(8, product, acc);
+        if (instr.setsFlags)
+        {
+            ConditionExecuteBlockSized(4, instr.cond, instr, il,
+                                       [&](size_t, Instruction &, LowLevelILFunction &il)
+                                       {
+                                           il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0), result));
+                                           ExprId temp = il.Register(8, LLIL_TEMP(0));
+                                           il.AddInstruction(il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), temp));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_N, il.And(8, il.LogicalShiftRight(8, temp, il.Const(1, 63)), il.Const(8, 1))));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_Z, il.CompareEqual(8, temp, il.Const(8, 0))));
+                                       });
+        }
+        else
+        {
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), result));
+        }
         break;
     }
 
@@ -1569,7 +1600,22 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
         ExprId product = il.MultDoublePrecSigned(4,
                                                  ReadRegisterOrPointer(il, op3, addr),
                                                  ReadRegisterOrPointer(il, op4, addr));
-        ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), product, instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE));
+        if (instr.setsFlags)
+        {
+            ConditionExecuteBlockSized(4, instr.cond, instr, il,
+                                       [&](size_t, Instruction &, LowLevelILFunction &il)
+                                       {
+                                           il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0), product));
+                                           ExprId temp = il.Register(8, LLIL_TEMP(0));
+                                           il.AddInstruction(il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), temp));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_N, il.And(8, il.LogicalShiftRight(8, temp, il.Const(1, 63)), il.Const(8, 1))));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_Z, il.CompareEqual(8, temp, il.Const(8, 0))));
+                                       });
+        }
+        else
+        {
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), product));
+        }
         break;
     }
 
@@ -1585,7 +1631,23 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
                                                  ReadRegisterOrPointer(il, op3, addr),
                                                  ReadRegisterOrPointer(il, op4, addr));
         ExprId acc = il.RegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg));
-        ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), il.Add(8, product, acc), instr.setsFlags ? IL_FLAGWRITE_NZ : IL_FLAGWRITE_NONE));
+        ExprId result = il.Add(8, product, acc);
+        if (instr.setsFlags)
+        {
+            ConditionExecuteBlockSized(4, instr.cond, instr, il,
+                                       [&](size_t, Instruction &, LowLevelILFunction &il)
+                                       {
+                                           il.AddInstruction(il.SetRegister(8, LLIL_TEMP(0), result));
+                                           ExprId temp = il.Register(8, LLIL_TEMP(0));
+                                           il.AddInstruction(il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), temp));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_N, il.And(8, il.LogicalShiftRight(8, temp, il.Const(1, 63)), il.Const(8, 1))));
+                                           il.AddInstruction(il.SetFlag(IL_FLAG_Z, il.CompareEqual(8, temp, il.Const(8, 0))));
+                                       });
+        }
+        else
+        {
+            ConditionExecute(il, instr.cond, il.SetRegisterSplit(4, RegisterToIndex(op2.reg), RegisterToIndex(op1.reg), result));
+        }
         break;
     }
 

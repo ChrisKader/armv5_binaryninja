@@ -3,6 +3,7 @@
  */
 
 #include "firmware_internal.h"
+#include "firmware_view.h"
 
 #include <algorithm>
 #include <cctype>
@@ -35,7 +36,7 @@ static void LogFirmwareActionSkip(Logger* logger, const char* action, uint64_t a
 {
 	if (!logger)
 		return;
-	logger->LogDebug("Firmware workflow: skip %s at 0x%llx (%s)",
+	logger->LogWarn("Firmware workflow: skip %s at 0x%llx (%s)",
 		action, (unsigned long long)addr, reason);
 }
 
@@ -48,6 +49,22 @@ static bool EnsureAddressInsideView(const BinaryView* view, Logger* logger,
 	return false;
 }
 
+static inline bool ScanShouldAbort(const BinaryView* view)
+{
+	if (BNIsShutdownRequested())
+		return true;
+	if (!view)
+		return true;
+	if (IsFirmwareViewClosing(view))
+		return true;
+	if (IsFirmwareViewScanCancelled(view))
+		return true;
+	// Note: AnalysisIsAborted() is checked at phase boundaries in ShouldCancel(),
+	// not here. Checking it here causes all scans to abort when maxFunctionUpdateCount
+	// is hit for a single function, which is too aggressive.
+	return false;
+}
+
 struct FirmwareActionPolicy
 {
 	bool allowAddFunction = true;
@@ -56,6 +73,36 @@ struct FirmwareActionPolicy
 	bool allowDefineSymbol = true;
 	bool allowRemoveFunction = true;
 };
+
+static inline void PlanAddFunction(FirmwareScanPlan* plan, uint64_t addr)
+{
+	if (plan)
+		plan->addFunctions.push_back(addr);
+}
+
+static inline void PlanRemoveFunction(FirmwareScanPlan* plan, uint64_t addr)
+{
+	if (plan)
+		plan->removeFunctions.push_back(addr);
+}
+
+static inline void PlanDefineData(FirmwareScanPlan* plan, uint64_t addr, const Ref<Type>& type)
+{
+	if (plan)
+		plan->defineData.push_back({addr, type});
+}
+
+static inline void PlanUndefineData(FirmwareScanPlan* plan, uint64_t addr)
+{
+	if (plan)
+		plan->undefineData.push_back(addr);
+}
+
+static inline void PlanDefineSymbol(FirmwareScanPlan* plan, const Ref<Symbol>& symbol)
+{
+	if (plan)
+		plan->defineSymbols.push_back(symbol);
+}
 
 static FirmwareActionPolicy ParseFirmwareActionPolicy()
 {
@@ -323,6 +370,8 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 	BNEndianness endian, uint64_t imageBase, uint64_t length, uint64_t addr,
 	const FirmwareScanTuning& tuning, bool requireBodyInstr, bool allowPcWriteStart)
 {
+	if (ScanShouldAbort(view))
+		return false;
 	uint64_t imageEnd = imageBase + length;
 	if (addr < imageBase || addr + 4 > imageEnd)
 		return false;
@@ -364,6 +413,8 @@ static bool ValidateFirmwareFunctionCandidate(BinaryView* view, const uint8_t* d
 
 	for (uint32_t i = 0; i < window; i++)
 	{
+		if (ScanShouldAbort(view))
+			return false;
 		uint64_t curOff = offset + (uint64_t)i * 4;
 		if (curOff + 4 > dataLen)
 			return false;
@@ -563,7 +614,7 @@ static bool LooksLikeReturnThunk(const uint8_t* data, uint64_t dataLen, BNEndian
 size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Architecture> armArch, Ref<Architecture> thumbArch, Ref<Platform> plat, Ref<Logger> logger,
-	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions)
+	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t prologuesFound = 0;
 	size_t totalWords = 0;
@@ -575,7 +626,7 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	size_t skippedInvalidCandidate = 0;
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
-		Logger* log = logger ? logger.GetPtr() : nullptr;
+	Logger* log = logger ? logger.GetPtr() : nullptr;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 
 	// Minimum offset to start scanning (skip vector table area)
@@ -586,9 +637,44 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
+	std::vector<uint64_t> pendingAdds;
+	pendingAdds.reserve(256);
+	const size_t addBatchSize = 256;
+
+	auto flushAdds = [&]()
+	{
+		if (pendingAdds.empty())
+			return;
+		for (uint64_t addr : pendingAdds)
+		{
+			if (ScanShouldAbort(view))
+				break;
+			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!actionPolicy.allowAddFunction)
+				continue;
+			if (plan)
+			{
+				PlanAddFunction(plan, addr);
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+				continue;
+			}
+			if (view->AddFunctionForAnalysis(plat, addr, true))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+			}
+		}
+		pendingAdds.clear();
+	};
 
 	// Helper to add a function if not already added
 	auto addFunction = [&](uint64_t funcAddr, bool requireBodyInstr) {
+		if (ScanShouldAbort(view))
+			return;
 		if (addedAddrs.find(funcAddr) == addedAddrs.end())
 		{
 			if (!view->GetAnalysisFunctionsContainingAddress(funcAddr).empty())
@@ -602,20 +688,17 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 				skippedInvalidCandidate++;
 				return;
 			}
-			if (EnsureAddressInsideView(view, log, "AddFunction", funcAddr) &&
-				actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, funcAddr, true))
-			{
-				if (seededFunctions)
-					seededFunctions->insert(funcAddr);
-				addedCount++;
-			}
 			addedAddrs.insert(funcAddr);
+			pendingAdds.push_back(funcAddr);
+			if (pendingAdds.size() >= addBatchSize)
+				flushAdds();
 			prologuesFound++;
 		}
 	};
 
-	logger->LogInfo("Prologue scan: Scanning for function prologues in %llu bytes",
-		(unsigned long long)(length - startOffset));
+	if (logger)
+		logger->LogInfo("Prologue scan: Scanning for function prologues in %llu bytes",
+			(unsigned long long)(length - startOffset));
 
 	// Track the previous instruction for boundary-based patterns
 	uint32_t prevInstr = 0;
@@ -624,6 +707,8 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	// Scan for ARM prologues (4-byte aligned)
 	for (uint64_t offset = startOffset; offset + 4 <= scanLen; offset += 4)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		totalWords++;
 		uint64_t instrAddr = imageBase + offset;
 		if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(instrAddr))
@@ -842,15 +927,19 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 	//
 	// Thumb functions will still be discovered via BX/BLX calls from ARM code
 	// that set the Thumb bit in the target address.
+	if (!ScanShouldAbort(view))
+		flushAdds();
 
-	logger->LogInfo("Prologue scan: Found %zu function prologues", prologuesFound);
+	if (logger)
+		logger->LogInfo("Prologue scan: Found %zu function prologues", prologuesFound);
 	if (verboseLog)
 	{
-		logger->LogInfo(
-			"Prologue scan detail: scanned=%zu code=%zu prologue_hits=%zu added=%zu skipped_existing=%zu "
-			"skipped_noncode=%zu skipped_invalid_candidate=%zu",
-			totalWords, codeWords, prologueHits, addedCount, skippedExisting, skippedNonCode,
-			skippedInvalidCandidate);
+		if (logger)
+			logger->LogInfo(
+				"Prologue scan detail: scanned=%zu code=%zu prologue_hits=%zu added=%zu skipped_existing=%zu "
+				"skipped_noncode=%zu skipped_invalid_candidate=%zu",
+				totalWords, codeWords, prologueHits, addedCount, skippedExisting, skippedNonCode,
+				skippedInvalidCandidate);
 	}
 	return prologuesFound;
 }
@@ -887,7 +976,7 @@ size_t ScanForFunctionPrologues(BinaryView* view, const uint8_t* data,
 size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
-	std::set<uint64_t>* seededFunctions)
+	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t targetsFound = 0;
 	uint64_t scanLen = (dataLen < length) ? dataLen : length;
@@ -918,10 +1007,45 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
-		Logger* log = logger ? logger.GetPtr() : nullptr;
+	Logger* log = logger ? logger.GetPtr() : nullptr;
+	std::vector<uint64_t> pendingAdds;
+	pendingAdds.reserve(256);
+	const size_t addBatchSize = 256;
+
+	auto flushAdds = [&]()
+	{
+		if (pendingAdds.empty())
+			return;
+		for (uint64_t addr : pendingAdds)
+		{
+			if (ScanShouldAbort(view))
+				break;
+			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!actionPolicy.allowAddFunction)
+				continue;
+			if (plan)
+			{
+				PlanAddFunction(plan, addr);
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+				continue;
+			}
+			if (view->AddFunctionForAnalysis(plat, addr, true))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+			}
+		}
+		pendingAdds.clear();
+	};
 
 	// Helper to add a function if not already added and target is valid
 	auto addFunction = [&](uint64_t funcAddr, const char* source, bool requireBoundary) {
+		if (ScanShouldAbort(view))
+			return;
 		// For ARM mode, addresses must be 4-byte aligned.
 		// Strip any Thumb bit and reject misaligned addresses.
 		uint64_t alignedAddr = funcAddr & ~3ULL;
@@ -1026,14 +1150,10 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 
 		if (addedAddrs.find(alignedAddr) == addedAddrs.end())
 		{
-			if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
-				actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
-			{
-				if (seededFunctions)
-					seededFunctions->insert(alignedAddr);
-				addedCount++;
-			}
 			addedAddrs.insert(alignedAddr);
+			pendingAdds.push_back(alignedAddr);
+			if (pendingAdds.size() >= addBatchSize)
+				flushAdds();
 			targetsFound++;
 		}
 		else
@@ -1078,6 +1198,8 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 	// Scan for ARM call instructions (4-byte aligned)
 	for (uint64_t offset = startOffset; offset + 4 <= scanLen; offset += 4)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		totalInstrs++;
 		uint32_t instr = 0;
 		if (offset + 4 <= dataLen)
@@ -1224,24 +1346,29 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 			}
 		}
 
-		// Remember this instruction for next iteration
-		prevInstr = instr;
-	}
+	// Remember this instruction for next iteration
+	prevInstr = instr;
+}
 
-	logger->LogInfo("Call target scan: Found %zu call targets", targetsFound);
+	if (!ScanShouldAbort(view))
+		flushAdds();
+
+	if (logger)
+		logger->LogInfo("Call target scan: Found %zu call targets", targetsFound);
 	if (verboseLog)
 	{
-		logger->LogInfo(
-			"Call target scan detail: scanned=%zu code=%zu in_func=%zu non_func=%zu bl=%zu ldr_pc=%zu added=%zu "
-			"skip_noncode=%zu skip_not_in_func=%zu skip_prev_not_code=%zu skip_misaligned=%zu "
-			"skip_oob=%zu skip_noncode_target=%zu skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_ldr_pc_in_func=%zu "
-			"skip_bl_intra_func=%zu skip_bl_nonfunc_boundary=%zu "
-			"skip_invalid_target=%zu skip_duplicate=%zu skip_invalid_candidate=%zu",
-			totalInstrs, codeInstrs, inFunctionInstrs, nonFunctionInstrs, blMatches, ldrMatches, addedCount,
-			skippedNonCode, skippedNotInFunction, skippedPrevNotCode, skipMisaligned,
-			skipOutOfBounds, skipNonCodeTarget, skipNonBoundary, skipExistingTarget, skipReturnThunk, skipLdrPcInFunction,
-			skipBlIntraFunction, skipBlNonFuncBoundary,
-			skipInvalidTarget, skipDuplicate, skipInvalidCandidate);
+		if (logger)
+			logger->LogInfo(
+				"Call target scan detail: scanned=%zu code=%zu in_func=%zu non_func=%zu bl=%zu ldr_pc=%zu added=%zu "
+				"skip_noncode=%zu skip_not_in_func=%zu skip_prev_not_code=%zu skip_misaligned=%zu "
+				"skip_oob=%zu skip_noncode_target=%zu skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_ldr_pc_in_func=%zu "
+				"skip_bl_intra_func=%zu skip_bl_nonfunc_boundary=%zu "
+				"skip_invalid_target=%zu skip_duplicate=%zu skip_invalid_candidate=%zu",
+				totalInstrs, codeInstrs, inFunctionInstrs, nonFunctionInstrs, blMatches, ldrMatches, addedCount,
+				skippedNonCode, skippedNotInFunction, skippedPrevNotCode, skipMisaligned,
+				skipOutOfBounds, skipNonCodeTarget, skipNonBoundary, skipExistingTarget, skipReturnThunk, skipLdrPcInFunction,
+				skipBlIntraFunction, skipBlNonFuncBoundary,
+				skipInvalidTarget, skipDuplicate, skipInvalidCandidate);
 	}
 	return targetsFound;
 }
@@ -1257,7 +1384,7 @@ size_t ScanForCallTargets(BinaryView* view, const uint8_t* data,
 size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
-	std::set<uint64_t>* seededFunctions)
+	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t targetsFound = 0;
 	std::set<uint64_t> addedAddrs;
@@ -1290,9 +1417,47 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	uint8_t minHigh = (uint8_t)(imageBase >> 24);
 	uint8_t maxHigh = (uint8_t)((imageEnd - 1) >> 24);
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
-		Logger* log = logger ? logger.GetPtr() : nullptr;
+	Logger* log = logger ? logger.GetPtr() : nullptr;
+	std::vector<uint64_t> pendingAdds;
+	pendingAdds.reserve(256);
+	const size_t addBatchSize = 256;
+
+	auto flushAdds = [&]()
+	{
+		if (pendingAdds.empty())
+			return;
+		for (uint64_t addr : pendingAdds)
+		{
+			if (ScanShouldAbort(view))
+				break;
+			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!actionPolicy.allowAddFunction)
+				continue;
+			if (plan)
+			{
+				PlanAddFunction(plan, addr);
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+				continue;
+			}
+			if (view->AddFunctionForAnalysis(plat, addr, true))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+			}
+		}
+		pendingAdds.clear();
+	};
+
+	if (ScanShouldAbort(view))
+		return 0;
 
 	auto addFunction = [&](uint64_t funcAddr) {
+		if (ScanShouldAbort(view))
+			return;
 		uint64_t alignedAddr = funcAddr & ~3ULL;
 		if (funcAddr & 3)
 		{
@@ -1334,18 +1499,16 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 		}
 		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
 			return;
-		if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
-			actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
-		{
-			if (seededFunctions)
-				seededFunctions->insert(alignedAddr);
-			addedCount++;
-		}
 		addedAddrs.insert(alignedAddr);
+		pendingAdds.push_back(alignedAddr);
+		if (pendingAdds.size() >= addBatchSize)
+			flushAdds();
 		targetsFound++;
 	};
 
 	auto isValidTarget = [&](uint64_t targetAddr, bool countInvalid) -> bool {
+		if (ScanShouldAbort(view))
+			return false;
 		if (targetAddr < imageBase || targetAddr + 4 > imageEnd)
 			return false;
 		uint64_t targetOffset = targetAddr - imageBase;
@@ -1414,6 +1577,8 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 	auto dataVars = view->GetDataVariables();
 	for (const auto& entry : dataVars)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		dataVarCount++;
 		uint64_t locationAddr = entry.first;
 		const DataVariable& dataVar = entry.second;
@@ -1488,6 +1653,8 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 
 		auto finalizeRun = [&](uint64_t startOffset, uint32_t count)
 		{
+			if (ScanShouldAbort(view))
+				return;
 			if (count < tuning.minPointerRun)
 				return;
 			rawRunsFound++;
@@ -1536,7 +1703,14 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 				if (actionPolicy.allowDefineData &&
 					EnsureAddressInsideView(view, log, "DefineDataVariable", tableAddr))
 				{
-					view->DefineDataVariable(tableAddr, tableType);
+					if (plan)
+					{
+						PlanDefineData(plan, tableAddr, tableType);
+					}
+					else
+					{
+						view->DefineDataVariable(tableAddr, tableType);
+					}
 				}
 			}
 
@@ -1571,6 +1745,8 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 
 		for (uint64_t offset = scanStart; offset + 4 <= dataLen; offset += 4)
 		{
+			if (ScanShouldAbort(view))
+				break;
 			rawWordScanned++;
 			uint64_t addr = imageBase + offset;
 			if (!view->GetAnalysisFunctionsContainingAddress(addr).empty())
@@ -1626,25 +1802,30 @@ size_t ScanForPointerTargets(BinaryView* view, const uint8_t* data,
 			runLen++;
 		}
 
-		if (runLen > 0)
-			finalizeRun(runStartOffset, runLen);
+	if (runLen > 0)
+		finalizeRun(runStartOffset, runLen);
 	}
 
-	logger->LogInfo("Pointer target scan: Found %zu pointer targets", targetsFound);
+	if (!ScanShouldAbort(view))
+		flushAdds();
+
+	if (logger)
+		logger->LogInfo("Pointer target scan: Found %zu pointer targets", targetsFound);
 	if (verboseLog)
 	{
-		logger->LogInfo(
-			"Pointer target scan detail: data_vars=%zu code_ref_vars=%zu pointer_typed=%zu added=%zu "
-			"skip_not_pointer_type=%zu skip_misaligned=%zu skip_oob=%zu skip_noncode_target=%zu "
-			"skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_invalid_target=%zu skip_invalid_candidate=%zu "
-			"skip_jump_table_refs=%zu raw_words=%zu raw_runs=%zu raw_runs_with_refs=%zu raw_runs_no_refs=%zu "
-			"raw_runs_allowed_no_refs=%zu raw_added=%zu raw_skip_in_func=%zu raw_skip_invalid_target=%zu "
-			"raw_skip_jump_table_refs=%zu",
-			dataVarCount, withCodeRefs, pointerTyped, addedCount,
-			skipNotPointerType, skipMisaligned, skipOutOfBounds, skipNonCodeTarget,
-			skipNonBoundary, skipExistingTarget, skipReturnThunk, skipInvalidTarget, skipInvalidCandidate, skipJumpTableRefs,
-			rawWordScanned, rawRunsFound, rawRunsWithRefs, rawRunsNoRefs, rawRunsAllowedNoRefs, rawAddedCount,
-			rawSkipInFunction, rawSkipInvalidTarget, rawSkipJumpTableRefs);
+		if (logger)
+			logger->LogInfo(
+				"Pointer target scan detail: data_vars=%zu code_ref_vars=%zu pointer_typed=%zu added=%zu "
+				"skip_not_pointer_type=%zu skip_misaligned=%zu skip_oob=%zu skip_noncode_target=%zu "
+				"skip_non_boundary=%zu skip_existing=%zu skip_return_thunk=%zu skip_invalid_target=%zu skip_invalid_candidate=%zu "
+				"skip_jump_table_refs=%zu raw_words=%zu raw_runs=%zu raw_runs_with_refs=%zu raw_runs_no_refs=%zu "
+				"raw_runs_allowed_no_refs=%zu raw_added=%zu raw_skip_in_func=%zu raw_skip_invalid_target=%zu "
+				"raw_skip_jump_table_refs=%zu",
+				dataVarCount, withCodeRefs, pointerTyped, addedCount,
+				skipNotPointerType, skipMisaligned, skipOutOfBounds, skipNonCodeTarget,
+				skipNonBoundary, skipExistingTarget, skipReturnThunk, skipInvalidTarget, skipInvalidCandidate, skipJumpTableRefs,
+				rawWordScanned, rawRunsFound, rawRunsWithRefs, rawRunsNoRefs, rawRunsAllowedNoRefs, rawAddedCount,
+				rawSkipInFunction, rawSkipInvalidTarget, rawSkipJumpTableRefs);
 	}
 	return targetsFound;
 }
@@ -1664,7 +1845,7 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
 	uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes, uint32_t maxPerPage,
 	bool requirePrologue,
-	std::set<uint64_t>* seededFunctions)
+	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t orphansFound = 0;
 	size_t blocksScanned = 0;
@@ -1684,7 +1865,43 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 	uint64_t lastAddedAddr = 0;
 	std::unordered_map<uint64_t, uint32_t> pageCounts;
-		Logger* log = logger ? logger.GetPtr() : nullptr;
+	Logger* log = logger ? logger.GetPtr() : nullptr;
+	std::vector<uint64_t> pendingAdds;
+	pendingAdds.reserve(256);
+	const size_t addBatchSize = 256;
+
+	auto flushAdds = [&]()
+	{
+		if (pendingAdds.empty())
+			return;
+		for (uint64_t addr : pendingAdds)
+		{
+			if (ScanShouldAbort(view))
+				break;
+			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!actionPolicy.allowAddFunction)
+				continue;
+			if (plan)
+			{
+				PlanAddFunction(plan, addr);
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+				continue;
+			}
+			if (view->AddFunctionForAnalysis(plat, addr, true))
+			{
+				if (seededFunctions)
+					seededFunctions->insert(addr);
+				addedCount++;
+			}
+		}
+		pendingAdds.clear();
+	};
+
+	if (ScanShouldAbort(view))
+		return 0;
 
 	auto isStrongPrologue = [&](uint32_t instr) -> bool {
 		uint32_t cond = (instr >> 28) & 0xF;
@@ -1714,6 +1931,8 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 	};
 
 	auto addFunction = [&](uint64_t funcAddr) {
+		if (ScanShouldAbort(view))
+			return;
 		uint64_t alignedAddr = funcAddr & ~3ULL;
 		if (alignedAddr < imageBase || alignedAddr >= imageBase + length)
 			return;
@@ -1742,47 +1961,80 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 		}
 		if (addedAddrs.find(alignedAddr) != addedAddrs.end())
 			return;
-		if (EnsureAddressInsideView(view, log, "AddFunction", alignedAddr) &&
-			actionPolicy.allowAddFunction && view->AddFunctionForAnalysis(plat, alignedAddr, true))
-		{
-			if (seededFunctions)
-				seededFunctions->insert(alignedAddr);
-			addedCount++;
-			lastAddedAddr = alignedAddr;
-			pageCounts[alignedAddr & ~0xFFFULL]++;
-		}
 		addedAddrs.insert(alignedAddr);
+		pendingAdds.push_back(alignedAddr);
+		lastAddedAddr = alignedAddr;
+		pageCounts[alignedAddr & ~0xFFFULL]++;
+		if (pendingAdds.size() >= addBatchSize)
+			flushAdds();
 		orphansFound++;
 	};
 
 	// Collect all basic blocks from the view
 	auto allFuncs = view->GetAnalysisFunctionList();
-	std::set<uint64_t> coveredRanges;
+	struct AddressRange
+	{
+		uint64_t start;
+		uint64_t end;
+	};
+	std::vector<AddressRange> coveredRanges;
+	coveredRanges.reserve(allFuncs.size());
 
 	// Build a set of all addresses covered by existing functions
 	for (const auto& func : allFuncs)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		if (!func)
 			continue;
 		uint64_t funcStart = func->GetStart();
 		uint64_t funcEnd = func->GetHighestAddress();
-		// Mark entire function range as covered
-		for (uint64_t addr = funcStart; addr <= funcEnd; addr += 4)
-		{
-			coveredRanges.insert(addr);
-		}
+		if (funcEnd < funcStart)
+			continue;
+		coveredRanges.push_back({funcStart, funcEnd});
 	}
 
+	std::sort(coveredRanges.begin(), coveredRanges.end(),
+		[](const AddressRange& a, const AddressRange& b) {
+			return a.start < b.start;
+		});
+	size_t mergedCount = 0;
+	for (const auto& range : coveredRanges)
+	{
+		if (mergedCount == 0)
+		{
+			coveredRanges[mergedCount++] = range;
+			continue;
+		}
+		AddressRange& last = coveredRanges[mergedCount - 1];
+		if (range.start <= last.end + 4)
+		{
+			if (range.end > last.end)
+				last.end = range.end;
+		}
+		else
+		{
+			coveredRanges[mergedCount++] = range;
+		}
+	}
+	coveredRanges.resize(mergedCount);
+
 	// Scan for orphaned 4-byte aligned code in code semantics regions
-	logger->LogInfo("Orphan code scan: Scanning for unreachable functions in %llu bytes",
-		(unsigned long long)(length));
+	if (logger)
+		logger->LogInfo("Orphan code scan: Scanning for unreachable functions in %llu bytes",
+			(unsigned long long)(length));
+	size_t rangeIndex = 0;
 
 	for (uint64_t offset = 0; offset + 4 <= length; offset += 4)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		uint64_t instrAddr = imageBase + offset;
 
 		// Skip if already covered by a function
-		if (coveredRanges.find(instrAddr) != coveredRanges.end())
+		while (rangeIndex < coveredRanges.size() && instrAddr > coveredRanges[rangeIndex].end)
+			rangeIndex++;
+		if (rangeIndex < coveredRanges.size() && instrAddr >= coveredRanges[rangeIndex].start)
 			continue;
 
 		// Skip if not in code semantics
@@ -1861,18 +2113,23 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 		addFunction(instrAddr);
 	}
 
-	logger->LogInfo("Orphan code scan: Found %zu orphaned functions", orphansFound);
+	if (!ScanShouldAbort(view))
+		flushAdds();
+
+	if (logger)
+		logger->LogInfo("Orphan code scan: Found %zu orphaned functions", orphansFound);
 	if (verboseLog)
 	{
-		logger->LogInfo(
-			"Orphan code scan detail: scanned=%zu candidates=%zu added=%zu "
-			"skip_existing=%zu skip_invalid_candidate=%zu skip_protected=%zu "
-			"skip_non_boundary_or_prologue=%zu skip_spacing=%zu skip_page_cap=%zu "
-			"skip_padding_run=%zu skip_no_prologue=%zu",
-			blocksScanned, orphanCandidates, addedCount,
-			skipExisting, skipInvalidCandidate, skipProtected,
-			skipNonBoundaryOrPrologue, skipSpacing, skipPageCap,
-			skipPaddingRun, skipNoPrologue);
+		if (logger)
+			logger->LogInfo(
+				"Orphan code scan detail: scanned=%zu candidates=%zu added=%zu "
+				"skip_existing=%zu skip_invalid_candidate=%zu skip_protected=%zu "
+				"skip_non_boundary_or_prologue=%zu skip_spacing=%zu skip_page_cap=%zu "
+				"skip_padding_run=%zu skip_no_prologue=%zu",
+				blocksScanned, orphanCandidates, addedCount,
+				skipExisting, skipInvalidCandidate, skipProtected,
+				skipNonBoundaryOrPrologue, skipSpacing, skipPageCap,
+				skipPaddingRun, skipNoPrologue);
 	}
 	return orphansFound;
 }
@@ -1880,8 +2137,12 @@ size_t ScanForOrphanCodeBlocks(BinaryView* view, const uint8_t* data,
 size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t imageBase, uint64_t length, Ref<Logger> logger, bool verboseLog,
 	const FirmwareScanTuning& tuning, uint32_t maxSizeBytes, bool requireZeroRefs,
-	bool requirePcWriteStart, uint64_t entryPoint, const std::set<uint64_t>& protectedStarts)
+	bool requirePcWriteStart, uint64_t entryPoint, const std::set<uint64_t>& protectedStarts,
+	FirmwareScanPlan* plan)
 {
+	if (ScanShouldAbort(view))
+		return 0;
+
 	size_t scanned = 0;
 	size_t candidates = 0;
 	size_t removed = 0;
@@ -1894,14 +2155,17 @@ size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t d
 	size_t skipNoData = 0;
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
+	Ref<Platform> defaultPlat = view->GetDefaultPlatform();
 	FirmwareScanTuning cleanupTuning = tuning;
 	cleanupTuning.minValidInstr = 1;
 	cleanupTuning.minBodyInstr = 0;
 
-	std::vector<Ref<Function>> toRemove;
+	std::vector<uint64_t> toRemove;
 	auto funcs = view->GetAnalysisFunctionList();
 	for (const auto& func : funcs)
 	{
+		if (ScanShouldAbort(view))
+			break;
 		scanned++;
 		if (!func || !func->WasAutomaticallyDiscovered())
 		{
@@ -1973,27 +2237,46 @@ size_t CleanupInvalidFunctions(BinaryView* view, const uint8_t* data, uint64_t d
 			continue;
 		}
 
-		toRemove.push_back(func);
+		toRemove.push_back(start);
 	}
 
-	for (const auto& func : toRemove)
+	for (uint64_t start : toRemove)
 	{
-		if (actionPolicy.allowRemoveFunction)
+		if (ScanShouldAbort(view))
+			break;
+		if (!actionPolicy.allowRemoveFunction)
+			continue;
+		if (plan)
+		{
+			PlanRemoveFunction(plan, start);
+			removed++;
+			continue;
+		}
+		Ref<Function> func = view->GetAnalysisFunction(defaultPlat.GetPtr(), start);
+		if (!func)
+		{
+			auto funcs = view->GetAnalysisFunctionsContainingAddress(start);
+			if (!funcs.empty())
+				func = funcs.front();
+		}
+		if (func)
 		{
 			view->RemoveAnalysisFunction(func, true);
 			removed++;
 		}
 	}
 
-	logger->LogInfo("Cleanup invalid functions: removed=%zu candidates=%zu scanned=%zu",
-		removed, candidates, scanned);
+	if (logger)
+		logger->LogInfo("Cleanup invalid functions: removed=%zu candidates=%zu scanned=%zu",
+			removed, candidates, scanned);
 	if (verboseLog)
 	{
-		logger->LogInfo(
-			"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
-			"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu",
-			skipUser, skipProtected, skipTooLarge, skipHasRefs,
-			skipNonPcWrite, skipValid, skipNoData);
+		if (logger)
+			logger->LogInfo(
+				"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
+				"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu",
+				skipUser, skipProtected, skipTooLarge, skipHasRefs,
+				skipNonPcWrite, skipValid, skipNoData);
 	}
 
 	return removed;
@@ -2029,9 +2312,12 @@ static bool IsLikelyMMIOPointer(uint32_t value, uint64_t imageBase, uint64_t ima
 // This keeps literal pools from being interpreted as code and improves display
 void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 {
-	ctx.logger->LogDebug("Typing literal pool entries...");
+	if (ctx.logger)
+		ctx.logger->LogDebug("Typing literal pool entries...");
 
-		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	if (ScanShouldAbort(ctx.view))
+		return;
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
 	Ref<Type> ptrType = Type::PointerType(ctx.arch, Type::VoidType());
@@ -2045,6 +2331,8 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
+		if (ScanShouldAbort(ctx.view))
+			break;
 		uint32_t instr = 0;
 		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr, ctx.length);
 		uint64_t instrAddr = ctx.imageBase + offset;
@@ -2104,20 +2392,30 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 				if (actionPolicy.allowDefineData &&
 					EnsureAddressInsideView(ctx.view, log, "DefineDataVariable", literalAddr))
 				{
-					ctx.view->DefineDataVariable(literalAddr, entryType);
-					entriesTyped++;
+					if (ctx.plan)
+					{
+						PlanDefineData(ctx.plan, literalAddr, entryType);
+						entriesTyped++;
+					}
+					else
+					{
+						ctx.view->DefineDataVariable(literalAddr, entryType);
+						entriesTyped++;
+					}
 				}
 			}
 		}
 	}
 
-	ctx.logger->LogInfo("Typed %u literal pool entries as data", entriesTyped);
+	if (ctx.logger)
+		ctx.logger->LogInfo("Typed %u literal pool entries as data", entriesTyped);
 	if (ctx.verboseLog)
 	{
-		ctx.logger->LogInfo(
-			"Literal pool typing detail: ldr_pc=%u typed=%u skipped_noncode=%u skipped_in_function=%u "
-			"skipped_decoded_code=%u skipped_existing=%u",
-			ldrPcCount, entriesTyped, skippedNonCode, skippedInFunction, skippedDecodedCode, skippedExisting);
+		if (ctx.logger)
+			ctx.logger->LogInfo(
+				"Literal pool typing detail: ldr_pc=%u typed=%u skipped_noncode=%u skipped_in_function=%u "
+				"skipped_decoded_code=%u skipped_existing=%u",
+				ldrPcCount, entriesTyped, skippedNonCode, skippedInFunction, skippedDecodedCode, skippedExisting);
 	}
 }
 
@@ -2128,13 +2426,18 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 	uint32_t autoVarCount = 0;
 	uint32_t withCodeRefs = 0;
 	uint32_t decodeFailed = 0;
-	ctx.logger->LogDebug("Clearing auto data at code-referenced addresses...");
+	if (ctx.logger)
+		ctx.logger->LogDebug("Clearing auto data at code-referenced addresses...");
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
-		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	if (ScanShouldAbort(ctx.view))
+		return;
 	auto dataVars = ctx.view->GetDataVariables();
 	for (const auto& entry : dataVars)
 	{
+		if (ScanShouldAbort(ctx.view))
+			break;
 		dataVarCount++;
 		uint64_t addr = entry.first;
 		const DataVariable& dataVar = entry.second;
@@ -2181,17 +2484,27 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 		if (actionPolicy.allowClearData &&
 			EnsureAddressInsideView(ctx.view, log, "UndefineDataVariable", addr))
 		{
-			ctx.view->UndefineDataVariable(addr, false);
-			cleared++;
+			if (ctx.plan)
+			{
+				PlanUndefineData(ctx.plan, addr);
+				cleared++;
+			}
+			else
+			{
+				ctx.view->UndefineDataVariable(addr, false);
+				cleared++;
+			}
 		}
 	}
 
-	ctx.logger->LogInfo("Cleared %u auto data variables at code-referenced addresses", cleared);
+	if (ctx.logger)
+		ctx.logger->LogInfo("Cleared %u auto data variables at code-referenced addresses", cleared);
 	if (ctx.verboseLog)
 	{
-		ctx.logger->LogInfo(
-			"Clear auto data detail: data_vars=%u auto=%u code_ref=%u cleared=%u decode_fail=%u",
-			dataVarCount, autoVarCount, withCodeRefs, cleared, decodeFailed);
+		if (ctx.logger)
+			ctx.logger->LogInfo(
+				"Clear auto data detail: data_vars=%u auto=%u code_ref=%u cleared=%u decode_fail=%u",
+				dataVarCount, autoVarCount, withCodeRefs, cleared, decodeFailed);
 	}
 }
 
@@ -2204,7 +2517,9 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 	const size_t maxInstrs = 16;
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
-		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	if (ScanShouldAbort(ctx.view))
+		return;
 	std::vector<uint64_t> targets;
 	if (seededFunctions && !seededFunctions->empty())
 	{
@@ -2225,10 +2540,14 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 
 	for (auto startAddr : targets)
 	{
+		if (ScanShouldAbort(ctx.view))
+			break;
 		targetsCount++;
 		uint64_t addr = startAddr;
 		for (size_t i = 0; i < maxInstrs; i++)
 		{
+			if (ScanShouldAbort(ctx.view))
+				break;
 			if (addr + 8 > ctx.ImageEnd())
 				break;
 			uint64_t offset = addr - ctx.imageBase;
@@ -2264,12 +2583,20 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 			if (ctx.view->GetDataVariableAtAddress(addr, dataVar) &&
 				dataVar.address == addr && dataVar.autoDiscovered)
 			{
-		if (actionPolicy.allowClearData &&
-			EnsureAddressInsideView(ctx.view, log, "UndefineDataVariable", addr))
-		{
-			ctx.view->UndefineDataVariable(addr, false);
-			cleared++;
-		}
+				if (actionPolicy.allowClearData &&
+					EnsureAddressInsideView(ctx.view, log, "UndefineDataVariable", addr))
+				{
+					if (ctx.plan)
+					{
+						PlanUndefineData(ctx.plan, addr);
+						cleared++;
+					}
+					else
+					{
+						ctx.view->UndefineDataVariable(addr, false);
+						cleared++;
+					}
+				}
 			}
 
 			if ((instr0.operation == armv5::ARMV5_B) &&
@@ -2282,13 +2609,14 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 		}
 	}
 
-	if (cleared)
+	if (cleared && ctx.logger)
 		ctx.logger->LogInfo("Cleared %u auto data variables inside function entry blocks", cleared);
 	if (ctx.verboseLog)
 	{
-		ctx.logger->LogInfo(
-			"Entry block clear detail: targets=%u cleared=%u decode_fail=%u",
-			targetsCount, cleared, decodeFailed);
+		if (ctx.logger)
+			ctx.logger->LogInfo(
+				"Entry block clear detail: targets=%u cleared=%u decode_fail=%u",
+				targetsCount, cleared, decodeFailed);
 	}
 }
 
@@ -2296,14 +2624,19 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 // NOTE: Currently unused, kept for future IL-based jump table resolution
 static void ScanForJumpTables(const FirmwareScanContext& ctx)
 {
-	ctx.logger->LogDebug("Scanning for jump tables...");
+	if (ctx.logger)
+		ctx.logger->LogDebug("Scanning for jump tables...");
 
 	const auto& actionPolicy = GetFirmwareActionPolicy();
 	Ref<Type> uint32Type = Type::IntegerType(4, false);
-		Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
+	if (ScanShouldAbort(ctx.view))
+		return;
 
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
+		if (ScanShouldAbort(ctx.view))
+			break;
 		uint32_t instr = 0;
 		ReadU32At(ctx.reader, ctx.data, ctx.dataLen, ctx.endian, offset, instr, ctx.length);
 
@@ -2360,23 +2693,39 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 				if (validEntries > 0)
 				{
 					Ref<Type> arrayType = Type::ArrayType(uint32Type, validEntries);
-				if (actionPolicy.allowDefineData &&
-					EnsureAddressInsideView(ctx.view, log, "DefineUserDataVariable", tableBase))
-				{
-					ctx.view->DefineUserDataVariable(tableBase, arrayType);
-				}
+					if (actionPolicy.allowDefineData &&
+						EnsureAddressInsideView(ctx.view, log, "DefineDataVariable", tableBase))
+					{
+						if (ctx.plan)
+						{
+							PlanDefineData(ctx.plan, tableBase, arrayType);
+						}
+						else
+						{
+							ctx.view->DefineDataVariable(tableBase, arrayType);
+						}
+					}
 
-				char symName[32];
-				snprintf(symName, sizeof(symName), "switch_table_%llx",
-					(unsigned long long)tableBase);
-				if (actionPolicy.allowDefineSymbol &&
-					EnsureAddressInsideView(ctx.view, log, "DefineAutoSymbol", tableBase))
-				{
-					ctx.view->DefineAutoSymbol(new Symbol(DataSymbol, symName, tableBase, LocalBinding));
-				}
+					char symName[32];
+					snprintf(symName, sizeof(symName), "switch_table_%llx",
+						(unsigned long long)tableBase);
+					if (actionPolicy.allowDefineSymbol &&
+						EnsureAddressInsideView(ctx.view, log, "DefineAutoSymbol", tableBase))
+					{
+						if (ctx.plan)
+						{
+							PlanDefineSymbol(ctx.plan,
+								new Symbol(DataSymbol, symName, tableBase, LocalBinding));
+						}
+						else
+						{
+							ctx.view->DefineAutoSymbol(new Symbol(DataSymbol, symName, tableBase, LocalBinding));
+						}
+					}
 
-					ctx.logger->LogDebug("Defined switch table at 0x%llx with %u entries",
-						(unsigned long long)tableBase, validEntries);
+					if (ctx.logger)
+						ctx.logger->LogDebug("Defined switch table at 0x%llx with %u entries",
+							(unsigned long long)tableBase, validEntries);
 				}
 			}
 		}

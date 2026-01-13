@@ -149,18 +149,18 @@ static void NormalizeFirmwareSettings(FirmwareSettings& settings)
 FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 {
 	FirmwareSettings settings{};
-	settings.enablePrologueScan = false;
-	settings.enableCallTargetScan = false;
-	settings.enablePointerTargetScan = false;
+	settings.enablePrologueScan = true;
+	settings.enableCallTargetScan = true;
+	settings.enablePointerTargetScan = true;
 	settings.enableOrphanCodeScan = true;
-	settings.enableLiteralPoolTyping = false;
-	settings.enableClearAutoDataOnCodeRefs = false;
+	settings.enableLiteralPoolTyping = true;
+	settings.enableClearAutoDataOnCodeRefs = true;
 	settings.enableVerboseLogging = false;
-	settings.enableInvalidFunctionCleanup = false;
+	settings.enableInvalidFunctionCleanup = true;
 	settings.disablePointerSweep = false;
 	settings.disableLinearSweep = false;
 	settings.enablePartialLinearSweep = (mode == FirmwareSettingsMode::Init);
-	settings.skipFirmwareScans = true;
+	settings.skipFirmwareScans = false;
 	settings.cleanupMaxSizeBytes = 8;
 	settings.cleanupRequireZeroRefs = true;
 	settings.cleanupRequirePcWriteStart = true;
@@ -169,7 +169,9 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.orphanMinSpacingBytes = 0x80;
 	settings.orphanMaxPerPage = (mode == FirmwareSettingsMode::Init) ? 6 : 8;
 	settings.orphanRequirePrologue = (mode == FirmwareSettingsMode::Init);
+	settings.maxFunctionAdds = 2000;
 	settings.tuning = FirmwareScanTuning{};
+	settings.tuning.scanRawPointerTables = true;
 	return settings;
 }
 
@@ -201,6 +203,8 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 		result.orphanMaxPerPage = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kOrphanMaxPerPage, view);
 	if (settings->Contains(FirmwareSettingKeys::kOrphanRequirePrologue))
 		result.orphanRequirePrologue = settings->Get<bool>(FirmwareSettingKeys::kOrphanRequirePrologue, view);
+	if (settings->Contains(FirmwareSettingKeys::kMaxFunctionAdds))
+		result.maxFunctionAdds = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kMaxFunctionAdds, view);
 	if (settings->Contains(FirmwareSettingKeys::kPartialLinearSweep))
 		result.enablePartialLinearSweep = settings->Get<bool>(FirmwareSettingKeys::kPartialLinearSweep, view);
 	if (settings->Contains(FirmwareSettingKeys::kSkipFirmwareScans))
@@ -255,16 +259,17 @@ void LogFirmwareSettingsSummary(const Ref<Logger>& logger, const FirmwareSetting
 		"orphan_min_valid=%u orphan_min_body=%u orphan_min_spacing=0x%x orphan_max_per_page=%u "
 		"orphan_require_prologue=%d partial_linear_sweep=%d skip_firmware_scans=%d "
 		"raw_ptr_tables=%d raw_ptr_min_run=%u raw_ptr_require_refs=%d raw_ptr_allow_in_code=%d "
-		"call_scan_require_in_func=%d disable_pointer_sweep=%d disable_linear_sweep=%d "
+		"call_scan_require_in_func=%d max_function_adds=%u disable_pointer_sweep=%d disable_linear_sweep=%d "
 		"cleanup_invalid=%d cleanup_max_size=%u cleanup_zero_refs=%d cleanup_pc_write=%d "
 		"type_literal_pools=%d clear_auto_data_on_code_refs=%d scan_min_valid=%u scan_min_body=%u scan_max_literal_run=%u",
 		settings.enablePrologueScan, settings.enableCallTargetScan, settings.enablePointerTargetScan, settings.enableOrphanCodeScan,
 		settings.orphanMinValidInstr, settings.orphanMinBodyInstr, settings.orphanMinSpacingBytes, settings.orphanMaxPerPage,
 		settings.orphanRequirePrologue, settings.enablePartialLinearSweep, settings.skipFirmwareScans,
 		settings.tuning.scanRawPointerTables, settings.tuning.minPointerRun, settings.tuning.requirePointerTableCodeRefs,
-		settings.tuning.allowPointerTablesInCode, settings.tuning.requireCallInFunction, settings.disablePointerSweep,
-		settings.disableLinearSweep, settings.enableInvalidFunctionCleanup, settings.cleanupMaxSizeBytes,
-		settings.cleanupRequireZeroRefs, settings.cleanupRequirePcWriteStart, settings.enableLiteralPoolTyping,
+		settings.tuning.allowPointerTablesInCode, settings.tuning.requireCallInFunction, settings.maxFunctionAdds,
+		settings.disablePointerSweep, settings.disableLinearSweep, settings.enableInvalidFunctionCleanup,
+		settings.cleanupMaxSizeBytes, settings.cleanupRequireZeroRefs, settings.cleanupRequirePcWriteStart,
+		settings.enableLiteralPoolTyping,
 		settings.enableClearAutoDataOnCodeRefs, settings.tuning.minValidInstr, settings.tuning.minBodyInstr,
 		settings.tuning.maxLiteralRun);
 }
@@ -395,6 +400,15 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 		"type" : "boolean",
 		"default" : false,
 		"description" : "Restrict call-target scanning to instructions already inside functions."
+		})");
+	settings->RegisterSetting(FirmwareSettingKeys::kMaxFunctionAdds,
+		R"({
+		"title" : "Max firmware function additions",
+		"type" : "number",
+		"default" : 2000,
+		"min" : 0,
+		"max" : 100000,
+		"description" : "Cap the number of functions added per firmware scan run (0 disables the cap)."
 		})");
 	settings->RegisterSetting(FirmwareSettingKeys::kDisablePointerSweep,
 		R"({
