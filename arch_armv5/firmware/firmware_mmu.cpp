@@ -5,10 +5,14 @@
 #include "firmware_internal.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
@@ -65,13 +69,63 @@ enum class MapGranularity
 	Section1M,
 };
 
+// Walking mode for discovering TTBR/config arrays when the L1 table isn't initialized.
+// Heuristic = current scan+local backsolve (fast, robust when code is straight-line)
+// Emulated  = lightweight forward emulation with branch following (slower, handles CFG)
+enum class MMUWalkMode
+{
+	Heuristic,
+	Emulated,
+};
+
+
+static MMUWalkMode GetMMUWalkMode(const Ref<BinaryView>& view, Ref<Logger> logger)
+{
+	// Option 1: environment variable (works everywhere)
+	//   BN_MMU_WALK=emu     -> Emulated
+	//   BN_MMU_WALK=heur    -> Heuristic
+	//   BN_MMU_EMU_WALK=1   -> Emulated (legacy convenience)
+	const char* v = std::getenv("BN_MMU_WALK");
+	if (v && *v)
+	{
+		std::string s(v);
+		for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+		if (s == "emu" || s == "emulated" || s == "emulate")
+		{
+			if (logger) logger->LogInfo("MMU: WalkMode=Emulated (BN_MMU_WALK=%s)", v);
+			return MMUWalkMode::Emulated;
+		}
+		if (s == "heur" || s == "heuristic" || s == "scan")
+		{
+			if (logger) logger->LogInfo("MMU: WalkMode=Heuristic (BN_MMU_WALK=%s)", v);
+			return MMUWalkMode::Heuristic;
+		}
+	}
+
+
+	const char* v2 = std::getenv("BN_MMU_EMU_WALK");
+	if (v2 && *v2 && std::strcmp(v2, "0") != 0)
+	{
+		if (logger) logger->LogInfo("MMU: WalkMode=Emulated (BN_MMU_EMU_WALK=%s)", v2);
+		return MMUWalkMode::Emulated;
+	}
+
+
+	// Option 2 (future): wire to BN Settings when/if you register keys elsewhere.
+	(void)view;
+
+
+	return MMUWalkMode::Heuristic;
+}
 struct MapFormat
 {
 	MapEntryKind kind;
 	MapGranularity gran;
 	uint32_t knownFlagMask; // which bits we consider “flags”
-	uint32_t alignMask;			// address alignment mask
-	uint32_t pageSize;			// 0x1000 or 0x100000
+	uint32_t alignMask;         // address alignment mask
+	uint32_t pageSize;          // 0x1000 or 0x100000
+	bool swapWords = false;        // VaPa8 may be stored as {PA,VA} instead of {VA,PA}
+	uint64_t effectiveEndAddr = 0; // tolerate inclusive end pointers
 };
 
 struct MapStats
@@ -168,6 +222,9 @@ static bool ReadU32Resolved(BinaryReader& reader, const uint8_t* data, uint64_t 
 	BNEndianness endian, const AddressResolver& resolver, uint64_t addr, const RomToSramCopy& romCopy,
 	uint64_t length, uint32_t& out);
 
+// Forward declaration (used by ParseRegionDesc16 before definition below)
+static inline void AppendRegion(std::vector<MemRegion>& outRegions, const MemRegion& region);
+
 static uint32_t MaskForGran(MapGranularity g)
 {
 	return (g == MapGranularity::Section1M) ? 0xFFF00000u : 0xFFFFF000u;
@@ -198,7 +255,7 @@ static MapStats ScoreFormat(const AddressResolver &resolver, BinaryReader &reade
 														const uint8_t *data, uint64_t dataLen, BNEndianness endian,
 														const RomToSramCopy &romCopy, uint64_t length,
 														uint64_t startAddr, uint64_t endAddr,
-														MapEntryKind kind, MapGranularity gran,
+														MapEntryKind kind, bool swapWords, MapGranularity gran,
 														uint32_t flagMask, size_t maxSamples = 256)
 {
 	MapStats st;
@@ -226,6 +283,12 @@ static MapStats ScoreFormat(const AddressResolver &resolver, BinaryReader &reade
 
 		uint32_t vaRaw = w0;
 		uint32_t paRaw = (kind == MapEntryKind::VaPa8) ? w1 : w0;
+		if (kind == MapEntryKind::VaPa8 && swapWords)
+		{
+			// Some firmwares store entries as {PA, VA}
+			vaRaw = w1;
+			paRaw = w0;
+		}
 
 		uint32_t va = vaRaw & addrMask;
 		uint32_t pa = paRaw & addrMask;
@@ -259,8 +322,19 @@ static MapStats ScoreFormat(const AddressResolver &resolver, BinaryReader &reade
 
 		if (havePrev)
 		{
-			uint32_t d = va - prevVA;
-			strideFreq[d]++;
+			int64_t sd = (int64_t)va - (int64_t)prevVA;
+			// Only count forward, reasonably-sized strides; ignore wrap/underflow and wild jumps.
+			// For real maps the stride is usually pageSize (or a small multiple) and VA is monotonic.
+			uint32_t maxStride = pageSize * 16; // tolerate small gaps, but not hundreds of MB
+			if (sd > 0 && (uint64_t)sd <= maxStride)
+			{
+				strideFreq[(uint32_t)sd]++;
+			}
+			else
+			{
+				// Track outliers by counting a 0 stride bucket (used only for scoring penalty below).
+				strideFreq[0]++;
+			}
 		}
 		prevVA = va;
 		havePrev = true;
@@ -284,10 +358,27 @@ static MapStats ScoreFormat(const AddressResolver &resolver, BinaryReader &reade
 
 	// scoring: alignment + dominant stride + low flag entropy
 	double alignRate = (st.samples ? (double)st.aligned / (double)st.samples : 0.0);
+	// strideHits is based on strideFreq; compute a rate against the number of stride observations (samples-1)
 	double strideRate = (st.samples > 1 ? (double)st.strideHits / (double)(st.samples - 1) : 0.0);
+	// Penalize if we saw lots of outlier strides (we stored them under stride==0)
+	size_t outlierStrides = 0;
+	auto itOut = strideFreq.find(0);
+	if (itOut != strideFreq.end())
+		outlierStrides = itOut->second;
+	double outlierPenalty = 1.0;
+	if (st.samples > 1)
+	{
+		double outlierRate = (double)outlierStrides / (double)(st.samples - 1);
+		// If more than 20% of strides are outliers, heavily penalize.
+		if (outlierRate > 0.20)
+			outlierPenalty = 0.25;
+		else if (outlierRate > 0.10)
+			outlierPenalty = 0.60;
+	}
 	double flagPenalty = (st.uniqueFlags > 32) ? 0.25 : 1.0; // brutal penalty if flags explode
 
 	st.score = (alignRate * 0.55) + (strideRate * 0.35) + (flagPenalty * 0.10);
+	st.score *= outlierPenalty;
 	return st;
 }
 
@@ -306,17 +397,24 @@ static bool ChooseBestFormat(const AddressResolver &resolver, BinaryReader &read
 		MapEntryKind k;
 		MapGranularity g;
 		uint32_t fm;
+		bool swap;
 	};
 	Cand cands[] = {
-			{MapEntryKind::VaPa8, MapGranularity::Section1M, kFlagMaskTight},
-			{MapEntryKind::VaPa8, MapGranularity::Page4K, kFlagMaskTight},
-			{MapEntryKind::Identity4, MapGranularity::Section1M, kFlagMaskTight},
-			{MapEntryKind::Identity4, MapGranularity::Page4K, kFlagMaskTight},
+			// Prefer VaPa8 first, try both word orders.
+			{MapEntryKind::VaPa8,     MapGranularity::Section1M, kFlagMaskTight, false},
+			{MapEntryKind::VaPa8,     MapGranularity::Section1M, kFlagMaskTight, true},
+			{MapEntryKind::VaPa8,     MapGranularity::Page4K,    kFlagMaskTight, false},
+			{MapEntryKind::VaPa8,     MapGranularity::Page4K,    kFlagMaskTight, true},
+			{MapEntryKind::Identity4, MapGranularity::Section1M, kFlagMaskTight, false},
+			{MapEntryKind::Identity4, MapGranularity::Page4K,    kFlagMaskTight, false},
 
-			{MapEntryKind::VaPa8, MapGranularity::Section1M, kFlagMaskLoose},
-			{MapEntryKind::VaPa8, MapGranularity::Page4K, kFlagMaskLoose},
-			{MapEntryKind::Identity4, MapGranularity::Section1M, kFlagMaskLoose},
-			{MapEntryKind::Identity4, MapGranularity::Page4K, kFlagMaskLoose},
+			// Loose flag masks as fallback.
+			{MapEntryKind::VaPa8,     MapGranularity::Section1M, kFlagMaskLoose, false},
+			{MapEntryKind::VaPa8,     MapGranularity::Section1M, kFlagMaskLoose, true},
+			{MapEntryKind::VaPa8,     MapGranularity::Page4K,    kFlagMaskLoose, false},
+			{MapEntryKind::VaPa8,     MapGranularity::Page4K,    kFlagMaskLoose, true},
+			{MapEntryKind::Identity4, MapGranularity::Section1M, kFlagMaskLoose, false},
+			{MapEntryKind::Identity4, MapGranularity::Page4K,    kFlagMaskLoose, false},
 	};
 
 	MapStats bestSt;
@@ -326,20 +424,48 @@ static bool ChooseBestFormat(const AddressResolver &resolver, BinaryReader &read
 	for (auto &c : cands)
 	{
 		uint64_t entrySize = (c.k == MapEntryKind::Identity4) ? 4 : 8;
-		uint64_t len = (arr.endAddr > arr.startAddr) ? (arr.endAddr - arr.startAddr) : 0;
-		if (len < entrySize * 4)
-			continue;
-		if ((len % entrySize) != 0)
-			continue;
-		uint64_t count = len / entrySize;
-		if (c.g == MapGranularity::Section1M && count > 4096)
+		uint64_t baseLen = (arr.endAddr > arr.startAddr) ? (arr.endAddr - arr.startAddr) : 0;
+		if (baseLen < entrySize * 4)
 			continue;
 
-		MapStats st = ScoreFormat(resolver, reader, data, dataLen, endian, romCopy, length,
-															arr.startAddr, arr.endAddr, c.k, c.g, c.fm);
+		// Some firmwares store an inclusive end pointer; tolerate +4/+8 to make length divisible.
+		uint64_t bestLenForCand = 0;
+		MapStats bestStForCand;
+		double bestScoreForCand = 0.0;
 
-		if (st.samples < 16)
+		for (uint64_t extra = 0; extra <= 8; extra += 4)
+		{
+			uint64_t len = baseLen + extra;
+			if (len < entrySize * 4)
+				continue;
+			if ((len % entrySize) != 0)
+				continue;
+
+			uint64_t endAddr = arr.startAddr + len;
+			uint64_t count = len / entrySize;
+			if (c.g == MapGranularity::Section1M && count > 4096)
+				continue;
+
+			MapStats st = ScoreFormat(resolver, reader, data, dataLen, endian, romCopy, length,
+															arr.startAddr, endAddr, c.k, c.swap, c.g, c.fm);
+
+			// Boot ROM tables can be small; accept fewer samples.
+			if (st.samples < 8)
+				continue;
+
+			if (st.score > bestScoreForCand)
+			{
+				bestScoreForCand = st.score;
+				bestStForCand = st;
+				bestLenForCand = len;
+			}
+		}
+
+		if (bestLenForCand == 0)
 			continue;
+
+		MapStats st = bestStForCand;
+		uint64_t endAddr = arr.startAddr + bestLenForCand;
 
 		if (st.score > bestScore)
 		{
@@ -350,25 +476,115 @@ static bool ChooseBestFormat(const AddressResolver &resolver, BinaryReader &read
 			bestFmt.knownFlagMask = c.fm;
 			bestFmt.alignMask = MaskForGran(c.g);
 			bestFmt.pageSize = PageSizeForGran(c.g);
+			bestFmt.swapWords = c.swap;
+			bestFmt.effectiveEndAddr = endAddr;
 		}
 	}
 
-	// Hard reject unless the table looks “structured”
-	// Tune thresholds as you like.
-	if (bestScore < 0.60)
+	// Boot ROM tables can be compact/irregular; keep thresholds permissive but still structured.
+	if (bestScore < 0.45)
 		return false;
-	if ((double)bestSt.aligned / (double)bestSt.samples < 0.70)
+	if (bestSt.samples && ((double)bestSt.aligned / (double)bestSt.samples) < 0.55)
 		return false;
-	if (bestSt.uniqueFlags > 256) // flags look like address residue
+	if (bestSt.uniqueFlags > 1024) // flags look like address residue
 		return false;
 	if (!bestSt.haveVA || bestSt.maxVA <= bestSt.minVA)
 		return false;
-	if (bestFmt.pageSize != 0 && (bestSt.dominantStride == 0 || (bestSt.dominantStride % bestFmt.pageSize) != 0))
-		return false;
+	if (bestFmt.pageSize != 0)
+	{
+		if (bestSt.dominantStride == 0)
+			return false;
+		if ((bestSt.dominantStride % bestFmt.pageSize) != 0)
+			return false;
+		// Reject absurd gaps (these are almost always unsigned underflow / wrap or not a real map).
+		uint32_t maxStride = bestFmt.pageSize * 16;
+		if (bestSt.dominantStride > maxStride)
+			return false;
+	}
 
 	outFmt = bestFmt;
 	outStats = bestSt;
 	return true;
+}
+
+// Fallback: some firmwares build MMU regions via a compact descriptor list instead of per-page/section maps.
+// Common shape we see in boot ROMs: 16-byte entries {va, pa, size, flags}.
+// If this parses cleanly, emit regions directly.
+static bool ParseRegionDesc16(const AddressResolver &resolver, BinaryReader &reader,
+                             const uint8_t *data, uint64_t dataLen, BNEndianness endian,
+                             const RomToSramCopy &romCopy, uint64_t length,
+                             const MMUConfigArray &arr,
+                             std::vector<MemRegion> &outRegions,
+                             Ref<Logger> logger)
+{
+	outRegions.clear();
+	if (arr.endAddr <= arr.startAddr)
+		return false;
+
+	uint64_t len = arr.endAddr - arr.startAddr;
+	if (len < 16 * 4) // need at least 4 entries
+		return false;
+
+	// Many firmwares store an inclusive end pointer; tolerate small misalignment by rounding down.
+	uint64_t entryCount = len / 16;
+	if (entryCount < 4)
+		return false;
+
+	size_t valid = 0;
+	size_t total = 0;
+
+	for (uint64_t i = 0; i < entryCount; i++)
+	{
+		uint64_t ea = arr.startAddr + i * 16;
+		uint32_t va = 0, pa = 0, sz = 0, flags = 0;
+		if (!ReadU32Resolved(reader, data, dataLen, endian, resolver, ea + 0, romCopy, length, va))
+			break;
+		if (!ReadU32Resolved(reader, data, dataLen, endian, resolver, ea + 4, romCopy, length, pa))
+			break;
+		if (!ReadU32Resolved(reader, data, dataLen, endian, resolver, ea + 8, romCopy, length, sz))
+			break;
+		if (!ReadU32Resolved(reader, data, dataLen, endian, resolver, ea + 12, romCopy, length, flags))
+			break;
+
+		total++;
+
+		// Basic sanity: size must be plausible and aligned; VA/PA aligned too.
+		if (sz < 0x400 || sz > (512u * 1024u * 1024u))
+			continue;
+		if ((sz & 0x3FFu) != 0)
+			continue;
+		if ((va & 0x3FFu) != 0 || (pa & 0x3FFu) != 0)
+			continue;
+
+		// Reject obviously bogus "sizes" that look like pointers (same high byte as VA/PA but huge span)
+		// (keeps false-positives down on random data).
+		if ((sz & 0xFF000000u) == (va & 0xFF000000u) && sz > 0x01000000u)
+			continue;
+
+		// Use the same flag decode as the per-entry map path; many firmwares reuse this bitfield.
+		bool readable = (flags & 0x01) != 0;
+		bool writable = (flags & 0x02) != 0;
+		bool executable = (flags & 0x04) != 0;
+		bool cacheable = (flags & 0x08) != 0;
+		bool bufferable = (flags & 0x10) != 0;
+		const char* type = (flags & 0x20) ? "MMIO" : "RAM";
+
+		MemRegion r = {(uint64_t)va, (uint64_t)pa, (uint64_t)sz,
+			readable, writable, executable, cacheable, bufferable, type};
+		AppendRegion(outRegions, r);
+		valid++;
+	}
+
+	if (total < 4)
+		return false;
+
+	double rate = (double)valid / (double)total;
+	if (valid < 4 || rate < 0.60)
+		return false;
+
+	if (logger)
+		logger->LogInfo("MMU: RegionDesc16 accepted (valid=%zu/%zu, rate=%.2f)", valid, total, rate);
+	return !outRegions.empty();
 }
 
 static AddressResolver BuildResolver(uint64_t imageBase, uint64_t length)
@@ -846,12 +1062,8 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 
 	// Scan for the characteristic LDRLO/STRLO copy loop pattern
 	// ARM encoding for LDRLO Rx, [Ry], #4 (post-indexed, unsigned immediate):
-	//   cond=0011 (LO/CC) 01 I=0 P=0 U=1 B=0 W=0 L=1 Rn Rd imm12=4
-	//   Example: LDRLO r3, [r0], #4 = 0x34903004
 	//   Mask 0x0FF00FFF (ignore cond, Rn, Rd), value 0x04900004
 	// ARM encoding for STRLO:
-	//   cond=0011 01 I=0 P=0 U=1 B=0 W=0 L=0 Rn Rd imm12=4
-	//   Example: STRLO r3, [r1], #4 = 0x34813004
 	//   Mask 0x0FF00FFF, value 0x04800004
 
 	for (uint64_t offset = 0; offset + 8 <= length; offset += 4)
@@ -860,132 +1072,200 @@ static RomToSramCopy FindRomToSramCopy(BinaryReader& reader, const uint8_t* data
 		ReadU32At(reader, data, dataLen, endian, offset, instr1, length);
 		ReadU32At(reader, data, dataLen, endian, offset + 4, instr2, length);
 
-		// Check for LDRLO followed by STRLO (or vice versa)
 		bool isLdrLo1 = (instr1 & 0x0FF00FFF) == 0x04900004 && (instr1 & 0xF0000000) == 0x30000000;
 		bool isStrLo1 = (instr1 & 0x0FF00FFF) == 0x04800004 && (instr1 & 0xF0000000) == 0x30000000;
 		bool isLdrLo2 = (instr2 & 0x0FF00FFF) == 0x04900004 && (instr2 & 0xF0000000) == 0x30000000;
 		bool isStrLo2 = (instr2 & 0x0FF00FFF) == 0x04800004 && (instr2 & 0xF0000000) == 0x30000000;
 
-		if ((isLdrLo1 && isStrLo2) || (isStrLo1 && isLdrLo2))
+		if (!((isLdrLo1 && isStrLo2) || (isStrLo1 && isLdrLo2)))
+			continue;
+
+		logger->LogInfo("MMU: Found copy loop at file offset 0x%llx (LDRLO/STRLO pattern)",
+			(unsigned long long)offset);
+
+		// Scan backwards to find literal pool loads that set up the copy.
+		// Important: literals are often a few hundred bytes before the tight loop.
+		std::vector<std::pair<uint64_t, uint32_t>> literalRefs; // (lit_file_off, value)
+
+		// Scan up to 256 instructions back (~1KB)
+		for (int i = 1; i <= 256 && offset >= (uint64_t)(i * 4); i++)
 		{
-			logger->LogInfo("MMU: Found copy loop at file offset 0x%llx (LDRLO/STRLO pattern)",
-				(unsigned long long)offset);
+			uint32_t prevInstr = 0;
+			ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr, length);
 
-			// Scan backwards to find literal pool loads that set up the copy
-			// We're looking for LDR instructions that load:
-			// 1. ROM source address (small value within file)
-			// 2. SRAM destination address (matches alias base)
-			// 3. SRAM end address (matches alias base)
-
-			std::vector<std::pair<uint64_t, uint32_t>> literalRefs;
-
-			// Scan up to 64 instructions back
-			for (int i = 1; i <= 64 && offset >= (uint64_t)(i * 4); i++)
+			// LDR Rd, [PC, #imm]: 0x051F0000 (sub) or 0x059F0000 (add)
+			if ((prevInstr & 0x0F7F0000) == 0x051F0000)
 			{
-				uint32_t prevInstr = 0;
-				ReadU32At(reader, data, dataLen, endian, offset - (i * 4), prevInstr, length);
+				uint32_t imm12 = prevInstr & 0xFFF;
+				bool add = (prevInstr & 0x00800000) != 0;
+				uint64_t pcVal = (offset - (i * 4)) + 8;
+				uint64_t litAddr = add ? (pcVal + imm12) : (pcVal - imm12);
 
-				// LDR Rd, [PC, #imm]: 0x051F0000 (sub) or 0x059F0000 (add)
-				if ((prevInstr & 0x0F7F0000) == 0x051F0000)
+				if (litAddr + 4 <= length)
 				{
-					uint32_t imm12 = prevInstr & 0xFFF;
-					bool add = (prevInstr & 0x00800000) != 0;
-					uint64_t pcVal = (offset - (i * 4)) + 8;
-					uint64_t litAddr = add ? (pcVal + imm12) : (pcVal - imm12);
-
-					if (litAddr + 4 <= length)
-					{
-						uint32_t value = 0;
-						ReadU32At(reader, data, dataLen, endian, litAddr, value, length);
-						literalRefs.push_back({litAddr, value});
-					}
-				}
-			}
-
-			// Categorize the literal values
-			// The copy pattern typically loads: ROM source, SRAM start, SRAM end
-			// in consecutive literal pool entries. We look for the ROM address
-			// and then the SRAM addresses that are loaded closest to it.
-			uint64_t romSrc = 0;
-			uint64_t romSrcLitAddr = 0;
-			std::vector<std::pair<uint64_t, uint64_t>> sramAddrsWithLitAddr;  // (sram_addr, lit_pool_addr)
-
-			for (const auto& ref : literalRefs)
-			{
-				uint64_t litAddr = ref.first;
-				uint32_t val = ref.second;
-
-				// ROM address: a pointer into the ROM image range (imageBase-relative)
-				uint64_t offTmp = 0;
-				if (((val >= imageBase) && (val < imageBase + length) &&
-						resolver.CpuToFile(val, offTmp, false)) && offTmp > 0x1000)
-				{
-					romSrc = val;
-					romSrcLitAddr = litAddr;
-				}
-				else if (resolver.CpuToFile(val, offTmp, false) && offTmp > 0x1000)
-				{
-					romSrc = val;
-					romSrcLitAddr = litAddr;
-				}
-				// SRAM address: matches our alias base (high byte)
-				else if (aliasBase != 0 && (val & 0xFF000000) == aliasBase)
-				{
-					sramAddrsWithLitAddr.push_back({val, litAddr});
-				}
-			}
-
-			if (romSrc != 0 && sramAddrsWithLitAddr.size() >= 2)
-			{
-				// Find the SRAM addresses that are in consecutive literal pool entries
-				// closest to the ROM source (they form: ROM, SRAM_start, SRAM_end)
-				// The literal pool entries may be loaded in any order, so we check both directions
-				uint64_t sramDst = 0, sramEnd = 0;
-
-				for (size_t i = 0; i + 1 < sramAddrsWithLitAddr.size(); i++)
-				{
-					uint64_t addr1 = sramAddrsWithLitAddr[i].first;
-					uint64_t lit1 = sramAddrsWithLitAddr[i].second;
-					uint64_t addr2 = sramAddrsWithLitAddr[i + 1].first;
-					uint64_t lit2 = sramAddrsWithLitAddr[i + 1].second;
-
-					// Check if these are consecutive literal pool entries (either direction)
-					int64_t litDiff = (int64_t)lit2 - (int64_t)lit1;
-					if (litDiff != 4 && litDiff != -4)
-						continue;
-
-					// Determine which is start (smaller addr) and which is end (larger addr)
-					uint64_t startAddr = (addr1 < addr2) ? addr1 : addr2;
-					uint64_t endAddr = (addr1 < addr2) ? addr2 : addr1;
-					uint64_t size = endAddr - startAddr;
-
-					// Check for reasonable copy size (256 bytes to 64KB)
-					if (size >= 0x100 && size <= 0x10000)
-					{
-						// Use this pair
-						sramDst = startAddr;
-						sramEnd = endAddr;
-						break;  // Found a valid pair, stop searching
-					}
-				}
-
-				if (sramDst != 0 && sramEnd != 0)
-				{
-					result.romSrc = romSrc;
-					result.sramDst = sramDst;
-					result.sramEnd = sramEnd;
-					result.valid = true;
-
-					logger->LogInfo("MMU: ROM-to-SRAM copy found:");
-					logger->LogInfo("MMU:   ROM source:  0x%08llx", (unsigned long long)romSrc);
-					logger->LogInfo("MMU:   SRAM dest:   0x%08llx - 0x%08llx",
-						(unsigned long long)sramDst, (unsigned long long)sramEnd);
-					logger->LogInfo("MMU:   Size:        %llu bytes", (unsigned long long)(sramEnd - sramDst));
-
-					return result;
+					uint32_t value = 0;
+					ReadU32At(reader, data, dataLen, endian, litAddr, value, length);
+					literalRefs.push_back({litAddr, value});
 				}
 			}
 		}
+
+		// Collect ROM-src candidates and SRAM (alias) candidates.
+		// We do NOT assume strict consecutiveness; we search for "nearby" literal pool entries.
+		std::vector<std::pair<uint64_t, uint64_t>> romCands;  // (rom_cpu, lit_off)
+		std::vector<std::pair<uint64_t, uint64_t>> sramCands; // (sram_cpu, lit_off)
+
+		for (const auto& ref : literalRefs)
+		{
+			uint64_t litOff = ref.first;
+			uint32_t val = ref.second;
+
+			uint64_t offTmp = 0;
+
+			// SRAM address: matches alias base (high byte)
+			if ((((uint64_t)val) & 0xFF000000ULL) == aliasBase)
+			{
+				sramCands.push_back({(uint64_t)val, litOff});
+				continue;
+			}
+
+			// ROM-ish address: something that can map into the file.
+			// Prefer non-fallback (allowFallback=false), but keep a fallback option if needed.
+			if (resolver.CpuToFile((uint64_t)val, offTmp, false) && offTmp > 0x1000 && offTmp < length)
+			{
+				romCands.push_back({(uint64_t)val, litOff});
+			}
+			else if (resolver.CpuToFile((uint64_t)val, offTmp, true) && offTmp > 0x1000 && offTmp < length)
+			{
+				// keep these too; theyre lower priority but better than nothing
+				romCands.push_back({(uint64_t)val, litOff});
+			}
+			else if (imageBase && (uint64_t)val >= imageBase && (uint64_t)val < (imageBase + length))
+			{
+				// If we have a real imageBase, accept pointers into that range even if resolver is ambiguous.
+				romCands.push_back({(uint64_t)val, litOff});
+			}
+		}
+
+		if (romCands.empty() || sramCands.size() < 2)
+			continue;
+
+		// Sort SRAM candidates by literal pool location so we can pick a tight "cluster".
+		std::sort(sramCands.begin(), sramCands.end(),
+			[](const std::pair<uint64_t, uint64_t>& a, const std::pair<uint64_t, uint64_t>& b)
+			{
+				return a.second < b.second;
+			});
+
+		// Pick the best local cluster of SRAM literals near the loop.
+		// Rationale: firmware often has multiple SRAM pointers (start/end + related anchors) and
+		// our old "best pair" heuristic could miss the true start by a few words (as seen in btrom:
+		// candidates start at 0xa402f74c but we picked 0xa402f790).
+		// We instead select a window in the literal pool (<= 0x80 bytes span) that contains the
+		// most SRAM pointers; then we use min/max address in that window as the copy range.
+		const uint64_t kMaxLitSpan = 0x80;
+		const uint64_t kMinCopy = 0x100;
+		const uint64_t kMaxCopy = 0x200000;
+
+		size_t bestCount = 0;
+		uint64_t bestSpan = ~0ULL;
+		uint64_t bestSize = 0;
+		uint64_t bestSramDst = 0;
+		uint64_t bestSramEnd = 0;
+		uint64_t bestLitMid = 0;
+
+		for (size_t i = 0; i < sramCands.size(); i++)
+		{
+			uint64_t litFirst = sramCands[i].second;
+			uint64_t litLast = litFirst;
+			uint64_t minAddr = sramCands[i].first;
+			uint64_t maxAddr = sramCands[i].first;
+			size_t count = 1;
+
+			for (size_t j = i + 1; j < sramCands.size(); j++)
+			{
+				uint64_t litJ = sramCands[j].second;
+				uint64_t span = (litJ >= litFirst) ? (litJ - litFirst) : (litFirst - litJ);
+				if (span > kMaxLitSpan)
+					break; // sorted by lit addr; further j only increases span
+
+				litLast = litJ;
+				count++;
+				minAddr = std::min<uint64_t>(minAddr, sramCands[j].first);
+				maxAddr = std::max<uint64_t>(maxAddr, sramCands[j].first);
+			}
+
+			if (count < 2)
+				continue;
+
+			uint64_t startAddr = minAddr;
+			uint64_t endAddr = maxAddr;
+			uint64_t size = (endAddr > startAddr) ? (endAddr - startAddr) : 0;
+			uint64_t span = (litLast >= litFirst) ? (litLast - litFirst) : (litFirst - litLast);
+
+			if ((startAddr & 3) != 0 || (endAddr & 3) != 0)
+				continue;
+			if (size < kMinCopy || size > kMaxCopy)
+				continue;
+
+			// Score: prefer more pointers (strong signal), then larger coverage, then tighter lit span.
+			bool better = false;
+			if (count > bestCount)
+				better = true;
+			else if (count == bestCount && size > bestSize)
+				better = true;
+			else if (count == bestCount && size == bestSize && span < bestSpan)
+				better = true;
+
+			if (better)
+			{
+				bestCount = count;
+				bestSpan = span;
+				bestSize = size;
+				bestSramDst = startAddr;
+				bestSramEnd = endAddr;
+				bestLitMid = (litFirst + litLast) / 2;
+			}
+		}
+
+		if (bestSramDst == 0 || bestSramEnd == 0)
+			continue;
+
+		// Normalize: ensure dst < end
+		if (bestSramEnd < bestSramDst)
+			std::swap(bestSramDst, bestSramEnd);
+		uint64_t bestRom = 0;
+		uint64_t bestDist = ~0ULL;
+		for (const auto& rc : romCands)
+		{
+			uint64_t litOff = rc.second;
+			uint64_t dist = (litOff > bestLitMid) ? (litOff - bestLitMid) : (bestLitMid - litOff);
+			if (dist < bestDist)
+			{
+				bestDist = dist;
+				bestRom = rc.first;
+			}
+		}
+
+		if (bestRom == 0)
+			continue;
+
+		result.romSrc = bestRom;
+		result.sramDst = bestSramDst;
+		result.sramEnd = bestSramEnd;
+		// Some firmwares use the end pointer as inclusive; make the range robust by allowing
+		// a small extension if the interval looks suspiciously tiny.
+		if (result.sramEnd > result.sramDst && (result.sramEnd - result.sramDst) < 0x100)
+			result.sramEnd = result.sramDst + 0x100;
+		result.valid = true;
+
+		logger->LogInfo("MMU: ROM-to-SRAM copy found:");
+		logger->LogInfo("MMU:   ROM source:  0x%08llx", (unsigned long long)result.romSrc);
+		logger->LogInfo("MMU:   SRAM dest:   0x%08llx - 0x%08llx",
+			(unsigned long long)result.sramDst, (unsigned long long)result.sramEnd);
+		logger->LogInfo("MMU:   Size:        %llu bytes", (unsigned long long)(result.sramEnd - result.sramDst));
+
+		return result;
 	}
 
 	return result;
@@ -1028,6 +1308,527 @@ struct RegVal
 	uint32_t v = 0;
 };
 
+
+
+// --------------------------
+// Lightweight ARMv5 forward emulation (branch-following)
+// Purpose: resolve TTBR register and collect literal loads / candidate config pointers
+// without requiring straight-line code.
+// This is *not* a full emulator: no memory model except literal reads, no flags solving.
+// Conditional branches are explored both taken and not-taken.
+// --------------------------
+
+
+static inline bool IsBranchImm(uint32_t ins)
+{
+	// ARM B/BL: bits[27:25] == 101
+	return ((ins >> 25) & 0x7) == 0x5;
+}
+
+
+static inline uint64_t BranchTarget(uint64_t curCpuPc, uint32_t ins)
+{
+	// imm24 sign-extended, shifted left 2, added to PC+8 (curCpuPc is current instruction address)
+	int32_t imm24 = (int32_t)(ins & 0x00FFFFFFu);
+	// sign extend 24->32
+	if (imm24 & 0x00800000)
+		imm24 |= 0xFF000000;
+	int32_t off = (imm24 << 2);
+	return (uint64_t)((int64_t)(curCpuPc + 8) + (int64_t)off);
+}
+
+
+static inline uint32_t CondField(uint32_t ins) { return (ins >> 28) & 0xF; }
+static inline bool CondAlways(uint32_t cond) { return cond == 0xE; } // AL
+static inline bool CondNever(uint32_t cond) { return cond == 0xF; }  // NV (treat as never)
+
+
+static inline uint64_t HashRegs(const RegVal regs[16])
+{
+	// Cheap hash: fold known bits and values.
+	uint64_t h = 1469598103934665603ull; // FNV offset
+	for (int i = 0; i < 16; i++)
+	{
+		uint64_t x = (uint64_t)(regs[i].known ? 0xA5A50000u : 0x5A5A0000u) | (uint64_t)regs[i].v;
+		h ^= x + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+	}
+	return h;
+}
+
+
+struct LitLoad
+{
+	uint64_t insFileOff = 0;
+	uint64_t litCpuAddr = 0;
+	uint32_t value = 0;
+	uint32_t rd = 0;
+};
+
+
+struct EmuResult
+{
+	bool regResolved = false;
+	uint32_t regValue = 0;
+	std::vector<LitLoad> literalLoads;
+};
+
+
+static void EmuStepInstruction(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
+	BNEndianness endian, const AddressResolver& resolver, uint64_t fileOff,
+	RegVal regs[16], EmuResult& out, Ref<Logger> logger)
+{
+	uint32_t ins = 0;
+	ReadU32At(reader, data, dataLen, endian, fileOff, ins, resolver.fileLen);
+
+
+	auto getCpuPc = [&](uint64_t fileOff2, uint64_t& outCpuPc) -> bool
+	{
+		return resolver.FileToCpu(fileOff2, outCpuPc, true);
+	};
+
+
+	// MOV (register): 0x01A00000
+	if ((ins & 0x0FF0FFF0) == 0x01A00000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		uint32_t rm = ins & 0xF;
+		// If this is MOV pc, Rm, control flow is handled in ResolveRegAtEmulated.
+		if (rd == 15)
+			return;
+		if (regs[rm].known) regs[rd] = regs[rm];
+		else regs[rd].known = false;
+		return;
+	}
+
+
+	// MOV (imm): 0x03A00000
+	if ((ins & 0x0FEF0000) == 0x03A00000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		regs[rd].known = true;
+		regs[rd].v = DecodeImm12(ins);
+		return;
+	}
+
+
+	// ORR (imm): opcode 1100
+	if ((ins & 0x0FE00000) == 0x03800000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		uint32_t rn = (ins >> 16) & 0xF;
+		uint32_t opcode = (ins >> 21) & 0xF;
+		if (opcode == 0xC)
+		{
+			if (regs[rn].known)
+			{
+				uint32_t imm = DecodeImm12(ins);
+				regs[rd].known = true;
+				regs[rd].v = regs[rn].v | imm;
+			}
+			else regs[rd].known = false;
+			return;
+		}
+	}
+
+
+	// BIC (imm): opcode 1110
+	if ((ins & 0x0FE00000) == 0x03C00000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		uint32_t rn = (ins >> 16) & 0xF;
+		uint32_t opcode = (ins >> 21) & 0xF;
+		if (opcode == 0xE)
+		{
+			if (regs[rn].known)
+			{
+				uint32_t imm = DecodeImm12(ins);
+				regs[rd].known = true;
+				regs[rd].v = regs[rn].v & ~imm;
+			}
+			else regs[rd].known = false;
+			return;
+		}
+	}
+
+
+	// ADD/SUB (imm)
+	if ((ins & 0x0FE00000) == 0x02800000 || (ins & 0x0FE00000) == 0x02400000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		uint32_t rn = (ins >> 16) & 0xF;
+		uint32_t opcode = (ins >> 21) & 0xF;
+		uint32_t imm = DecodeImm12(ins);
+
+
+		if (opcode == 0x4) // ADD
+		{
+			if (rn == 15)
+			{
+				uint64_t cpuPc = 0;
+				if (getCpuPc(fileOff, cpuPc)) { regs[rd].known = true; regs[rd].v = (uint32_t)(cpuPc + 8 + imm); }
+				else { regs[rd].known = true; regs[rd].v = (uint32_t)(fileOff + 8 + imm); }
+			}
+			else if (regs[rn].known) { regs[rd].known = true; regs[rd].v = regs[rn].v + imm; }
+			else regs[rd].known = false;
+			return;
+		}
+		if (opcode == 0x2) // SUB
+		{
+			if (rn == 15)
+			{
+				uint64_t cpuPc = 0;
+				if (getCpuPc(fileOff, cpuPc)) { regs[rd].known = true; regs[rd].v = (uint32_t)(cpuPc + 8 - imm); }
+				else { regs[rd].known = true; regs[rd].v = (uint32_t)(fileOff + 8 - imm); }
+			}
+			else if (regs[rn].known) { regs[rd].known = true; regs[rd].v = regs[rn].v - imm; }
+			else regs[rd].known = false;
+			return;
+		}
+	}
+
+
+	// LDR literal
+	if ((ins & 0x0F7F0000) == 0x051F0000)
+	{
+		uint32_t rd = (ins >> 12) & 0xF;
+		// If this is a load into PC, control-flow is handled in ResolveRegAtEmulated.
+		if (rd == 15)
+			return;
+		uint32_t imm12 = ins & 0xFFF;
+		bool add = (ins & 0x00800000) != 0;
+
+		uint64_t cpuPc = 0;
+		uint64_t litCpu = 0;
+		uint32_t val = 0;
+		RomToSramCopy dummy = {0, 0, 0, false};
+
+		if (getCpuPc(fileOff, cpuPc))
+		{
+			uint64_t pcVal = cpuPc + 8;
+			litCpu = add ? (pcVal + imm12) : (pcVal - imm12);
+			if (ReadU32Resolved(reader, data, dataLen, endian, resolver, litCpu, dummy, resolver.fileLen, val))
+			{
+				regs[rd].known = true;
+				regs[rd].v = val;
+				out.literalLoads.push_back({fileOff, litCpu, val, rd});
+			}
+			else regs[rd].known = false;
+		}
+		else
+		{
+			uint64_t pcFile = fileOff + 8;
+			uint64_t litFile = add ? (pcFile + imm12) : (pcFile - imm12);
+			if (litFile + 4 <= resolver.fileLen && ReadU32At(reader, data, dataLen, endian, litFile, val, resolver.fileLen))
+			{
+				regs[rd].known = true;
+				regs[rd].v = val;
+				// best-effort: record litCpuAddr as file-based value if CPU mapping unknown
+				out.literalLoads.push_back({fileOff, litFile, val, rd});
+			}
+			else regs[rd].known = false;
+		}
+		return;
+	}
+
+
+	// Conservative invalidation for other ops that write Rd (same policy as ResolveRegAt)
+	uint32_t classBits = (ins >> 26) & 0x3;
+	if (classBits == 0)
+	{
+		uint32_t opcode = (ins >> 21) & 0xF;
+		if (!(opcode >= 0x8 && opcode <= 0xB))
+		{
+			uint32_t rd = (ins >> 12) & 0xF;
+			regs[rd].known = false;
+		}
+	}
+	else if (classBits == 1)
+	{
+		bool isLoad = (ins & (1u << 20)) != 0;
+		if (isLoad)
+		{
+			uint32_t rd = (ins >> 12) & 0xF;
+			regs[rd].known = false;
+		}
+	}
+
+
+	(void)logger;
+}
+
+
+static bool ResolveRegAtEmulated(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
+	BNEndianness endian, const AddressResolver& resolver,
+	uint64_t startFileOff, uint64_t endFileOff,
+	uint32_t targetReg, uint32_t& outValue,
+	EmuResult* optResult, Ref<Logger> logger)
+{
+	if (startFileOff >= resolver.fileLen || endFileOff > resolver.fileLen || startFileOff >= endFileOff)
+		return false;
+
+
+	struct Node { uint64_t off; RegVal regs[16]; };
+	std::vector<Node> work;
+	work.reserve(64);
+
+
+	Node n{};
+	n.off = startFileOff & ~3ull;
+	work.push_back(n);
+
+
+	std::unordered_set<uint64_t> visited;
+	visited.reserve(4096);
+
+
+	const size_t kMaxStates = 20000;
+	const uint64_t kMaxSpan = 0x3000; // keep bounded: function-local-ish
+
+
+	EmuResult localRes;
+
+
+	while (!work.empty() && visited.size() < kMaxStates)
+	{
+		Node cur = work.back();
+		work.pop_back();
+
+
+		// clamp exploration window (avoid runaway into other code)
+		if (cur.off + 4 > resolver.fileLen)
+			continue;
+		if (cur.off > endFileOff)
+			continue;
+		if (cur.off > startFileOff + kMaxSpan && endFileOff <= startFileOff + kMaxSpan)
+			continue;
+
+
+		uint64_t h = (cur.off << 1) ^ HashRegs(cur.regs);
+		if (visited.find(h) != visited.end())
+			continue;
+		visited.insert(h);
+
+
+		if (cur.off == endFileOff)
+		{
+			if (cur.regs[targetReg].known)
+			{
+				outValue = cur.regs[targetReg].v;
+				if (optResult) *optResult = localRes;
+				return true;
+			}
+			continue;
+		}
+
+
+		uint32_t ins = 0;
+		ReadU32At(reader, data, dataLen, endian, cur.off, ins, resolver.fileLen);
+
+		// Indirect branch: BX Rm
+		// Encoding: 0x012FFF10 | Rm (ignore cond)
+		if ((ins & 0x0FFFFFF0u) == 0x012FFF10u)
+		{
+			uint32_t rm = ins & 0xFu;
+			if (!cur.regs[rm].known)
+				continue;
+
+			uint64_t tgtCpu = (uint64_t)cur.regs[rm].v;
+			uint64_t tgtFile = 0;
+			if (!resolver.CpuToFile(tgtCpu, tgtFile, true))
+				continue;
+
+			Node taken = cur;
+			taken.off = tgtFile & ~3ull;
+			work.push_back(taken);
+			continue;
+		}
+
+		// MOV pc, Rm (data-processing MOV with Rd==15)
+		if ((ins & 0x0FF0FFF0u) == 0x01A00000u)
+		{
+			uint32_t rd = (ins >> 12) & 0xFu;
+			uint32_t rm = ins & 0xFu;
+			if (rd == 15)
+			{
+				if (!cur.regs[rm].known)
+					continue;
+				uint64_t tgtCpu = (uint64_t)cur.regs[rm].v;
+				uint64_t tgtFile = 0;
+				if (!resolver.CpuToFile(tgtCpu, tgtFile, true))
+					continue;
+				Node taken = cur;
+				taken.off = tgtFile & ~3ull;
+				work.push_back(taken);
+				continue;
+			}
+		}
+
+		// LDR pc, [pc, #imm] (literal load into PC)
+		if ((ins & 0x0F7F0000u) == 0x051F0000u && (((ins >> 12) & 0xFu) == 15))
+		{
+			uint32_t imm12 = ins & 0xFFFu;
+			bool add = (ins & 0x00800000u) != 0;
+
+			uint64_t cpuPc = 0;
+			if (!resolver.FileToCpu(cur.off, cpuPc, true))
+				cpuPc = cur.off;
+
+			uint64_t pcVal = cpuPc + 8;
+			uint64_t litCpu = add ? (pcVal + imm12) : (pcVal - imm12);
+			uint32_t val = 0;
+			RomToSramCopy dummy = {0, 0, 0, false};
+			if (!ReadU32Resolved(reader, data, dataLen, endian, resolver, litCpu, dummy, resolver.fileLen, val))
+				continue;
+
+			// Record the literal load for later candidate derivation.
+			localRes.literalLoads.push_back({cur.off, litCpu, val, 15});
+
+			uint64_t tgtFile = 0;
+			if (!resolver.CpuToFile((uint64_t)val, tgtFile, true))
+				continue;
+			Node taken = cur;
+			taken.off = tgtFile & ~3ull;
+			work.push_back(taken);
+			continue;
+		}
+
+		// Branch immediate handling (explore)
+		if (IsBranchImm(ins))
+		{
+			uint32_t cond = CondField(ins);
+			if (CondNever(cond))
+			{
+				// treat as no-op (rare NV in ARM state)
+			}
+			else
+			{
+				uint64_t cpuPc = 0;
+				if (!resolver.FileToCpu(cur.off, cpuPc, true))
+					cpuPc = cur.off;
+
+				uint64_t tgtCpu = BranchTarget(cpuPc, ins);
+				uint64_t tgtFile = 0;
+				if (resolver.CpuToFile(tgtCpu, tgtFile, true))
+				{
+					Node taken = cur;
+					taken.off = tgtFile & ~3ull;
+
+					// BL behaves like a call: set LR to return address (next instruction) and
+					// explore fallthrough regardless of condition (call-return behavior).
+					bool isBL = (ins & (1u << 24)) != 0;
+					if (isBL)
+					{
+						uint32_t lrVal = 0;
+						// In ARM state, LR gets address of the next instruction (curCpuPc + 4).
+						lrVal = (uint32_t)(cpuPc + 4);
+						// Apply LR update to both paths.
+						cur.regs[14].known = true;
+						cur.regs[14].v = lrVal;
+						taken.regs[14].known = true;
+						taken.regs[14].v = lrVal;
+
+						Node fall = cur;
+						fall.off = cur.off + 4;
+						work.push_back(fall);
+					}
+					else if (!CondAlways(cond))
+					{
+						Node fall = cur;
+						fall.off = cur.off + 4;
+						work.push_back(fall);
+					}
+
+					work.push_back(taken);
+					continue;
+				}
+				else
+				{
+					// target not mappable -> stop this path
+					continue;
+				}
+			}
+		}
+
+
+		// Normal step: execute instruction semantics, then fallthrough
+		EmuStepInstruction(reader, data, dataLen, endian, resolver, cur.off, cur.regs, localRes, logger);
+
+
+		Node nxt = cur;
+		nxt.off = cur.off + 4;
+		work.push_back(nxt);
+	}
+
+
+	if (logger)
+		logger->LogDebug("MMU: Emu resolve failed for R%d (visited=%zu states)", targetReg, visited.size());
+	if (optResult) *optResult = localRes;
+	return false;
+}
+
+
+static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loads,
+	std::vector<MMUConfigArray>& out, Ref<Logger> logger)
+{
+	out.clear();
+	if (loads.empty())
+		return;
+
+
+	// Dedup by value, keep a representative literal pool address.
+	std::map<uint32_t, uint64_t> valToLit;
+	for (const auto& ll : loads)
+	{
+		if (valToLit.find(ll.value) == valToLit.end())
+			valToLit[ll.value] = ll.litCpuAddr;
+	}
+
+
+	std::vector<uint32_t> vals;
+	vals.reserve(valToLit.size());
+	for (auto& kv : valToLit) vals.push_back(kv.first);
+	std::sort(vals.begin(), vals.end());
+
+
+	// Find plausible (start,end) pairs. Keep it tight to avoid junk explosion.
+	const uint32_t kMaxSpan = 0x10000;
+	size_t produced = 0;
+	for (size_t i = 0; i < vals.size(); i++)
+	{
+		for (size_t j = i + 1; j < vals.size(); j++)
+		{
+			uint32_t a = vals[i], b = vals[j];
+			uint32_t d = b - a;
+			if (d == 0) continue;
+			if (d > kMaxSpan) break;
+
+
+			// Candidate arrays are typically 4- or 8-byte entries and aligned.
+			if ((a & 0x3) != 0 || (b & 0x3) != 0)
+				continue;
+			if (d < 16) // too small
+				continue;
+			if ((d % 4) != 0)
+				continue;
+
+
+			MMUConfigArray arr{};
+			arr.startAddr = a;
+			arr.endAddr = b;
+			arr.isIdentity = true; // legacy hint only; real format chosen by ChooseBestFormat
+			arr.litPoolAddr1 = valToLit[a];
+			arr.litPoolAddr2 = valToLit[b];
+			out.push_back(arr);
+			produced++;
+			if (produced >= 64) // cap
+				return;
+		}
+	}
+
+
+	if (logger && !out.empty())
+		logger->LogInfo("MMU: Emulated walk produced %zu candidate config arrays (literal-derived)", out.size());
+}
 static bool ResolveRegAt(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, const AddressResolver& resolver, uint64_t useFileOff,
 	uint32_t targetReg, uint32_t& outValue, Ref<Logger> logger)
@@ -1257,32 +2058,142 @@ static bool ResolveRegAt(BinaryReader& reader, const uint8_t* data, uint64_t dat
 	return false;
 }
 
+// Produce a compact but useful debug summary of regions, beyond the per-region listing.
+static void LogRegionSummary(const std::vector<MemRegion>& regions, Ref<Logger> logger, const char* tag)
+{
+	if (!logger)
+		return;
+	if (regions.empty())
+	{
+		logger->LogInfo("MMU: Summary(%s): no regions", tag ? tag : "?");
+		return;
+	}
+
+
+	uint64_t minVA = regions[0].virtBase, maxVA = regions[0].virtBase + regions[0].size;
+	uint64_t minPA = regions[0].physBase, maxPA = regions[0].physBase + regions[0].size;
+	uint64_t total = 0;
+	uint64_t totalRam = 0, totalMmio = 0;
+	size_t ramCnt = 0, mmioCnt = 0, otherCnt = 0;
+	size_t rwx[8] = {0};
+	size_t cacheWB = 0, cacheWT = 0, cacheWC = 0, cacheUC = 0;
+
+
+	uint64_t largest = 0, smallest = ~0ull;
+	MemRegion largestR = regions[0], smallestR = regions[0];
+
+
+	for (const auto& r : regions)
+	{
+		if (r.size == 0) continue;
+		minVA = std::min(minVA, r.virtBase);
+		maxVA = std::max(maxVA, r.virtBase + r.size);
+		minPA = std::min(minPA, r.physBase);
+		maxPA = std::max(maxPA, r.physBase + r.size);
+		total += r.size;
+
+
+		bool isMmio = (r.type && std::strcmp(r.type, "MMIO") == 0);
+		bool isRam = (r.type && std::strcmp(r.type, "RAM") == 0) || (!r.type);
+		if (isMmio) { mmioCnt++; totalMmio += r.size; }
+		else if (isRam) { ramCnt++; totalRam += r.size; }
+		else otherCnt++;
+
+
+		uint32_t idx = (r.readable ? 1 : 0) | (r.writable ? 2 : 0) | (r.executable ? 4 : 0);
+		rwx[idx]++;
+
+
+		// Cache policy histogram
+		if (r.cacheable && r.bufferable) cacheWB++;
+		else if (r.cacheable && !r.bufferable) cacheWT++;
+		else if (!r.cacheable && r.bufferable) cacheWC++;
+		else cacheUC++;
+
+
+		if (r.size > largest) { largest = r.size; largestR = r; }
+		if (r.size < smallest) { smallest = r.size; smallestR = r; }
+	}
+
+
+	logger->LogInfo("MMU: Summary(%s): regions=%zu VA=[0x%08llx..0x%08llx] span=0x%llx total=0x%llx",
+		tag ? tag : "?", regions.size(),
+		(unsigned long long)minVA, (unsigned long long)(maxVA ? (maxVA - 1) : 0),
+		(unsigned long long)(maxVA - minVA),
+		(unsigned long long)total);
+	logger->LogInfo("MMU: Summary(%s): RAM=%zu (0x%llx) MMIO=%zu (0x%llx) other=%zu",
+		tag ? tag : "?",
+		ramCnt, (unsigned long long)totalRam,
+		mmioCnt, (unsigned long long)totalMmio,
+		otherCnt);
+	logger->LogInfo("MMU: Summary(%s): cache WB=%zu WT=%zu WC=%zu UC=%zu",
+		tag ? tag : "?", cacheWB, cacheWT, cacheWC, cacheUC);
+	logger->LogInfo("MMU: Summary(%s): perms R=%zu RW=%zu RX=%zu RWX=%zu (and others)",
+		tag ? tag : "?",
+		rwx[1], rwx[3], rwx[5], rwx[7]);
+	logger->LogInfo("MMU: Summary(%s): largest 0x%llx @ VA 0x%08llx type=%s; smallest 0x%llx @ VA 0x%08llx type=%s",
+		tag ? tag : "?",
+		(unsigned long long)largest,
+		(unsigned long long)largestR.virtBase,
+		largestR.type ? largestR.type : "?",
+		(unsigned long long)smallest,
+		(unsigned long long)smallestR.virtBase,
+		smallestR.type ? smallestR.type : "?");
+	(void)minPA; (void)maxPA;
+}
+
 static bool LooksLikeL1Table(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, uint64_t offset, uint64_t length)
 {
-	if (offset + 0x4000 > length)
-		return false;
+	if (offset + 0x4000 > length) return false;
 
-	size_t valid = 0;
-	size_t faults = 0;
+	size_t faults = 0, coarse = 0, fine = 0, sections = 0;
+	size_t badCoarse = 0, badFine = 0;
+	std::map<uint32_t, size_t> deltaFreq;
 
 	for (size_t i = 0; i < 4096; i++)
 	{
 		uint32_t desc = 0;
-		if (!ReadU32At(reader, data, dataLen, endian, offset + (i * 4), desc, length))
-			return false;
-
+		if (!ReadU32At(reader, data, dataLen, endian, offset + (i * 4), desc, length)) return false;
 		uint32_t type = desc & 0x3;
-		if (type == 0)
-			faults++;
-		else if (type == 1 || type == 2)
-			valid++;
+		
+		if (type==0) { faults++; continue; }
+        if (type==1) { coarse++; if ((desc & 0x3FFu)!=0) badCoarse++; continue; }
+        if (type==3) { fine++;   if ((desc & 0xFFFu)!=0) badFine++;   continue; }
+
+        // section
+        sections++;
+        bool super = (desc & (1u<<18)) != 0;
+        uint32_t pa = super ? (desc & 0xFF000000u) : (desc & 0xFFF00000u);
+        uint32_t va = (uint32_t)(i << 20);
+        deltaFreq[pa - va]++;
 	}
 
-	if (valid < 128)
+	size_t valid = sections + coarse + fine;
+	if (valid < 64)
 		return false;
-	if (faults > 4000)
+	if (faults < 128)
 		return false;
+
+	if (sections >= 32)
+	{
+		size_t best = 0;
+		for (auto &kv : deltaFreq)
+			best = std::max(best, kv.second);
+		if (best < std::max<size_t>(16, sections / 4))
+			return false;
+	}
+	else
+	{
+		// if no sections, only accept if many page tables & theyre aligned
+		if ((coarse + fine) < 128)
+			return false;
+		if (coarse && badCoarse > coarse / 8)
+			return false;
+		if (fine && badFine > fine / 8)
+			return false;
+	}
+
 	return true;
 }
 
@@ -1318,6 +2229,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 	MMULogScope logScope(logger, viewName);
 
 	AddressResolver resolver = BuildResolver(imageBase, length);
+	MMUWalkMode walkMode = GetMMUWalkMode(view, logger);
 	std::vector<uint64_t> ttbrHits;
 
 	// Scan for MCR p15, 0, Rx, c2, c0, 0/1 instruction
@@ -1459,7 +2371,74 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			(unsigned long long)ttbrInstrAddr, rt);
 
 		uint32_t ttbrRegValue = 0;
-		if (!ResolveRegAt(reader, data, dataLen, endian, resolver, ttbrInstrAddr, rt, ttbrRegValue, logger))
+				bool resolved = false;
+		EmuResult emuRes{};
+
+
+		// Prefer emulated walk when requested; otherwise keep the existing fast backsolve.
+		if (walkMode == MMUWalkMode::Emulated)
+		{
+			uint64_t mmuSetupFuncStart = 0;
+			// keep same prologue heuristic: nearest PUSH {..,LR}
+			for (int i = 1; i <= 32 && ttbrInstrAddr >= (uint64_t)(i * 4); i++)
+			{
+				uint32_t prevInstr = 0;
+				ReadU32At(reader, data, dataLen, endian, ttbrInstrAddr - (i * 4), prevInstr, length);
+				if ((prevInstr & 0xFFFF0000) == 0xE92D0000 && (prevInstr & 0x4000))
+				{
+					mmuSetupFuncStart = ttbrInstrAddr - (i * 4);
+					break;
+				}
+			}
+
+			// Prefer starting emulation from the binary entry point (often the vec_reset handler).
+			// This is closer to "real" boot flow than starting from a short window before the TTBR write.
+			uint64_t entryStart = 0;
+			if (view)
+			{
+				uint64_t ep = view->GetEntryPoint();
+				uint64_t epFile = 0;
+				if (ep && resolver.CpuToFile(ep, epFile, true))
+					entryStart = epFile & ~3ull;
+				else if (ep && ep < length)
+					entryStart = ep & ~3ull;
+			}
+
+			uint64_t start = 0;
+			if (entryStart != 0 && entryStart < ttbrInstrAddr)
+				start = entryStart;
+			else if (mmuSetupFuncStart != 0)
+				start = mmuSetupFuncStart;
+			else
+				start = (ttbrInstrAddr > 0x800) ? (ttbrInstrAddr - 0x800) : 0;
+
+			uint64_t end = ttbrInstrAddr;
+
+			if (logger)
+				logger->LogDebug("MMU: Emu window 0x%llx - 0x%llx%s", (unsigned long long)start,
+					(unsigned long long)end, (entryStart != 0 ? " (entrypoint-based)" : ""));
+
+			resolved = ResolveRegAtEmulated(reader, data, dataLen, endian, resolver, start, end, rt, ttbrRegValue, &emuRes, logger);
+			if (!resolved)
+			{
+				// fallback to old method (sometimes better for straight-line)
+				resolved = ResolveRegAt(reader, data, dataLen, endian, resolver, ttbrInstrAddr, rt, ttbrRegValue, logger);
+			}
+		}
+		else
+		{
+			resolved = ResolveRegAt(reader, data, dataLen, endian, resolver, ttbrInstrAddr, rt, ttbrRegValue, logger);
+			if (!resolved)
+			{
+				// fallback: try emulated walk only if old method fails
+				uint64_t start = (ttbrInstrAddr > 0x800) ? (ttbrInstrAddr - 0x800) : 0;
+				uint64_t end = ttbrInstrAddr;
+				resolved = ResolveRegAtEmulated(reader, data, dataLen, endian, resolver, start, end, rt, ttbrRegValue, nullptr, logger);
+			}
+		}
+
+
+		if (!resolved)
 		{
 			logger->LogInfo("MMU: TTBR value not resolved at 0x%llx", (unsigned long long)ttbrInstrAddr);
 			continue;
@@ -1521,6 +2500,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			std::vector<MemRegion> regions;
 			if (ParseArmv5L1Table(reader, data, dataLen, endian, resolver, length, romCopy, tableBase, regions, logger))
 			{
+				LogRegionSummary(regions, logger, "L1");
 				logL1Regions(regions);
 				return;
 			}
@@ -1549,10 +2529,31 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 		if (scanEnd > length)
 			scanEnd = length;
 
-		logger->LogInfo("MMU: Scanning 0x%llx - 0x%llx for config arrays",
-			(unsigned long long)scanStart, (unsigned long long)scanEnd);
+		logger->LogInfo("MMU: Scanning 0x%llx - 0x%llx for config arrays (mode=%s)",
+			(unsigned long long)scanStart, (unsigned long long)scanEnd,
+			(walkMode == MMUWalkMode::Emulated) ? "Emulated" : "Heuristic");
 
-		for (uint64_t offset = scanStart; offset + 4 <= scanEnd; offset += 4)
+				// If we have emulation results, derive candidates from literal loads first.
+		// This tends to work better when the setup code has branches / multiple paths.
+		if (!emuRes.literalLoads.empty())
+		{
+			DiscoverConfigArraysFromLiteralLoads(emuRes.literalLoads, configArrays, logger);
+			for (const auto& arr : configArrays)
+			{
+				logger->LogInfo("MMU: Candidate config array 0x%llx-0x%llx (lit 0x%llx / 0x%llx)",
+					(unsigned long long)arr.startAddr, (unsigned long long)arr.endAddr,
+					(unsigned long long)arr.litPoolAddr1, (unsigned long long)arr.litPoolAddr2);
+			}
+		}
+
+
+		// Keep existing heuristic scan as well (either as primary or fallback).
+		if (configArrays.empty())
+		{
+			logger->LogInfo("MMU: No emulated-derived arrays; using heuristic LDR-pair scan");
+		}
+
+		for (uint64_t offset = scanStart; configArrays.empty() && offset + 4 <= scanEnd; offset += 4)
 		{
 			uint32_t instrScan = 0;
 			ReadU32At(reader, data, dataLen, endian, offset, instrScan, length);
@@ -1588,6 +2589,32 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 
 								if (value < valueb && (valueb - value) <= 0x10000)
 								{
+									// Filter out obvious junk: endpoints must live in the same meaningful address space.
+									if (value == 0 || valueb == 0)
+										continue;
+									if (aliasBase != 0)
+									{
+										if ( (value  & 0xFF000000u) != (uint32_t)aliasBase ||
+											 (valueb & 0xFF000000u) != (uint32_t)aliasBase )
+											continue;
+									}
+									else if (imageBase != 0)
+									{
+										// If we're using a real image base, require the pair to be inside that mapped range.
+										if ((uint64_t)value < imageBase || (uint64_t)value >= imageBase + length)
+											continue;
+										if ((uint64_t)valueb <= imageBase || (uint64_t)valueb > imageBase + length)
+											continue;
+									}
+
+									uint64_t offA = 0, offB = 0;
+									// Reject junk pointer pairs: require a *non-fallback* mapping (no blob0 fallback).
+									if (!resolver.CpuToFile((uint64_t)value, offA, false) ||
+										!resolver.CpuToFile(((uint64_t)valueb) - 4, offB, false))
+										continue;
+									// Also reject tiny/near-header offsets; real tables won't start at 0.
+									if (offA < 0x1000 || offB < 0x1000)
+										continue;
 									bool isIdentity = ((valueb - value) % 4 == 0);
 
 									MMUConfigArray arr;
@@ -1619,7 +2646,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			logger->LogInfo("MMU: No config arrays found in tight window; widening scan to 0x%llx - 0x%llx",
 				(unsigned long long)wideStart, (unsigned long long)wideEnd);
 
-			for (uint64_t offset = wideStart; offset + 4 <= wideEnd; offset += 4)
+			for (uint64_t offset = wideStart; configArrays.empty() && offset + 4 <= wideEnd; offset += 4)
 			{
 				uint32_t instrScan = 0;
 				ReadU32At(reader, data, dataLen, endian, offset, instrScan, length);
@@ -1655,6 +2682,32 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 
 									if (value < valueb && (valueb - value) <= 0x10000)
 									{
+										// Filter out obvious junk: endpoints must live in the same meaningful address space.
+										if (value == 0 || valueb == 0)
+											continue;
+										if (aliasBase != 0)
+										{
+											if ( (value  & 0xFF000000u) != (uint32_t)aliasBase ||
+												 (valueb & 0xFF000000u) != (uint32_t)aliasBase )
+												continue;
+										}
+										else if (imageBase != 0)
+										{
+											// If we're using a real image base, require the pair to be inside that mapped range.
+											if ((uint64_t)value < imageBase || (uint64_t)value >= imageBase + length)
+												continue;
+											if ((uint64_t)valueb <= imageBase || (uint64_t)valueb > imageBase + length)
+												continue;
+										}
+
+										uint64_t offA = 0, offB = 0;
+										// Reject junk pointer pairs: require a *non-fallback* mapping (no blob0 fallback).
+										if (!resolver.CpuToFile((uint64_t)value, offA, false) ||
+											!resolver.CpuToFile(((uint64_t)valueb) - 4, offB, false))
+											continue;
+										// Also reject tiny/near-header offsets; real tables won't start at 0.
+										if (offA < 0x1000 || offB < 0x1000)
+											continue;
 										bool isIdentity = ((valueb - value) % 4 == 0);
 
 										MMUConfigArray arr;
@@ -1683,6 +2736,9 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			continue;
 		}
 
+		// Debug summary: arrays found
+		logger->LogInfo("MMU: %zu config array candidate(s) accepted for format scoring", configArrays.size());
+
 		vector<MemRegion> regions;
 		MemRegion currentRegion = {0, 0, 0, false, false, false, false, false, nullptr};
 
@@ -1692,13 +2748,24 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			MapStats st = {};
 			if (!ChooseBestFormat(resolver, reader, data, dataLen, endian, romCopy, length, arr, fmt, st))
 			{
+				// Fallback: region descriptor list (va, pa, size, flags)
+				std::vector<MemRegion> rd;
+				if (ParseRegionDesc16(resolver, reader, data, dataLen, endian, romCopy, length, arr, rd, logger))
+				{
+					logger->LogInfo("MMU: Using RegionDesc16 for candidate array 0x%llx-0x%llx (%zu region(s))",
+						(unsigned long long)arr.startAddr, (unsigned long long)arr.endAddr, rd.size());
+					regions.insert(regions.end(), rd.begin(), rd.end());
+					continue;
+				}
+
 				logger->LogInfo("MMU: Rejecting candidate array 0x%llx-0x%llx (failed preflight)",
-												(unsigned long long)arr.startAddr, (unsigned long long)arr.endAddr);
+					(unsigned long long)arr.startAddr, (unsigned long long)arr.endAddr);
 				continue;
 			}
 
 			uint64_t entrySize = (fmt.kind == MapEntryKind::Identity4) ? 4 : 8;
-			uint64_t entryCount = (arr.endAddr - arr.startAddr) / entrySize;
+			uint64_t effectiveEnd = (fmt.effectiveEndAddr != 0) ? fmt.effectiveEndAddr : arr.endAddr;
+			uint64_t entryCount = (effectiveEnd - arr.startAddr) / entrySize;
 			logger->LogInfo("MMU: Using format %s %s (score=%.2f aligned=%zu/%zu stride=0x%x flags=%zu)",
 											(fmt.kind == MapEntryKind::VaPa8 ? "VaPa8" : "Identity4"),
 											(fmt.gran == MapGranularity::Section1M ? "1M" : "4K"),
@@ -1720,6 +2787,8 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			}
 
 			logger->LogInfo("MMU: Parsing config array with %llu entries", (unsigned long long)entryCount);
+			if (fmt.kind == MapEntryKind::VaPa8 && fmt.swapWords)
+				logger->LogInfo("MMU:   Note: VaPa8 word order swapped (PA,VA)");
 			currentRegion = {0, 0, 0, false, false, false, false, false, nullptr}; // IMPORTANT: reset per array
 			for (uint64_t i = 0; i < entryCount; i++)
 			{
@@ -1735,7 +2804,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 				uint32_t pa = paRaw & fmt.alignMask;
 				uint32_t flags = paRaw & fmt.knownFlagMask;
 
-				// Your flag decode (keep it, but now flags won’t be “address dust”)
+				// Your flag decode (keep it, but now flags wont be "address dust")
 				bool readable = (flags & 0x01) != 0;
 				bool writable = (flags & 0x02) != 0;
 				bool executable = (flags & 0x04) != 0;
@@ -1799,6 +2868,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			uniqueRegions.push_back(region);
 		}
 
+		LogRegionSummary(uniqueRegions, logger, "Config");
 		logConfigRegions(uniqueRegions);
 		return;
 	}
