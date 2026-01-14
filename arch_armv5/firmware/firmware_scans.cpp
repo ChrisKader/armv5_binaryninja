@@ -78,10 +78,10 @@ static inline void PlanRemoveFunction(FirmwareScanPlan* plan, uint64_t addr)
 		plan->removeFunctions.push_back(addr);
 }
 
-static inline void PlanDefineData(FirmwareScanPlan* plan, uint64_t addr, const Ref<Type>& type)
+static inline void PlanDefineData(FirmwareScanPlan* plan, uint64_t addr, const Ref<Type>& type, bool user = false)
 {
 	if (plan)
-		plan->defineData.push_back({addr, type});
+		plan->defineData.push_back({addr, type, user});
 }
 
 static inline void PlanUndefineData(FirmwareScanPlan* plan, uint64_t addr)
@@ -2235,13 +2235,15 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 
 	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Type> ptrType = Type::PointerType(ctx.arch, Type::VoidType());
-	Ref<Type> u32Type = Type::IntegerType(4, false);
+	// Use unsigned hex display so literal pool values match their disassembly representation
+	auto u32Builder = TypeBuilder::IntegerType(4, false);
+	u32Builder.SetIntegerTypeDisplayType(UnsignedHexadecimalDisplayType);
+	Ref<Type> u32Type = u32Builder.Finalize();
 	uint32_t entriesTyped = 0;
 	uint32_t ldrPcCount = 0;
 	uint32_t skippedNonCode = 0;
 	uint32_t skippedInFunction = 0;
 	uint32_t skippedDecodedCode = 0;
-	uint32_t skippedExisting = 0;
 
 	for (uint64_t offset = 0; offset + 4 <= ctx.length; offset += 4)
 	{
@@ -2290,14 +2292,6 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 						continue;
 					}
 				}
-				DataVariable existing;
-				if (ctx.view->GetDataVariableAtAddress(literalAddr, existing) &&
-					existing.address == literalAddr)
-				{
-					skippedExisting++;
-					continue;
-				}
-
 				Ref<Type> entryType = u32Type;
 				if (IsLikelyMMIOPointer(value, ctx.imageBase, ctx.ImageEnd()) ||
 					((value & 3) == 0 && value >= ctx.imageBase && value < ctx.ImageEnd()))
@@ -2308,12 +2302,13 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 				{
 					if (ctx.plan)
 					{
-						PlanDefineData(ctx.plan, literalAddr, entryType);
+						PlanDefineData(ctx.plan, literalAddr, entryType, true);
 						entriesTyped++;
 					}
 					else
 					{
-						ctx.view->DefineDataVariable(literalAddr, entryType);
+						// Use DefineUserDataVariable so our type takes precedence over core analysis
+						ctx.view->DefineUserDataVariable(literalAddr, entryType);
 						entriesTyped++;
 					}
 				}
@@ -2328,8 +2323,8 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 		if (ctx.logger)
 			ctx.logger->LogInfo(
 				"Literal pool typing detail: ldr_pc=%u typed=%u skipped_noncode=%u skipped_in_function=%u "
-				"skipped_decoded_code=%u skipped_existing=%u",
-				ldrPcCount, entriesTyped, skippedNonCode, skippedInFunction, skippedDecodedCode, skippedExisting);
+				"skipped_decoded_code=%u",
+				ldrPcCount, entriesTyped, skippedNonCode, skippedInFunction, skippedDecodedCode);
 	}
 }
 
@@ -2542,7 +2537,10 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 		ctx.logger->LogDebug("Scanning for jump tables...");
 
 	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
-	Ref<Type> uint32Type = Type::IntegerType(4, false);
+	// Use unsigned hex display for consistency with disassembly representation
+	auto uint32Builder = TypeBuilder::IntegerType(4, false);
+	uint32Builder.SetIntegerTypeDisplayType(UnsignedHexadecimalDisplayType);
+	Ref<Type> uint32Type = uint32Builder.Finalize();
 	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	if (ScanShouldAbort(ctx.view))
 		return;

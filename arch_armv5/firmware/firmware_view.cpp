@@ -104,8 +104,10 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 {
 	if (!view)
 		return;
+	// Only process ARMv5 Firmware views
+	if (view->GetTypeName() != "ARMv5 Firmware")
+		return;
 
-	// Minimize BN API calls here
 	auto *obj = view->GetObject();
 	if (!obj)
 		return;
@@ -138,6 +140,7 @@ static void RegisterFirmwareViewDestructionCallbacks()
 			if (!bnView)
 				return;
 
+			// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
 			uintptr_t viewPtr = reinterpret_cast<uintptr_t>(bnView);
 			ViewId viewId = 0;
 
@@ -165,6 +168,7 @@ static void RegisterFirmwareViewDestructionCallbacks()
 			if (!fileMetadata)
 				return;
 
+			// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
 			FileMetadata file(fileMetadata);
 			ViewId viewId = GetViewIdFromFileMetadata(file);
 
@@ -206,12 +210,22 @@ Armv5FirmwareView::Armv5FirmwareView(BinaryView *data, bool parseOnly)
 
 		if (!m_parseOnly && viewId != 0)
 		{
+			bool wasClosing = FirmwareViewClosingSet().count(viewId) > 0;
 			FirmwareViewClosingSet().erase(viewId);
+			FirmwareViewScanCancelSet().erase(viewId);
 			FirmwareViewMap()[viewId] = this;
 
 			m_viewPtr = reinterpret_cast<uintptr_t>(GetObject());
 			if (m_viewPtr != 0)
 				FirmwareViewPointerMap()[m_viewPtr] = viewId;
+
+			m_logger->LogInfo("FirmwareView ctor: viewId=%llu parseOnly=%d wasClosing=%d ptr=0x%llx",
+				(unsigned long long)viewId, m_parseOnly, wasClosing, (unsigned long long)m_viewPtr);
+		}
+		else
+		{
+			m_logger->LogInfo("FirmwareView ctor: viewId=%llu parseOnly=%d (not tracking)",
+				(unsigned long long)viewId, m_parseOnly);
 		}
 	}
 }
@@ -221,6 +235,7 @@ Armv5FirmwareView::~Armv5FirmwareView()
 	// Do not call BinaryView APIs from the destructor. The core object has already
 	// been released by the time this runs. Cleanup happens via the object
 	// destruction callback registered in InitArmv5FirmwareViewType().
+	// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
 	if (m_viewId != 0)
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
@@ -536,49 +551,6 @@ bool Armv5FirmwareView::Init()
 			m_seededUserFunctions.insert(m_entryPoint);
 		}
 
-		// Special handling for IRQ/FIQ handlers that use MMIO vector tables
-		// Mark the instruction after the "ldr pc, [rn, #imm]" trampoline as a function entry.
-		try
-		{
-			for (int vecIdx = 6; vecIdx <= 7; vecIdx++)
-			{
-				if (handlerAddrs[vecIdx] == 0 || handlerAddrs[vecIdx] < imageBase)
-					continue;
-
-				uint64_t handlerOffset = handlerAddrs[vecIdx] - imageBase;
-				if (handlerOffset + 16 > length)
-					continue;
-
-				for (int instrIdx = 0; instrIdx < 4; instrIdx++)
-				{
-					uint32_t instr = 0;
-					ReadU32At(reader, fileData, fileDataLen, m_endian,
-										handlerOffset + (static_cast<uint64_t>(instrIdx) * 4), instr, length);
-
-					// LDR PC, [Rn, #imm] (add/sub) with AL condition:
-					// matches: cond=1110, op=0101, L=1, Rd=PC
-					if (((instr & 0x0F50F000) == 0x0510F000) && ((instr & 0xF0000000) == 0xE0000000))
-					{
-						uint64_t cleanupAddr = handlerAddrs[vecIdx] + (static_cast<uint64_t>(instrIdx + 1) * 4);
-						if (cleanupAddr >= imageBase && cleanupAddr < imageBase + length)
-						{
-							seededFunctions.insert(cleanupAddr);
-							const char *cleanupName = (vecIdx == 6) ? "irq_return" : "fiq_return";
-							m_seededSymbols.push_back(
-									new Symbol(FunctionSymbol, cleanupName, cleanupAddr, GlobalBinding));
-
-							m_logger->LogDebug("Added %s cleanup function at 0x%llx",
-																 cleanupName, (unsigned long long)cleanupAddr);
-						}
-						break;
-					}
-				}
-			}
-		}
-		catch (ReadException &)
-		{
-			// Ignore read errors during IRQ/FIQ cleanup scan
-		}
 
 		// Timing helper for firmware-specific analysis passes (only logs when verbose enabled)
 		auto timePass = [&](const char *label, auto &&fn)
@@ -729,13 +701,6 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView> &view)
 	{
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: wrong view type %s", view->GetTypeName().c_str());
-		return;
-	}
-
-	if (IsFirmwareViewClosing(view.GetPtr()))
-	{
-		if (logger)
-			logger->LogInfo("Firmware workflow scan: skipped (view closing)");
 		return;
 	}
 

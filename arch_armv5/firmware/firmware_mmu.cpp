@@ -1774,7 +1774,6 @@ static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loa
 	if (loads.empty())
 		return;
 
-
 	// Dedup by value, keep a representative literal pool address.
 	std::map<uint32_t, uint64_t> valToLit;
 	for (const auto& ll : loads)
@@ -1783,12 +1782,10 @@ static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loa
 			valToLit[ll.value] = ll.litCpuAddr;
 	}
 
-
 	std::vector<uint32_t> vals;
 	vals.reserve(valToLit.size());
 	for (auto& kv : valToLit) vals.push_back(kv.first);
 	std::sort(vals.begin(), vals.end());
-
 
 	// Find plausible (start,end) pairs. Keep it tight to avoid junk explosion.
 	const uint32_t kMaxSpan = 0x10000;
@@ -1802,7 +1799,6 @@ static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loa
 			if (d == 0) continue;
 			if (d > kMaxSpan) break;
 
-
 			// Candidate arrays are typically 4- or 8-byte entries and aligned.
 			if ((a & 0x3) != 0 || (b & 0x3) != 0)
 				continue;
@@ -1810,7 +1806,6 @@ static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loa
 				continue;
 			if ((d % 4) != 0)
 				continue;
-
 
 			MMUConfigArray arr{};
 			arr.startAddr = a;
@@ -1825,9 +1820,42 @@ static void DiscoverConfigArraysFromLiteralLoads(const std::vector<LitLoad>& loa
 		}
 	}
 
-
 	if (logger && !out.empty())
 		logger->LogInfo("MMU: Emulated walk produced %zu candidate config arrays (literal-derived)", out.size());
+}
+
+static uint64_t InferAliasBaseFromLiteralLoads(const std::vector<LitLoad>& loads)
+{
+	// Heuristic: pick the most common high-byte among literal values that look like SRAM/alias pointers.
+	// We ignore 0 and tiny values, and require the high byte to be non-zero.
+	std::map<uint32_t, size_t> freq;
+	for (const auto& ll : loads)
+	{
+		uint32_t v = ll.value;
+		if (v == 0)
+			continue;
+		// Filter out small immediates/flags.
+		if (v < 0x10000u)
+			continue;
+		uint32_t hi = v & 0xFF000000u;
+		if (hi == 0)
+			continue;
+		freq[hi]++;
+	}
+	uint32_t best = 0;
+	size_t bestCnt = 0;
+	for (auto& kv : freq)
+	{
+		if (kv.second > bestCnt)
+		{
+			bestCnt = kv.second;
+			best = kv.first;
+		}
+	}
+	// Require at least 2 hits to avoid latching onto a single stray pointer.
+	if (bestCnt < 2)
+		return 0;
+	return (uint64_t)best;
 }
 static bool ResolveRegAt(BinaryReader& reader, const uint8_t* data, uint64_t dataLen,
 	BNEndianness endian, const AddressResolver& resolver, uint64_t useFileOff,
@@ -2447,6 +2475,8 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 		uint64_t ttbrValue = ttbrRegValue;
 		uint64_t aliasBase = 0;
 		uint64_t offTmp = 0;
+
+		// Prefer a concrete mapping for TTBR; if it doesn't map directly, treat it as an aliased/SRAM-space pointer.
 		if (!resolver.CpuToFile(ttbrValue, offTmp, false))
 		{
 			aliasBase = ttbrValue & 0xFF000000ULL;
@@ -2457,59 +2487,76 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 			}
 		}
 
+		// If TTBR resolves to 0 / tiny flaggy values, we can still proceed by inferring the alias base from
+		// literal loads seen during emulation (these often point into SRAM where config tables live).
+		if (aliasBase == 0 && !emuRes.literalLoads.empty())
+		{
+			uint64_t inferred = InferAliasBaseFromLiteralLoads(emuRes.literalLoads);
+			if (inferred != 0)
+			{
+				aliasBase = inferred;
+				AddLow24Alias(resolver, aliasBase, length);
+				logger->LogInfo("MMU: Inferred alias base 0x%08llx from literal loads", (unsigned long long)aliasBase);
+			}
+		}
+
 		if ((ttbrValue & ~0x3FFFULL) == 0)
 		{
 			logger->LogInfo("MMU: TTBR resolved to small value (0x%08llx); may be flags without base",
 				(unsigned long long)ttbrValue);
 		}
 
-		if (!resolver.CpuToFile(ttbrValue, offTmp, true))
-		{
-			logger->LogInfo("MMU: TTBR value 0x%08llx not mappable to file", (unsigned long long)ttbrValue);
-			continue;
-		}
-
+		// Find ROM->SRAM copy (used to read initialized SRAM contents). This requires a non-zero alias base.
 		RomToSramCopy romCopy = FindRomToSramCopy(reader, data, dataLen, endian, length, imageBase,
 			resolver, aliasBase, logger);
 
 		uint64_t tableBase = ttbrValue & ~0x3FFFULL;
 		logger->LogInfo("MMU: Translation table base = 0x%08llx", (unsigned long long)tableBase);
 
-		bool allZero = true;
-		bool allOnes = true;
-		bool allFault = true;
-
-		for (int i = 0; i < 16; i++)
+		// If the table base is unmappable (or zero), skip L1 parsing and go straight to config-array discovery.
+		bool tableBaseMappable = false;
+		if (tableBase != 0)
 		{
-			uint32_t entry = 0;
-			if (!ReadU32Resolved(reader, data, dataLen, endian, resolver,
-				tableBase + (i * 4), romCopy, length, entry))
-				break;
-
-			if (entry != 0)
-				allZero = false;
-			if (entry != 0xFFFFFFFF)
-				allOnes = false;
-			if ((entry & 0x3) != 0)
-				allFault = false;
+			uint64_t tmpOff = 0;
+			tableBaseMappable = resolver.CpuToFile(tableBase, tmpOff, true);
 		}
 
-		bool tableLooksEmpty = allZero || allOnes || allFault;
-		if (!tableLooksEmpty)
+		bool tableLooksEmpty = true;
+		if (tableBaseMappable)
 		{
-			std::vector<MemRegion> regions;
-			if (ParseArmv5L1Table(reader, data, dataLen, endian, resolver, length, romCopy, tableBase, regions, logger))
+			bool allZero = true;
+			bool allOnes = true;
+			bool allFault = true;
+
+			for (int i = 0; i < 16; i++)
 			{
-				LogRegionSummary(regions, logger, "L1");
-				logL1Regions(regions);
-				return;
-			}
-			tableLooksEmpty = true;
-			logger->LogInfo("MMU: L1 parse produced no regions; treating as uninitialized");
-		}
+				uint32_t entry = 0;
+				if (!ReadU32Resolved(reader, data, dataLen, endian, resolver,
+					tableBase + (i * 4), romCopy, length, entry))
+					break;
 
-		if (!tableLooksEmpty)
-			continue;
+				if (entry != 0)
+					allZero = false;
+				if (entry != 0xFFFFFFFF)
+					allOnes = false;
+				if ((entry & 0x3) != 0)
+					allFault = false;
+			}
+
+			tableLooksEmpty = allZero || allOnes || allFault;
+			if (!tableLooksEmpty)
+			{
+				std::vector<MemRegion> regions;
+				if (ParseArmv5L1Table(reader, data, dataLen, endian, resolver, length, romCopy, tableBase, regions, logger))
+				{
+					LogRegionSummary(regions, logger, "L1");
+					logL1Regions(regions);
+					return;
+				}
+				tableLooksEmpty = true;
+				logger->LogInfo("MMU: L1 parse produced no regions; treating as uninitialized");
+			}
+		}
 
 		logger->LogInfo("MMU: Translation table appears uninitialized");
 
