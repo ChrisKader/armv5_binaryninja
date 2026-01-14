@@ -56,6 +56,8 @@ file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/platforms/*.h
     ${ARCH_ARMV5_DIR}/firmware/*.cpp
     ${ARCH_ARMV5_DIR}/firmware/*.h
+    ${ARCH_ARMV5_DIR}/settings/*.cpp
+    ${ARCH_ARMV5_DIR}/settings/*.h
     ${ARCH_ARMV5_DIR}/workflow/*.cpp
     ${ARCH_ARMV5_DIR}/workflow/*.h
     ${ARCH_ARMV5_DIR}/il/*.cpp

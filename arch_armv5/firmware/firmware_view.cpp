@@ -258,9 +258,9 @@ bool Armv5FirmwareView::Init()
 
 	// Get load settings if available
 	Ref<Settings> settings = GetLoadSettings(GetTypeName());
-	if (settings && settings->Contains(FirmwareSettingKeys::kImageBase))
+	if (settings && settings->Contains(Armv5Settings::kImageBase))
 	{
-		imageBase = settings->Get<uint64_t>(FirmwareSettingKeys::kImageBase, this);
+		imageBase = settings->Get<uint64_t>(Armv5Settings::kImageBase, this);
 		imageBaseFromUser = (imageBase != 0);
 	}
 
@@ -273,10 +273,10 @@ bool Armv5FirmwareView::Init()
 		LogFirmwareSettingsSummary(m_logger, fwSettings);
 
 	// Handle platform override from settings
-	if (settings && settings->Contains(FirmwareSettingKeys::kPlatform))
+	if (settings && settings->Contains(Armv5Settings::kPlatform))
 	{
 		Ref<Platform> platformOverride =
-				Platform::GetByName(settings->Get<string>(FirmwareSettingKeys::kPlatform, this));
+				Platform::GetByName(settings->Get<string>(Armv5Settings::kPlatform, this));
 		if (platformOverride)
 		{
 			m_plat = platformOverride;
@@ -997,7 +997,7 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView *data)
 	RegisterFirmwareSettings(settings);
 
 	// Allow overriding image base and platform
-	vector<string> overrides = {FirmwareSettingKeys::kImageBase, FirmwareSettingKeys::kPlatform};
+	vector<string> overrides = {Armv5Settings::kImageBase, Armv5Settings::kPlatform};
 	for (const auto &overrideKey : overrides)
 	{
 		if (settings->Contains(overrideKey))
@@ -1006,9 +1006,9 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView *data)
 
 	// Auto-detect image base from vector table if the addresses are absolute
 	uint64_t detectedBase = DetectImageBaseFromVectorTable(data);
-	if (detectedBase != 0 && settings->Contains(FirmwareSettingKeys::kImageBase))
+	if (detectedBase != 0 && settings->Contains(Armv5Settings::kImageBase))
 	{
-		settings->Set(FirmwareSettingKeys::kImageBase, detectedBase, viewRef);
+		settings->Set(Armv5Settings::kImageBase, detectedBase, viewRef);
 		m_logger->LogInfo("Auto-detected image base: 0x%llx", (unsigned long long)detectedBase);
 	}
 

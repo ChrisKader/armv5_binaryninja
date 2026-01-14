@@ -4,6 +4,7 @@
 
 #include "firmware_internal.h"
 #include "firmware_view.h"
+#include "settings/action_policy.h"
 
 #include <algorithm>
 #include <cctype>
@@ -65,15 +66,6 @@ static inline bool ScanShouldAbort(const Ref<BinaryView>& view)
 	return false;
 }
 
-struct FirmwareActionPolicy
-{
-	bool allowAddFunction = true;
-	bool allowDefineData = true;
-	bool allowClearData = true;
-	bool allowDefineSymbol = true;
-	bool allowRemoveFunction = true;
-};
-
 static inline void PlanAddFunction(FirmwareScanPlan* plan, uint64_t addr)
 {
 	if (plan)
@@ -102,86 +94,6 @@ static inline void PlanDefineSymbol(FirmwareScanPlan* plan, const Ref<Symbol>& s
 {
 	if (plan)
 		plan->defineSymbols.push_back(symbol);
-}
-
-static FirmwareActionPolicy ParseFirmwareActionPolicy()
-{
-	FirmwareActionPolicy policy;
-	const char* env = getenv("BN_ARMV5_FIRMWARE_DISABLE_ACTIONS");
-	if (!env || env[0] == '\0')
-		return policy;
-
-	auto normalize = [](std::string token) {
-		for (char& ch : token)
-		{
-			if (ch == '-')
-				ch = '_';
-			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-		}
-		return token;
-	};
-
-	std::string current;
-	auto applyToken = [&](const std::string& raw) {
-		if (raw.empty())
-			return;
-		auto token = normalize(raw);
-		if (token == "all")
-		{
-			policy.allowAddFunction = false;
-			policy.allowDefineData = false;
-			policy.allowClearData = false;
-			policy.allowDefineSymbol = false;
-			policy.allowRemoveFunction = false;
-			return;
-		}
-		if (token == "add_function" || token == "add_functions")
-		{
-			policy.allowAddFunction = false;
-			return;
-		}
-		if (token == "define_data" || token == "define_data_variable" || token == "define_data_variables")
-		{
-			policy.allowDefineData = false;
-			return;
-		}
-		if (token == "clear_data" || token == "undefine_data" || token == "undefine_data_variable"
-			|| token == "undefine_data_variables")
-		{
-			policy.allowClearData = false;
-			return;
-		}
-		if (token == "define_symbol" || token == "define_symbols")
-		{
-			policy.allowDefineSymbol = false;
-			return;
-		}
-		if (token == "remove_function" || token == "remove_functions")
-		{
-			policy.allowRemoveFunction = false;
-			return;
-		}
-	};
-
-	for (const char* p = env; *p; ++p)
-	{
-		char c = *p;
-		if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
-		{
-			applyToken(current);
-			current.clear();
-			continue;
-		}
-		current.push_back(c);
-	}
-	applyToken(current);
-	return policy;
-}
-
-static const FirmwareActionPolicy& GetFirmwareActionPolicy()
-{
-	static FirmwareActionPolicy policy = ParseFirmwareActionPolicy();
-	return policy;
 }
 
 static bool HasExplicitCodeSemantics(const Ref<BinaryView>& view)
@@ -627,7 +539,7 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 	size_t skippedNonCode = 0;
 	size_t skippedInvalidCandidate = 0;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Logger* log = logger ? logger.GetPtr() : nullptr;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 
@@ -1005,7 +917,7 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	size_t skipDuplicate = 0;
 	size_t skipInvalidCandidate = 0;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	// Track addresses we've already added to avoid duplicates
 	std::set<uint64_t> addedAddrs;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
@@ -1414,7 +1326,7 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	size_t rawSkipInvalidTarget = 0;
 	size_t rawSkipJumpTableRefs = 0;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	uint64_t imageEnd = imageBase + length;
 	uint8_t minHigh = (uint8_t)(imageBase >> 24);
 	uint8_t maxHigh = (uint8_t)((imageEnd - 1) >> 24);
@@ -1862,7 +1774,7 @@ size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 	size_t skipPaddingRun = 0;
 	size_t skipNoPrologue = 0;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	std::set<uint64_t> addedAddrs;
 	bool enforceCodeSemantics = HasExplicitCodeSemantics(view);
 	uint64_t lastAddedAddr = 0;
@@ -2156,7 +2068,7 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 	size_t skipValid = 0;
 	size_t skipNoData = 0;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Platform> defaultPlat = view->GetDefaultPlatform();
 	FirmwareScanTuning cleanupTuning = tuning;
 	cleanupTuning.minValidInstr = 1;
@@ -2321,7 +2233,7 @@ void TypeLiteralPoolEntries(const FirmwareScanContext& ctx)
 	if (ScanShouldAbort(ctx.view))
 		return;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Type> ptrType = Type::PointerType(ctx.arch, Type::VoidType());
 	Ref<Type> u32Type = Type::IntegerType(4, false);
 	uint32_t entriesTyped = 0;
@@ -2431,7 +2343,7 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 	if (ctx.logger)
 		ctx.logger->LogDebug("Clearing auto data at code-referenced addresses...");
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	if (ScanShouldAbort(ctx.view))
 		return;
@@ -2518,7 +2430,7 @@ void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 	uint32_t decodeFailed = 0;
 	const size_t maxInstrs = 16;
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	if (ScanShouldAbort(ctx.view))
 		return;
@@ -2629,7 +2541,7 @@ static void ScanForJumpTables(const FirmwareScanContext& ctx)
 	if (ctx.logger)
 		ctx.logger->LogDebug("Scanning for jump tables...");
 
-	const auto& actionPolicy = GetFirmwareActionPolicy();
+	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Type> uint32Type = Type::IntegerType(4, false);
 	Logger* log = ctx.logger ? ctx.logger.GetPtr() : nullptr;
 	if (ScanShouldAbort(ctx.view))

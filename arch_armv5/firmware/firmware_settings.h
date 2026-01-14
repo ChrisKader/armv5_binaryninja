@@ -1,12 +1,14 @@
 /*
  * ARMv5 Firmware Settings
  *
- * Centralized settings keys and load helpers for firmware analysis.
+ * Settings keys and load helpers for firmware analysis.
+ * Uses the centralized settings infrastructure from settings/plugin_settings.h.
  */
 
 #pragma once
 
 #include "firmware_internal.h"
+#include "settings/plugin_settings.h"
 
 #include <cstdint>
 
@@ -16,40 +18,45 @@ enum class FirmwareSettingsMode
 	Workflow
 };
 
-namespace FirmwareSettingKeys
+// Firmware component name for settings registration
+constexpr const char* kFirmwareComponentName = "firmware";
+
+// Setting names (without prefix) - used with component->GetKey()
+namespace FirmwareSettingNames
 {
-	static constexpr const char* kImageBase = "loader.imageBase";
-	static constexpr const char* kPlatform = "loader.platform";
-	static constexpr const char* kScanPrologues = "loader.armv5.firmware.scanPrologues";
-	static constexpr const char* kScanCallTargets = "loader.armv5.firmware.scanCallTargets";
-	static constexpr const char* kScanPointerTargets = "loader.armv5.firmware.scanPointerTargets";
-	static constexpr const char* kScanOrphanCode = "loader.armv5.firmware.scanOrphanCode";
-	static constexpr const char* kOrphanMinValidInstr = "loader.armv5.firmware.orphanMinValidInstr";
-	static constexpr const char* kOrphanMinBodyInstr = "loader.armv5.firmware.orphanMinBodyInstr";
-	static constexpr const char* kOrphanMinSpacingBytes = "loader.armv5.firmware.orphanMinSpacingBytes";
-	static constexpr const char* kOrphanMaxPerPage = "loader.armv5.firmware.orphanMaxPerPage";
-	static constexpr const char* kOrphanRequirePrologue = "loader.armv5.firmware.orphanRequirePrologue";
-	static constexpr const char* kPartialLinearSweep = "loader.armv5.firmware.partialLinearSweep";
-	static constexpr const char* kSkipFirmwareScans = "loader.armv5.firmware.skipFirmwareScans";
-	static constexpr const char* kTypeLiteralPools = "loader.armv5.firmware.typeLiteralPools";
-	static constexpr const char* kClearAutoDataOnCodeRefs = "loader.armv5.firmware.clearAutoDataOnCodeRefs";
-	static constexpr const char* kVerboseLogging = "loader.armv5.firmware.verboseLogging";
-	static constexpr const char* kDisablePointerSweep = "loader.armv5.firmware.disablePointerSweep";
-	static constexpr const char* kDisableLinearSweep = "loader.armv5.firmware.disableLinearSweep";
-	static constexpr const char* kScanMinValidInstr = "loader.armv5.firmware.scanMinValidInstr";
-	static constexpr const char* kScanMinBodyInstr = "loader.armv5.firmware.scanMinBodyInstr";
-	static constexpr const char* kScanMaxLiteralRun = "loader.armv5.firmware.scanMaxLiteralRun";
-	static constexpr const char* kScanRawPointerTables = "loader.armv5.firmware.scanRawPointerTables";
-	static constexpr const char* kRawPointerTableMinRun = "loader.armv5.firmware.rawPointerTableMinRun";
-	static constexpr const char* kRawPointerTableRequireCodeRefs = "loader.armv5.firmware.rawPointerTableRequireCodeRefs";
-	static constexpr const char* kRawPointerTableAllowInCode = "loader.armv5.firmware.rawPointerTableAllowInCode";
-	static constexpr const char* kCallScanRequireInFunction = "loader.armv5.firmware.callScanRequireInFunction";
-	static constexpr const char* kMaxFunctionAdds = "loader.armv5.firmware.maxFunctionAdds";
-	static constexpr const char* kCleanupInvalidFunctions = "loader.armv5.firmware.cleanupInvalidFunctions";
-	static constexpr const char* kCleanupInvalidMaxSize = "loader.armv5.firmware.cleanupInvalidMaxSize";
-	static constexpr const char* kCleanupInvalidRequireZeroRefs = "loader.armv5.firmware.cleanupInvalidRequireZeroRefs";
-	static constexpr const char* kCleanupInvalidRequirePcWrite = "loader.armv5.firmware.cleanupInvalidRequirePcWrite";
+	constexpr const char* kScanPrologues = "scanPrologues";
+	constexpr const char* kScanCallTargets = "scanCallTargets";
+	constexpr const char* kScanPointerTargets = "scanPointerTargets";
+	constexpr const char* kScanOrphanCode = "scanOrphanCode";
+	constexpr const char* kOrphanMinValidInstr = "orphanMinValidInstr";
+	constexpr const char* kOrphanMinBodyInstr = "orphanMinBodyInstr";
+	constexpr const char* kOrphanMinSpacingBytes = "orphanMinSpacingBytes";
+	constexpr const char* kOrphanMaxPerPage = "orphanMaxPerPage";
+	constexpr const char* kOrphanRequirePrologue = "orphanRequirePrologue";
+	constexpr const char* kPartialLinearSweep = "partialLinearSweep";
+	constexpr const char* kSkipFirmwareScans = "skipFirmwareScans";
+	constexpr const char* kTypeLiteralPools = "typeLiteralPools";
+	constexpr const char* kClearAutoDataOnCodeRefs = "clearAutoDataOnCodeRefs";
+	constexpr const char* kVerboseLogging = "verboseLogging";
+	constexpr const char* kDisablePointerSweep = "disablePointerSweep";
+	constexpr const char* kDisableLinearSweep = "disableLinearSweep";
+	constexpr const char* kScanMinValidInstr = "scanMinValidInstr";
+	constexpr const char* kScanMinBodyInstr = "scanMinBodyInstr";
+	constexpr const char* kScanMaxLiteralRun = "scanMaxLiteralRun";
+	constexpr const char* kScanRawPointerTables = "scanRawPointerTables";
+	constexpr const char* kRawPointerTableMinRun = "rawPointerTableMinRun";
+	constexpr const char* kRawPointerTableRequireCodeRefs = "rawPointerTableRequireCodeRefs";
+	constexpr const char* kRawPointerTableAllowInCode = "rawPointerTableAllowInCode";
+	constexpr const char* kCallScanRequireInFunction = "callScanRequireInFunction";
+	constexpr const char* kMaxFunctionAdds = "maxFunctionAdds";
+	constexpr const char* kCleanupInvalidFunctions = "cleanupInvalidFunctions";
+	constexpr const char* kCleanupInvalidMaxSize = "cleanupInvalidMaxSize";
+	constexpr const char* kCleanupInvalidRequireZeroRefs = "cleanupInvalidRequireZeroRefs";
+	constexpr const char* kCleanupInvalidRequirePcWrite = "cleanupInvalidRequirePcWrite";
 }
+
+// Get the firmware settings component (registers if not already registered)
+std::shared_ptr<Armv5Settings::SettingsComponent> GetFirmwareSettingsComponent();
 
 struct FirmwareSettings
 {

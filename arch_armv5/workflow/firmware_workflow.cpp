@@ -4,9 +4,9 @@
 
 #include "firmware_workflow.h"
 #include "firmware/firmware_view.h"
+#include "settings/plugin_settings.h"
+#include "settings/env_config.h"
 
-#include <cctype>
-#include <cstdlib>
 #include <exception>
 #include <string>
 
@@ -21,37 +21,19 @@ static Ref<Logger> GetFirmwareWorkflowLogger()
 
 static bool FirmwareWorkflowDisabledByEnv()
 {
-	const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
+	// Check for skip tokens in the disable scans env var
+	const char* disableScans = Armv5EnvConfig::GetEnv(Armv5EnvConfig::kDisableScans);
 	if (!disableScans || disableScans[0] == '\0')
 		return false;
-	string token;
-	auto checkToken = [&](const string& raw) -> bool {
-		if (raw.empty())
-			return false;
-		string normalized;
-		normalized.reserve(raw.size());
-		for (char ch : raw)
-		{
-			if (ch == '-')
-				ch = '_';
-			normalized.push_back(static_cast<char>(tolower(static_cast<unsigned char>(ch))));
-		}
-		return (normalized == "all" || normalized == "skip" || normalized == "skip_scans"
-			|| normalized == "skip_firmware_scans");
-	};
-	for (const char* p = disableScans; *p; ++p)
+
+	auto tokens = Armv5EnvConfig::ParseTokenList(disableScans);
+	for (const auto& raw : tokens)
 	{
-		char c = *p;
-		if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
-		{
-			if (checkToken(token))
-				return true;
-			token.clear();
-			continue;
-		}
-		token.push_back(c);
+		auto token = Armv5EnvConfig::NormalizeToken(raw);
+		if (token == "all" || token == "skip" || token == "skip_scans" || token == "skip_firmware_scans")
+			return true;
 	}
-	return checkToken(token);
+	return false;
 }
 
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
@@ -117,8 +99,9 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 {
 	auto logger = GetFirmwareWorkflowLogger();
-	const char* disableWorkflow = getenv("BN_ARMV5_DISABLE_WORKFLOW");
-	if (disableWorkflow && disableWorkflow[0] != '\0')
+
+	// Check workflow disable via singleton (which caches the env var at startup)
+	if (Armv5Settings::PluginConfig::Get().IsWorkflowDisabled())
 	{
 		if (logger)
 			logger->LogInfo("ARMv5 firmware workflow disabled via BN_ARMV5_DISABLE_WORKFLOW");

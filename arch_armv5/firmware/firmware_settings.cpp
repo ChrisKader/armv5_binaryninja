@@ -3,49 +3,15 @@
  */
 
 #include "firmware_settings.h"
+#include "settings/env_config.h"
 
-#include <cctype>
 #include <cstdint>
-#include <cstdlib>
-#include <string>
-#include <vector>
 
 using namespace BinaryNinja;
 
-static std::vector<std::string> SplitScanList(const char* value)
+std::shared_ptr<Armv5Settings::SettingsComponent> GetFirmwareSettingsComponent()
 {
-	std::vector<std::string> tokens;
-	if (!value)
-		return tokens;
-	std::string current;
-	for (const char* p = value; *p; ++p)
-	{
-		char c = *p;
-		if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
-		{
-			if (!current.empty())
-			{
-				tokens.emplace_back(current);
-				current.clear();
-			}
-			continue;
-		}
-		current.push_back(c);
-	}
-	if (!current.empty())
-		tokens.emplace_back(current);
-	return tokens;
-}
-
-static std::string NormalizeToken(std::string token)
-{
-	for (char& ch : token)
-	{
-		if (ch == '-')
-			ch = '_';
-		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-	}
-	return token;
+	return Armv5Settings::RegisterComponent(kFirmwareComponentName);
 }
 
 static void DisableFirmwareScanByToken(FirmwareSettings& settings, const std::string& token)
@@ -125,14 +91,14 @@ static void DisableFirmwareScanByToken(FirmwareSettings& settings, const std::st
 
 static void ApplyFirmwareEnvOverrides(FirmwareSettings& settings)
 {
-	const char* disableScans = getenv("BN_ARMV5_FIRMWARE_DISABLE_SCANS");
+	const char* disableScans = Armv5EnvConfig::GetEnv(Armv5EnvConfig::kDisableScans);
 	if (!disableScans || disableScans[0] == '\0')
 		return;
 
-	auto tokens = SplitScanList(disableScans);
+	auto tokens = Armv5EnvConfig::ParseTokenList(disableScans);
 	for (auto& token : tokens)
 	{
-		auto normalized = NormalizeToken(token);
+		auto normalized = Armv5EnvConfig::NormalizeToken(token);
 		if (!normalized.empty())
 			DisableFirmwareScanByToken(settings, normalized);
 	}
@@ -185,64 +151,69 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 		return result;
 	}
 
-	if (settings->Contains(FirmwareSettingKeys::kScanPrologues))
-		result.enablePrologueScan = settings->Get<bool>(FirmwareSettingKeys::kScanPrologues, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanCallTargets))
-		result.enableCallTargetScan = settings->Get<bool>(FirmwareSettingKeys::kScanCallTargets, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanPointerTargets))
-		result.enablePointerTargetScan = settings->Get<bool>(FirmwareSettingKeys::kScanPointerTargets, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanOrphanCode))
-		result.enableOrphanCodeScan = settings->Get<bool>(FirmwareSettingKeys::kScanOrphanCode, view);
-	if (settings->Contains(FirmwareSettingKeys::kOrphanMinValidInstr))
-		result.orphanMinValidInstr = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kOrphanMinValidInstr, view);
-	if (settings->Contains(FirmwareSettingKeys::kOrphanMinBodyInstr))
-		result.orphanMinBodyInstr = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kOrphanMinBodyInstr, view);
-	if (settings->Contains(FirmwareSettingKeys::kOrphanMinSpacingBytes))
-		result.orphanMinSpacingBytes = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kOrphanMinSpacingBytes, view);
-	if (settings->Contains(FirmwareSettingKeys::kOrphanMaxPerPage))
-		result.orphanMaxPerPage = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kOrphanMaxPerPage, view);
-	if (settings->Contains(FirmwareSettingKeys::kOrphanRequirePrologue))
-		result.orphanRequirePrologue = settings->Get<bool>(FirmwareSettingKeys::kOrphanRequirePrologue, view);
-	if (settings->Contains(FirmwareSettingKeys::kMaxFunctionAdds))
-		result.maxFunctionAdds = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kMaxFunctionAdds, view);
-	if (settings->Contains(FirmwareSettingKeys::kPartialLinearSweep))
-		result.enablePartialLinearSweep = settings->Get<bool>(FirmwareSettingKeys::kPartialLinearSweep, view);
-	if (settings->Contains(FirmwareSettingKeys::kSkipFirmwareScans))
-		result.skipFirmwareScans = settings->Get<bool>(FirmwareSettingKeys::kSkipFirmwareScans, view);
-	if (settings->Contains(FirmwareSettingKeys::kTypeLiteralPools))
-		result.enableLiteralPoolTyping = settings->Get<bool>(FirmwareSettingKeys::kTypeLiteralPools, view);
-	if (settings->Contains(FirmwareSettingKeys::kClearAutoDataOnCodeRefs))
-		result.enableClearAutoDataOnCodeRefs = settings->Get<bool>(FirmwareSettingKeys::kClearAutoDataOnCodeRefs, view);
-	if (settings->Contains(FirmwareSettingKeys::kVerboseLogging))
-		result.enableVerboseLogging = settings->Get<bool>(FirmwareSettingKeys::kVerboseLogging, view);
-	if (settings->Contains(FirmwareSettingKeys::kDisablePointerSweep))
-		result.disablePointerSweep = settings->Get<bool>(FirmwareSettingKeys::kDisablePointerSweep, view);
-	if (settings->Contains(FirmwareSettingKeys::kDisableLinearSweep))
-		result.disableLinearSweep = settings->Get<bool>(FirmwareSettingKeys::kDisableLinearSweep, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanMinValidInstr))
-		result.tuning.minValidInstr = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kScanMinValidInstr, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanMinBodyInstr))
-		result.tuning.minBodyInstr = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kScanMinBodyInstr, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanMaxLiteralRun))
-		result.tuning.maxLiteralRun = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kScanMaxLiteralRun, view);
-	if (settings->Contains(FirmwareSettingKeys::kScanRawPointerTables))
-		result.tuning.scanRawPointerTables = settings->Get<bool>(FirmwareSettingKeys::kScanRawPointerTables, view);
-	if (settings->Contains(FirmwareSettingKeys::kRawPointerTableMinRun))
-		result.tuning.minPointerRun = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kRawPointerTableMinRun, view);
-	if (settings->Contains(FirmwareSettingKeys::kRawPointerTableRequireCodeRefs))
-		result.tuning.requirePointerTableCodeRefs = settings->Get<bool>(FirmwareSettingKeys::kRawPointerTableRequireCodeRefs, view);
-	if (settings->Contains(FirmwareSettingKeys::kRawPointerTableAllowInCode))
-		result.tuning.allowPointerTablesInCode = settings->Get<bool>(FirmwareSettingKeys::kRawPointerTableAllowInCode, view);
-	if (settings->Contains(FirmwareSettingKeys::kCallScanRequireInFunction))
-		result.tuning.requireCallInFunction = settings->Get<bool>(FirmwareSettingKeys::kCallScanRequireInFunction, view);
-	if (settings->Contains(FirmwareSettingKeys::kCleanupInvalidFunctions))
-		result.enableInvalidFunctionCleanup = settings->Get<bool>(FirmwareSettingKeys::kCleanupInvalidFunctions, view);
-	if (settings->Contains(FirmwareSettingKeys::kCleanupInvalidMaxSize))
-		result.cleanupMaxSizeBytes = (uint32_t)settings->Get<uint64_t>(FirmwareSettingKeys::kCleanupInvalidMaxSize, view);
-	if (settings->Contains(FirmwareSettingKeys::kCleanupInvalidRequireZeroRefs))
-		result.cleanupRequireZeroRefs = settings->Get<bool>(FirmwareSettingKeys::kCleanupInvalidRequireZeroRefs, view);
-	if (settings->Contains(FirmwareSettingKeys::kCleanupInvalidRequirePcWrite))
-		result.cleanupRequirePcWriteStart = settings->Get<bool>(FirmwareSettingKeys::kCleanupInvalidRequirePcWrite, view);
+	auto fw = GetFirmwareSettingsComponent();
+	using namespace FirmwareSettingNames;
+
+	auto key = [&](const char* name) { return fw->GetKey(name); };
+
+	if (settings->Contains(key(kScanPrologues)))
+		result.enablePrologueScan = settings->Get<bool>(key(kScanPrologues), view);
+	if (settings->Contains(key(kScanCallTargets)))
+		result.enableCallTargetScan = settings->Get<bool>(key(kScanCallTargets), view);
+	if (settings->Contains(key(kScanPointerTargets)))
+		result.enablePointerTargetScan = settings->Get<bool>(key(kScanPointerTargets), view);
+	if (settings->Contains(key(kScanOrphanCode)))
+		result.enableOrphanCodeScan = settings->Get<bool>(key(kScanOrphanCode), view);
+	if (settings->Contains(key(kOrphanMinValidInstr)))
+		result.orphanMinValidInstr = (uint32_t)settings->Get<uint64_t>(key(kOrphanMinValidInstr), view);
+	if (settings->Contains(key(kOrphanMinBodyInstr)))
+		result.orphanMinBodyInstr = (uint32_t)settings->Get<uint64_t>(key(kOrphanMinBodyInstr), view);
+	if (settings->Contains(key(kOrphanMinSpacingBytes)))
+		result.orphanMinSpacingBytes = (uint32_t)settings->Get<uint64_t>(key(kOrphanMinSpacingBytes), view);
+	if (settings->Contains(key(kOrphanMaxPerPage)))
+		result.orphanMaxPerPage = (uint32_t)settings->Get<uint64_t>(key(kOrphanMaxPerPage), view);
+	if (settings->Contains(key(kOrphanRequirePrologue)))
+		result.orphanRequirePrologue = settings->Get<bool>(key(kOrphanRequirePrologue), view);
+	if (settings->Contains(key(kMaxFunctionAdds)))
+		result.maxFunctionAdds = (uint32_t)settings->Get<uint64_t>(key(kMaxFunctionAdds), view);
+	if (settings->Contains(key(kPartialLinearSweep)))
+		result.enablePartialLinearSweep = settings->Get<bool>(key(kPartialLinearSweep), view);
+	if (settings->Contains(key(kSkipFirmwareScans)))
+		result.skipFirmwareScans = settings->Get<bool>(key(kSkipFirmwareScans), view);
+	if (settings->Contains(key(kTypeLiteralPools)))
+		result.enableLiteralPoolTyping = settings->Get<bool>(key(kTypeLiteralPools), view);
+	if (settings->Contains(key(kClearAutoDataOnCodeRefs)))
+		result.enableClearAutoDataOnCodeRefs = settings->Get<bool>(key(kClearAutoDataOnCodeRefs), view);
+	if (settings->Contains(key(kVerboseLogging)))
+		result.enableVerboseLogging = settings->Get<bool>(key(kVerboseLogging), view);
+	if (settings->Contains(key(kDisablePointerSweep)))
+		result.disablePointerSweep = settings->Get<bool>(key(kDisablePointerSweep), view);
+	if (settings->Contains(key(kDisableLinearSweep)))
+		result.disableLinearSweep = settings->Get<bool>(key(kDisableLinearSweep), view);
+	if (settings->Contains(key(kScanMinValidInstr)))
+		result.tuning.minValidInstr = (uint32_t)settings->Get<uint64_t>(key(kScanMinValidInstr), view);
+	if (settings->Contains(key(kScanMinBodyInstr)))
+		result.tuning.minBodyInstr = (uint32_t)settings->Get<uint64_t>(key(kScanMinBodyInstr), view);
+	if (settings->Contains(key(kScanMaxLiteralRun)))
+		result.tuning.maxLiteralRun = (uint32_t)settings->Get<uint64_t>(key(kScanMaxLiteralRun), view);
+	if (settings->Contains(key(kScanRawPointerTables)))
+		result.tuning.scanRawPointerTables = settings->Get<bool>(key(kScanRawPointerTables), view);
+	if (settings->Contains(key(kRawPointerTableMinRun)))
+		result.tuning.minPointerRun = (uint32_t)settings->Get<uint64_t>(key(kRawPointerTableMinRun), view);
+	if (settings->Contains(key(kRawPointerTableRequireCodeRefs)))
+		result.tuning.requirePointerTableCodeRefs = settings->Get<bool>(key(kRawPointerTableRequireCodeRefs), view);
+	if (settings->Contains(key(kRawPointerTableAllowInCode)))
+		result.tuning.allowPointerTablesInCode = settings->Get<bool>(key(kRawPointerTableAllowInCode), view);
+	if (settings->Contains(key(kCallScanRequireInFunction)))
+		result.tuning.requireCallInFunction = settings->Get<bool>(key(kCallScanRequireInFunction), view);
+	if (settings->Contains(key(kCleanupInvalidFunctions)))
+		result.enableInvalidFunctionCleanup = settings->Get<bool>(key(kCleanupInvalidFunctions), view);
+	if (settings->Contains(key(kCleanupInvalidMaxSize)))
+		result.cleanupMaxSizeBytes = (uint32_t)settings->Get<uint64_t>(key(kCleanupInvalidMaxSize), view);
+	if (settings->Contains(key(kCleanupInvalidRequireZeroRefs)))
+		result.cleanupRequireZeroRefs = settings->Get<bool>(key(kCleanupInvalidRequireZeroRefs), view);
+	if (settings->Contains(key(kCleanupInvalidRequirePcWrite)))
+		result.cleanupRequirePcWriteStart = settings->Get<bool>(key(kCleanupInvalidRequirePcWrite), view);
 
 	ApplyFirmwareEnvOverrides(result);
 	NormalizeFirmwareSettings(result);
@@ -279,227 +250,122 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 	if (!settings)
 		return;
 
-	settings->RegisterSetting(FirmwareSettingKeys::kScanPrologues,
-		R"({
-		"title" : "Scan for function prologues",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Discover additional function entry points by scanning for common prologue patterns."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanCallTargets,
-		R"({
-		"title" : "Scan for call targets",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Discover additional function entry points from direct call and indirect branch targets."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanPointerTargets,
-		R"({
-		"title" : "Scan for pointer targets",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Discover function entry points referenced by data pointers."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanOrphanCode,
-		R"({
-		"title" : "Scan for orphan code blocks",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Discover unreachable functions post-analysis by finding orphaned code blocks and basic block boundaries."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kOrphanMinValidInstr,
-		R"({
-		"title" : "Orphan scan min valid instructions",
-		"type" : "number",
-		"default" : 6,
-		"min" : 1,
-		"max" : 16,
-		"description" : "Minimum consecutive valid ARM instructions required for an orphan code candidate."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kOrphanMinBodyInstr,
-		R"({
-		"title" : "Orphan scan min body instructions",
-		"type" : "number",
-		"default" : 2,
-		"min" : 0,
-		"max" : 16,
-		"description" : "Minimum valid instructions after the candidate prologue when validating orphan code."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kOrphanMinSpacingBytes,
-		R"({
-		"title" : "Orphan scan min spacing bytes",
-		"type" : "number",
-		"default" : 128,
-		"min" : 0,
-		"max" : 4096,
-		"description" : "Minimum spacing between orphan functions added during the post-analysis scan."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kOrphanMaxPerPage,
-		R"({
-		"title" : "Orphan scan max per 4KB page",
-		"type" : "number",
-		"default" : 6,
-		"min" : 0,
-		"max" : 64,
-		"description" : "Maximum orphan functions to add per 4KB page (0 disables the cap)."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kPartialLinearSweep,
-		R"({
-		"title" : "Partial linear sweep",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Enable Binary Ninja's partial linear sweep (no CFG pass) alongside the firmware scans."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kSkipFirmwareScans,
-		R"({
-		"title" : "Skip firmware scans",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Disable the firmware-specific pointer/orphan/call scans so only the core sweep runs."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kOrphanRequirePrologue,
-		R"({
-		"title" : "Orphan scan require prologue",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Require a prologue-like instruction at the candidate start to reduce false positives."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanRawPointerTables,
-		R"({
-		"title" : "Scan raw pointer tables",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Scan untyped data for runs of pointers into code to recover function starts when pointer sweep is disabled."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kRawPointerTableMinRun,
-		R"({
-		"title" : "Raw pointer table min run",
-		"type" : "number",
-		"default" : 3,
-		"min" : 1,
-		"max" : 16,
-		"description" : "Minimum consecutive pointers required to treat a region as a pointer table."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kRawPointerTableRequireCodeRefs,
-		R"({
-		"title" : "Raw pointer table require code refs",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Require at least one code reference into a raw pointer table before using it."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kRawPointerTableAllowInCode,
-		R"({
-		"title" : "Raw pointer table allow in code",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Allow raw pointer tables inside code semantics when code references are not required."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kCallScanRequireInFunction,
-		R"({
-		"title" : "Call scan require in-function",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Restrict call-target scanning to instructions already inside functions."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kMaxFunctionAdds,
-		R"({
-		"title" : "Max firmware function additions",
-		"type" : "number",
-		"default" : 2000,
-		"min" : 0,
-		"max" : 100000,
-		"description" : "Cap the number of functions added per firmware scan run (0 disables the cap)."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kDisablePointerSweep,
-		R"({
-		"title" : "Disable core pointer sweep",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Disable Binary Ninja's core pointer sweep (analysis.pointerSweep.autorun) to reduce false positives in raw firmware blobs."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kDisableLinearSweep,
-		R"({
-		"title" : "Disable core linear sweep",
-		"type" : "boolean",
-		"default" : false,
-		"description" : "Disable Binary Ninja's core linear sweep so firmware scans drive function discovery."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kCleanupInvalidFunctions,
-		R"({
-		"title" : "Cleanup invalid functions",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Remove tiny auto-discovered functions that fail ARMv5 validation checks after analysis."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kCleanupInvalidMaxSize,
-		R"({
-		"title" : "Cleanup invalid max size",
-		"type" : "number",
-		"default" : 8,
-		"min" : 4,
-		"max" : 32,
-		"description" : "Maximum size (bytes) for functions eligible for invalid cleanup."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kCleanupInvalidRequireZeroRefs,
-		R"({
-		"title" : "Cleanup invalid require zero refs",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Only remove invalid functions with zero incoming references."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kCleanupInvalidRequirePcWrite,
-		R"({
-		"title" : "Cleanup invalid require PC write",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Only remove invalid functions whose first instruction writes PC."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kTypeLiteralPools,
-		R"({
-		"title" : "Type literal pool entries",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Define literal pool entries as data to avoid disassembling them as code."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kClearAutoDataOnCodeRefs,
-		R"({
-		"title" : "Clear auto data on code references",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Undefine auto-discovered data at code-referenced addresses when nearby bytes decode as valid instructions."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kVerboseLogging,
-		R"({
-		"title" : "Verbose firmware analysis logging",
-		"type" : "boolean",
-		"default" : true,
-		"description" : "Emit per-pass summary logs for firmware analysis heuristics without enabling global debug logging."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanMinValidInstr,
-		R"({
-		"title" : "Scan minimum valid instructions",
-		"type" : "number",
-		"default" : 2,
-		"min" : 1,
-		"max" : 16,
-		"description" : "Minimum number of consecutive valid ARM instructions required to accept a firmware scan candidate."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanMinBodyInstr,
-		R"({
-		"title" : "Scan minimum body instructions",
-		"type" : "number",
-		"default" : 1,
-		"min" : 0,
-		"max" : 16,
-		"description" : "Minimum number of valid instructions after the prologue when validating a scan candidate."
-		})");
-	settings->RegisterSetting(FirmwareSettingKeys::kScanMaxLiteralRun,
-		R"({
-		"title" : "Scan max literal run",
-		"type" : "number",
-		"default" : 2,
-		"min" : 0,
-		"max" : 16,
-		"description" : "Maximum consecutive PC-relative literal loads allowed in the validation window."
-		})");
+	auto fw = GetFirmwareSettingsComponent();
+	using namespace FirmwareSettingNames;
+
+	fw->RegisterBool(settings, kScanPrologues, true,
+		"Scan for function prologues",
+		"Discover additional function entry points by scanning for common prologue patterns.");
+
+	fw->RegisterBool(settings, kScanCallTargets, true,
+		"Scan for call targets",
+		"Discover additional function entry points from direct call and indirect branch targets.");
+
+	fw->RegisterBool(settings, kScanPointerTargets, true,
+		"Scan for pointer targets",
+		"Discover function entry points referenced by data pointers.");
+
+	fw->RegisterBool(settings, kScanOrphanCode, true,
+		"Scan for orphan code blocks",
+		"Discover unreachable functions post-analysis by finding orphaned code blocks and basic block boundaries.");
+
+	fw->RegisterNumber(settings, kOrphanMinValidInstr, 6, 1, 16,
+		"Orphan scan min valid instructions",
+		"Minimum consecutive valid ARM instructions required for an orphan code candidate.");
+
+	fw->RegisterNumber(settings, kOrphanMinBodyInstr, 2, 0, 16,
+		"Orphan scan min body instructions",
+		"Minimum valid instructions after the candidate prologue when validating orphan code.");
+
+	fw->RegisterNumber(settings, kOrphanMinSpacingBytes, 128, 0, 4096,
+		"Orphan scan min spacing bytes",
+		"Minimum spacing between orphan functions added during the post-analysis scan.");
+
+	fw->RegisterNumber(settings, kOrphanMaxPerPage, 6, 0, 64,
+		"Orphan scan max per 4KB page",
+		"Maximum orphan functions to add per 4KB page (0 disables the cap).");
+
+	fw->RegisterBool(settings, kPartialLinearSweep, true,
+		"Partial linear sweep",
+		"Enable Binary Ninja's partial linear sweep (no CFG pass) alongside the firmware scans.");
+
+	fw->RegisterBool(settings, kSkipFirmwareScans, false,
+		"Skip firmware scans",
+		"Disable the firmware-specific pointer/orphan/call scans so only the core sweep runs.");
+
+	fw->RegisterBool(settings, kOrphanRequirePrologue, true,
+		"Orphan scan require prologue",
+		"Require a prologue-like instruction at the candidate start to reduce false positives.");
+
+	fw->RegisterBool(settings, kScanRawPointerTables, true,
+		"Scan raw pointer tables",
+		"Scan untyped data for runs of pointers into code to recover function starts when pointer sweep is disabled.");
+
+	fw->RegisterNumber(settings, kRawPointerTableMinRun, 3, 1, 16,
+		"Raw pointer table min run",
+		"Minimum consecutive pointers required to treat a region as a pointer table.");
+
+	fw->RegisterBool(settings, kRawPointerTableRequireCodeRefs, true,
+		"Raw pointer table require code refs",
+		"Require at least one code reference into a raw pointer table before using it.");
+
+	fw->RegisterBool(settings, kRawPointerTableAllowInCode, false,
+		"Raw pointer table allow in code",
+		"Allow raw pointer tables inside code semantics when code references are not required.");
+
+	fw->RegisterBool(settings, kCallScanRequireInFunction, false,
+		"Call scan require in-function",
+		"Restrict call-target scanning to instructions already inside functions.");
+
+	fw->RegisterNumber(settings, kMaxFunctionAdds, 2000, 0, 100000,
+		"Max firmware function additions",
+		"Cap the number of functions added per firmware scan run (0 disables the cap).");
+
+	fw->RegisterBool(settings, kDisablePointerSweep, false,
+		"Disable core pointer sweep",
+		"Disable Binary Ninja's core pointer sweep (analysis.pointerSweep.autorun) to reduce false positives in raw firmware blobs.");
+
+	fw->RegisterBool(settings, kDisableLinearSweep, false,
+		"Disable core linear sweep",
+		"Disable Binary Ninja's core linear sweep so firmware scans drive function discovery.");
+
+	fw->RegisterBool(settings, kCleanupInvalidFunctions, true,
+		"Cleanup invalid functions",
+		"Remove tiny auto-discovered functions that fail ARMv5 validation checks after analysis.");
+
+	fw->RegisterNumber(settings, kCleanupInvalidMaxSize, 8, 4, 32,
+		"Cleanup invalid max size",
+		"Maximum size (bytes) for functions eligible for invalid cleanup.");
+
+	fw->RegisterBool(settings, kCleanupInvalidRequireZeroRefs, true,
+		"Cleanup invalid require zero refs",
+		"Only remove invalid functions with zero incoming references.");
+
+	fw->RegisterBool(settings, kCleanupInvalidRequirePcWrite, true,
+		"Cleanup invalid require PC write",
+		"Only remove invalid functions whose first instruction writes PC.");
+
+	fw->RegisterBool(settings, kTypeLiteralPools, true,
+		"Type literal pool entries",
+		"Define literal pool entries as data to avoid disassembling them as code.");
+
+	fw->RegisterBool(settings, kClearAutoDataOnCodeRefs, true,
+		"Clear auto data on code references",
+		"Undefine auto-discovered data at code-referenced addresses when nearby bytes decode as valid instructions.");
+
+	fw->RegisterBool(settings, kVerboseLogging, true,
+		"Verbose firmware analysis logging",
+		"Emit per-pass summary logs for firmware analysis heuristics without enabling global debug logging.");
+
+	fw->RegisterNumber(settings, kScanMinValidInstr, 2, 1, 16,
+		"Scan minimum valid instructions",
+		"Minimum number of consecutive valid ARM instructions required to accept a firmware scan candidate.");
+
+	fw->RegisterNumber(settings, kScanMinBodyInstr, 1, 0, 16,
+		"Scan minimum body instructions",
+		"Minimum number of valid instructions after the prologue when validating a scan candidate.");
+
+	fw->RegisterNumber(settings, kScanMaxLiteralRun, 2, 0, 16,
+		"Scan max literal run",
+		"Maximum consecutive PC-relative literal loads allowed in the validation window.");
 }

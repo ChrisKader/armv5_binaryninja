@@ -11,6 +11,7 @@
 #include "relocations/relocations.h"
 #include "firmware/firmware_view.h"
 #include "workflow/firmware_workflow.h"
+#include "settings/plugin_settings.h"
 
 using namespace BinaryNinja;
 
@@ -55,6 +56,7 @@ extern "C"
 
   BINARYNINJAPLUGIN bool CorePluginInit()
   {
+    Armv5Settings::InitPluginSettings();
     RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
     InitArmv5FirmwareViewType();
     RegisterArmv5FirmwareWorkflow();

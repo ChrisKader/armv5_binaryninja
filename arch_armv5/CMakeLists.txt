@@ -33,6 +33,8 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     platforms/*.h
     firmware/*.cpp
     firmware/*.h
+    settings/*.cpp
+    settings/*.h
     workflow/*.cpp
     workflow/*.h
     il/*.cpp
