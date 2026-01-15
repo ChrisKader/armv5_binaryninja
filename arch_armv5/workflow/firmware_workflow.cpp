@@ -40,6 +40,9 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	if (BNIsShutdownRequested())
 		return;
 
+	if (Armv5Settings::PluginConfig::Get().AreAllScansDisabled())
+		return;
+
 	auto logger = GetFirmwareWorkflowLogger();
 	if (logger)
 		logger->LogInfo("RunArmv5FirmwareWorkflow: called");
@@ -72,6 +75,13 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	{
 		if (logger)
 			logger->LogInfo("RunArmv5FirmwareWorkflow: view closing, returning");
+		return;
+	}
+	Armv5FirmwareView* firmwareView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
+	if (firmwareView && firmwareView->IsParseOnly())
+	{
+		if (logger)
+			logger->LogInfo("RunArmv5FirmwareWorkflow: parse-only view, returning");
 		return;
 	}
 	if (FirmwareWorkflowDisabledByEnv())
@@ -136,8 +146,8 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 		"role": "action",
 		"description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
 		"eligibility": {
+			"runOnce": true,
 			"auto": {},
-			"runOncePerSession": true,
 			"predicates": [
 				{
 					"type": "viewType",

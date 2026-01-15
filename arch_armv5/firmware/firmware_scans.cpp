@@ -9,9 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include <map>
 #include <set>
-#include <unordered_set>
 #include <vector>
 #include <cstring>
 
@@ -94,6 +92,52 @@ static inline void PlanDefineSymbol(FirmwareScanPlan* plan, const Ref<Symbol>& s
 {
 	if (plan)
 		plan->defineSymbols.push_back(symbol);
+}
+
+static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform,
+	uint64_t addr, Logger* logger, const char* label)
+{
+	if (!view || !view->GetObject())
+		return false;
+	Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
+	if (!arch)
+		return false;
+	const bool enforceExecutable = !view->GetSegments().empty();
+	const bool enforceCodeSemantics = !view->GetSections().empty();
+	uint64_t checkAddr = addr;
+	const size_t align = arch->GetInstructionAlignment();
+	if (align > 1)
+		checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+	if (!view->IsValidOffset(checkAddr))
+		return false;
+	if (!view->IsOffsetBackedByFile(checkAddr))
+		return false;
+	if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
+		return false;
+	DataVariable dataVar;
+	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
+		return false;
+	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
+		return false;
+	DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
+	if (buf.GetLength() == 0)
+		return false;
+	if (buf.GetLength() >= 4)
+	{
+		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+		const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+		const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
+		if (allZero || allFF)
+			return false;
+	}
+	InstructionInfo info;
+	if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
+	{
+		if (logger)
+			logger->LogDebug("%s: no instruction at 0x%llx", label, (unsigned long long)checkAddr);
+		return false;
+	}
+	return info.length != 0;
 }
 
 static bool HasExplicitCodeSemantics(const Ref<BinaryView>& view)
@@ -415,6 +459,80 @@ static bool ValidateFirmwareFunctionCandidate(const Ref<BinaryView>& view, const
 	return true;
 }
 
+static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* data, uint64_t dataLen,
+	BNEndianness endian, uint64_t imageBase, const Ref<Function>& func)
+{
+	if (!view || !view->GetObject() || !func)
+		return false;
+	Ref<Architecture> arch = func->GetArchitecture();
+	if (!arch)
+		arch = view->GetDefaultArchitecture();
+	if (!arch)
+		return false;
+
+	const uint64_t start = func->GetStart();
+	const uint64_t highest = func->GetHighestAddress();
+	const uint64_t end = (highest >= start) ? (highest + arch->GetDefaultIntegerSize()) : start;
+	if (end <= start)
+		return false;
+
+	const uint64_t maxBytes = 0x800;
+	uint64_t sizeBytes = end - start;
+	if (sizeBytes > maxBytes)
+		sizeBytes = maxBytes;
+
+	const size_t align = arch->GetInstructionAlignment();
+	const size_t maxLen = arch->GetMaxInstructionLength();
+	uint64_t cur = start;
+	uint64_t processed = 0;
+	size_t valid = 0;
+	size_t invalid = 0;
+
+	while (processed + align <= sizeBytes)
+	{
+		if (ScanShouldAbort(view))
+			return false;
+		uint64_t offset = cur - imageBase;
+		if (offset + align > dataLen)
+			break;
+
+		if (align == 4 && offset + 4 <= dataLen)
+		{
+			uint32_t word = 0;
+			memcpy(&word, data + offset, sizeof(word));
+			if (endian == BigEndian)
+				word = Swap32(word);
+			if (word == 0 || word == 0xFFFFFFFF)
+			{
+				invalid++;
+				cur += align;
+				processed += align;
+				continue;
+			}
+		}
+
+		size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
+		InstructionInfo info;
+		if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
+		{
+			invalid++;
+			cur += align;
+			processed += align;
+			continue;
+		}
+
+		valid++;
+		cur += info.length;
+		processed += info.length;
+	}
+
+	const size_t total = valid + invalid;
+	if (total == 0)
+		return false;
+	const double ratio = static_cast<double>(valid) / static_cast<double>(total);
+	return (valid >= 2) && (ratio >= 0.6);
+}
+
 
 static bool LooksLikeReturnThunk(const uint8_t* data, uint64_t dataLen, BNEndianness endian,
 	uint64_t imageBase, uint64_t length, uint64_t addr)
@@ -564,6 +682,8 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 			if (ScanShouldAbort(view))
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!IsValidFunctionStart(view, plat, addr, log, "Prologue scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -935,6 +1055,8 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 			if (ScanShouldAbort(view))
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!IsValidFunctionStart(view, plat, addr, log, "Pointer scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -1345,6 +1467,8 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 			if (ScanShouldAbort(view))
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
+				continue;
+			if (!IsValidFunctionStart(view, plat, addr, log, "Orphan scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -1794,6 +1918,8 @@ size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
 				continue;
+			if (!IsValidFunctionStart(view, plat, addr, log, "Orphan scan"))
+				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
 			if (plan)
@@ -2067,6 +2193,8 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 	size_t skipNonPcWrite = 0;
 	size_t skipValid = 0;
 	size_t skipNoData = 0;
+	size_t skipBodyValid = 0;
+	size_t skipNoBlocks = 0;
 
 	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Platform> defaultPlat = view->GetDefaultPlatform();
@@ -2091,6 +2219,12 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		if (sym && !sym->IsAutoDefined())
 		{
 			skipUser++;
+			continue;
+		}
+
+		if (func->GetBasicBlocks().empty())
+		{
+			skipNoBlocks++;
 			continue;
 		}
 
@@ -2143,6 +2277,12 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			continue;
 		}
 
+		if (ValidateFunctionBody(view, data, dataLen, endian, imageBase, func))
+		{
+			skipBodyValid++;
+			continue;
+		}
+
 		candidates++;
 		if (ValidateFirmwareFunctionCandidate(view, data, dataLen, endian, imageBase, length,
 			start, cleanupTuning, false, true))
@@ -2162,6 +2302,9 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			continue;
 		if (verboseLog && logger)
 			logger->LogInfo("Cleanup invalid: removing function at 0x%llx",
+				(unsigned long long)start);
+		else if (logger)
+			logger->LogWarn("Cleanup invalid: removing function at 0x%llx",
 				(unsigned long long)start);
 		if (plan)
 		{
@@ -2191,9 +2334,10 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		if (logger)
 			logger->LogInfo(
 				"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
-				"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu",
+				"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu "
+				"skip_body_valid=%zu skip_no_blocks=%zu",
 				skipUser, skipProtected, skipTooLarge, skipHasRefs,
-				skipNonPcWrite, skipValid, skipNoData);
+				skipNonPcWrite, skipValid, skipNoData, skipBodyValid, skipNoBlocks);
 	}
 
 	return removed;

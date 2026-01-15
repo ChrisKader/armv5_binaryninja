@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 import pytest
+from binaryninja import BranchType
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -72,7 +73,8 @@ def assert_instruction_case(arch, case: Dict[str, object]) -> None:
     """Validate that an instruction decodes and formats as expected."""
     instruction_value = case['instruction']
     address = case.get('address', 0)
-    expected_length = case.get('expected_info', {}).get('length', 4)
+    expected_info = case.get('expected_info', {})
+    expected_length = expected_info.get('length', 4)
 
     instr_bytes = instruction_value.to_bytes(4, byteorder='little')
     info = arch.get_instruction_info(instr_bytes, address)
@@ -80,6 +82,38 @@ def assert_instruction_case(arch, case: Dict[str, object]) -> None:
     assert info.length == expected_length, (
         f"Expected length {expected_length}, got {info.length} for {case['name']}"
     )
+    expected_transition = expected_info.get('arch_transition_by_target_addr')
+    if expected_transition is not None:
+        assert info.arch_transition_by_target_addr == expected_transition, (
+            f"Expected arch_transition_by_target_addr={expected_transition} for {case['name']}, "
+            f"got {info.arch_transition_by_target_addr}"
+        )
+    expected_branches = expected_info.get('branches', [])
+    if expected_branches:
+        def normalize_branch_type(branch_type):
+            if isinstance(branch_type, BranchType):
+                return branch_type
+            if isinstance(branch_type, str):
+                try:
+                    return BranchType[branch_type]
+                except KeyError:
+                    return BranchType[branch_type.upper()]
+            raise AssertionError(f"Unsupported branch type {branch_type!r} for {case['name']}")
+
+        def branch_matches(branch, expected):
+            expected_type = normalize_branch_type(expected.get('type'))
+            if branch.type != expected_type:
+                return False
+            if 'target' in expected and expected['target'] is not None and branch.target != expected['target']:
+                return False
+            if 'arch' in expected and expected['arch'] is not None:
+                return branch.arch is not None and branch.arch.name == expected['arch']
+            return True
+
+        for expected in expected_branches:
+            assert any(branch_matches(branch, expected) for branch in info.branches), (
+                f"Expected branch {expected} for {case['name']}, got {info.branches}"
+            )
 
     text_tokens, length = arch.get_instruction_text(instr_bytes, address)
     assert length == expected_length, (

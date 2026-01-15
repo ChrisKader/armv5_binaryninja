@@ -11,8 +11,10 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace BinaryNinja;
 using namespace std;
@@ -195,6 +197,120 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		addrs.erase(unique(addrs.begin(), addrs.end()), addrs.end());
 	}
 
+	unordered_set<uint64_t> SnapshotFunctionStarts(const Ref<BinaryView>& view)
+	{
+		unordered_set<uint64_t> starts;
+		if (!view || !view->GetObject())
+			return starts;
+		auto funcs = view->GetAnalysisFunctionList();
+		starts.reserve(funcs.size());
+		for (const auto& func : funcs)
+		{
+			if (!func)
+				continue;
+			starts.insert(func->GetStart());
+		}
+		return starts;
+	}
+
+	void LogFunctionDiff(const Ref<Logger>& logger,
+		const unordered_set<uint64_t>& before,
+		const unordered_set<uint64_t>& after,
+		bool logLists)
+	{
+		if (!logger)
+			return;
+		vector<uint64_t> added;
+		vector<uint64_t> removed;
+		added.reserve(after.size());
+		removed.reserve(before.size());
+		for (uint64_t addr : after)
+		{
+			if (before.find(addr) == before.end())
+				added.push_back(addr);
+		}
+		for (uint64_t addr : before)
+		{
+			if (after.find(addr) == after.end())
+				removed.push_back(addr);
+		}
+		sort(added.begin(), added.end());
+		sort(removed.begin(), removed.end());
+		logger->LogInfo("Firmware scan: function diff added=%zu removed=%zu", added.size(), removed.size());
+		const size_t kMaxLog = 50;
+		if (logLists && !added.empty())
+		{
+			string line = "Firmware scan: added functions:";
+			for (size_t i = 0; i < added.size() && i < kMaxLog; ++i)
+				line += fmt::format(" 0x{:x}", added[i]);
+			if (added.size() > kMaxLog)
+				line += fmt::format(" ... (+{} more)", added.size() - kMaxLog);
+			logger->LogInfo("%s", line.c_str());
+		}
+		if (logLists && !removed.empty())
+		{
+			string line = "Firmware scan: removed functions:";
+			for (size_t i = 0; i < removed.size() && i < kMaxLog; ++i)
+				line += fmt::format(" 0x{:x}", removed[i]);
+			if (removed.size() > kMaxLog)
+				line += fmt::format(" ... (+{} more)", removed.size() - kMaxLog);
+			logger->LogWarn("%s", line.c_str());
+		}
+	}
+
+	bool IsValidFunctionStart(const Ref<BinaryView>& view,
+		const Ref<Platform>& platform,
+		uint64_t addr,
+		bool verbose,
+		const Ref<Logger>& logger)
+	{
+		if (!view || !view->GetObject())
+			return false;
+
+		Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
+		if (!arch)
+			return false;
+	const bool enforceExecutable = !view->GetSegments().empty();
+	const bool enforceCodeSemantics = !view->GetSections().empty();
+
+		uint64_t checkAddr = addr;
+		const size_t align = arch->GetInstructionAlignment();
+		if (align > 1)
+			checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+
+		if (!view->IsValidOffset(checkAddr))
+			return false;
+		if (!view->IsOffsetBackedByFile(checkAddr))
+			return false;
+		if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
+			return false;
+		DataVariable dataVar;
+		if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
+			return false;
+		if (enforceExecutable && view->IsOffsetExecutable(checkAddr) == false)
+			return false;
+
+		DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
+		if (buf.GetLength() == 0)
+			return false;
+		if (buf.GetLength() >= 4)
+		{
+			const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+			const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+			const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
+			if ((allZero || allFF))
+				return false;
+		}
+
+		InstructionInfo info;
+		if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
+			return false;
+		if (info.length == 0)
+			return false;
+
+		return true;
+	}
+
 	// Apply plan batches directly (called from workflow context, no main thread dispatch needed)
 	bool ApplyPlanBatchesDirect(const Ref<BinaryView>& view,
 		const FirmwareSettings& fwSettings, const FirmwareScanPlan& plan, const Ref<Logger>& logger)
@@ -223,6 +339,36 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 
 		bool prevDisabled = view->GetFunctionAnalysisUpdateDisabled();
 		view->SetFunctionAnalysisUpdateDisabled(true);
+
+		struct UndoGuard
+		{
+			Ref<BinaryView> view;
+			std::string id;
+			bool active = false;
+			explicit UndoGuard(const Ref<BinaryView>& v) : view(v) {}
+			void Begin()
+			{
+				if (!view || !view->GetObject())
+					return;
+				id = view->BeginUndoActions(false);
+				active = !id.empty();
+			}
+			void Commit()
+			{
+				if (active && view && view->GetObject())
+					view->CommitUndoActions(id);
+				active = false;
+			}
+			void Revert()
+			{
+				if (active && view && view->GetObject())
+					view->RevertUndoActions(id);
+				active = false;
+			}
+		} undoGuard(view);
+
+		if (!BNIsShutdownRequested() && !IsFirmwareViewClosing(view.GetPtr()))
+			undoGuard.Begin();
 
 		bool loggedAbort = false;
 		auto shouldAbort = [&]() -> bool {
@@ -256,6 +402,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -266,6 +413,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
 				if (!targetPlat)
 					targetPlat = platform;
+				if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
+					continue;
 				Ref<Function> func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
 				if (!func)
 					func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
@@ -316,6 +465,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -326,7 +476,18 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
 				if (!targetPlat)
 					targetPlat = platform;
-				view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+				if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
+					continue;
+				Ref<Function> func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
+				if (!func)
+					func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
+				if (!func)
+				{
+					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+					if (logger)
+						logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
+							(unsigned long long)addr);
+				}
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
@@ -335,6 +496,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -357,6 +519,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -370,6 +533,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -383,6 +547,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		{
 			if (shouldAbort())
 			{
+				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
@@ -398,12 +563,18 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 						func = funcs.front();
 				}
 				if (func)
+				{
+					if (logger)
+						logger->LogWarn("Firmware scan: removing function at 0x%llx (plan remove)",
+							(unsigned long long)addr);
 					view->RemoveAnalysisFunction(func, true);
+				}
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		finishUpdatesGuard();
+		undoGuard.Commit();
 		return true;
 	}
 
@@ -792,6 +963,11 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		}
 		if (fwSettings.enableInvalidFunctionCleanup)
 		{
+			if (logger)
+				logger->LogInfo("Cleanup invalid functions: enabled (max_size=%u zero_refs=%d pc_write=%d)",
+					fwSettings.cleanupMaxSizeBytes,
+					fwSettings.cleanupRequireZeroRefs ? 1 : 0,
+					fwSettings.cleanupRequirePcWriteStart ? 1 : 0);
 			std::set<uint64_t> protectedStarts;
 			auto addProtected = [&](uint64_t addr) {
 				protectedStarts.insert(addr);
@@ -808,6 +984,12 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, &plan);
 			});
 		}
+		else if (logger)
+		{
+			const bool rawView = view && view->GetSegments().empty();
+			const char* reason = rawView ? " (raw view)" : " (enable cleanup with BN_ARMV5_FIRMWARE_ENABLE_CLEANUP)";
+			logger->LogInfo("Cleanup invalid functions: disabled%s", reason);
+		}
 
 		if (logger)
 		{
@@ -817,6 +999,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		}
 
 		bool applied = false;
+		unordered_set<uint64_t> beforeFunctions = SnapshotFunctionStarts(view);
 		if (!refreshViewForPhase())
 		{
 			finishTask();
@@ -825,6 +1008,11 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		}
 		if (!ScanCancelled(view))
 			applied = ApplyPlanBatchesDirect(view, fwSettings, plan, logger);
+
+		WaitForAnalysisIdle(job, view, logger);
+		auto afterFunctions = SnapshotFunctionStarts(view);
+		LogFunctionDiff(logger, beforeFunctions, afterFunctions, fwSettings.enableVerboseLogging);
+		StoreFirmwareFunctionSnapshot(job->instanceId, afterFunctions);
 
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");
@@ -865,6 +1053,8 @@ void BinaryNinja::ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view)
 	if (!view || !view->GetObject())
 		return;
 	if (BNIsShutdownRequested())
+		return;
+	if (Armv5Settings::PluginConfig::Get().AreAllScansDisabled())
 		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;

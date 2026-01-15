@@ -176,10 +176,17 @@ public:
 		case ARMV5_LDMDB:
 		case ARMV5_LDMIA: // defaults to ARMV5_LDM
 		case ARMV5_LDMIB:
-			if ((decomp.format->operands[0].type == OPERAND_FORMAT_REG) && (decomp.fields[decomp.format->operands[0].field0] == 15))
+			if (IS_FIELD_PRESENT(&decomp, FIELD_registers))
 			{
-				result.AddBranch(UnresolvedBranch);
-				result.archTransitionByTargetAddr = true;
+				uint32_t regList = decomp.fields[FIELD_registers];
+				if (regList & (1U << 15))
+				{
+					if (regList == (1U << 15))
+						result.AddBranch(UnresolvedBranch);
+					else
+						result.AddBranch(FunctionReturn);
+					result.archTransitionByTargetAddr = true;
+				}
 			}
 			break;
 		// Instructions that can write to PC
@@ -205,7 +212,10 @@ public:
 		case armv5::ARMV5_MUL:
 		case armv5::ARMV5_CLZ:
 			if ((decomp.format->operands[0].type == OPERAND_FORMAT_REG) && (decomp.fields[decomp.format->operands[0].field0] == 15))
+			{
 				result.AddBranch(UnresolvedBranch);
+				result.archTransitionByTargetAddr = true;
+			}
 			break;
 
 		case armv5::ARMV5_B:
@@ -266,6 +276,7 @@ public:
 			if ((decomp.format->operands[0].type == OPERAND_FORMAT_REGISTERS) &&
 				(decomp.fields[FIELD_registers] & (1 << 15))) {
 				result.AddBranch(FunctionReturn);
+				result.archTransitionByTargetAddr = true;
 			}
 			break;
 

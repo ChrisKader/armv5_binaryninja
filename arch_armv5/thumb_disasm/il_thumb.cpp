@@ -603,7 +603,10 @@ bool GetLowLevelILForThumbInstruction(Architecture* arch, LowLevelILFunction& il
 		}
 		else
 		{
-			il.AddInstruction(il.Jump(ReadRegister(il, instr, GetRegisterByIndex(instr->fields[instr->format->operands[0].field0]), 4)));
+			il.AddInstruction(
+				il.TailCall(ReadRegister(
+					il, instr,
+					GetRegisterByIndex(instr->fields[instr->format->operands[0].field0]), 4)));
 		}
 		break;
 	// Note: CBNZ and CBZ are ARMv6T2+ (Thumb-2) - removed for ARMv5

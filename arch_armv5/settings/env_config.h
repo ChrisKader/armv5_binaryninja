@@ -16,6 +16,7 @@ namespace Armv5EnvConfig
 constexpr const char* kDisableScans = "BN_ARMV5_FIRMWARE_DISABLE_SCANS";
 constexpr const char* kDisableWorkflow = "BN_ARMV5_DISABLE_WORKFLOW";
 constexpr const char* kDisableActions = "BN_ARMV5_FIRMWARE_DISABLE_ACTIONS";
+constexpr const char* kEnableCleanup = "BN_ARMV5_FIRMWARE_ENABLE_CLEANUP";
 
 // Parse a comma/semicolon/whitespace-separated token list from an env var value
 std::vector<std::string> ParseTokenList(const char* value);

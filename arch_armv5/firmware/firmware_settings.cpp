@@ -208,6 +208,8 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 		result.tuning.requireCallInFunction = settings->Get<bool>(key(kCallScanRequireInFunction), view);
 	if (settings->Contains(key(kCleanupInvalidFunctions)))
 		result.enableInvalidFunctionCleanup = settings->Get<bool>(key(kCleanupInvalidFunctions), view);
+	if (view && view->GetSegments().empty())
+		result.enableInvalidFunctionCleanup = false;
 	if (settings->Contains(key(kCleanupInvalidMaxSize)))
 		result.cleanupMaxSizeBytes = (uint32_t)settings->Get<uint64_t>(key(kCleanupInvalidMaxSize), view);
 	if (settings->Contains(key(kCleanupInvalidRequireZeroRefs)))

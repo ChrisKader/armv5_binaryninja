@@ -61,7 +61,11 @@ LOAD_STORE_MULTIPLE_TESTS = [
         "address": 0x1000,
         "expected_mnemonic": "pop",
         "expected_operands": ["{pc}"],
-        "expected_info": {"length": 4},
+        "expected_info": {
+            "length": 4,
+            "arch_transition_by_target_addr": True,
+            "branches": [{"type": "FunctionReturn"}],
+        },
     },
     {
         "name": "STMIB increment before",

@@ -72,6 +72,69 @@ static std::unordered_map<uintptr_t, InstanceId> &FirmwareViewPointerToInstanceM
 	return *map;
 }
 
+static std::unordered_map<InstanceId, std::unordered_set<uint64_t>> &FirmwareFunctionSnapshotMap()
+{
+	static auto *map = new std::unordered_map<InstanceId, std::unordered_set<uint64_t>>();
+	return *map;
+}
+
+static std::unordered_set<uint64_t> SnapshotFunctionsForView(const Ref<BinaryView>& view)
+{
+	std::unordered_set<uint64_t> starts;
+	if (!view || !view->GetObject())
+		return starts;
+	auto funcs = view->GetAnalysisFunctionList();
+	starts.reserve(funcs.size());
+	for (const auto& func : funcs)
+	{
+		if (!func)
+			continue;
+		starts.insert(func->GetStart());
+	}
+	return starts;
+}
+
+static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform, uint64_t addr)
+{
+	if (!view || !view->GetObject())
+		return false;
+	Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
+	if (!arch)
+		return false;
+	const bool enforceExecutable = !view->GetSegments().empty();
+	const bool enforceCodeSemantics = !view->GetSections().empty();
+	uint64_t checkAddr = addr;
+	const size_t align = arch->GetInstructionAlignment();
+	if (align > 1)
+		checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+	if (!view->IsValidOffset(checkAddr))
+		return false;
+	if (!view->IsOffsetBackedByFile(checkAddr))
+		return false;
+	if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
+		return false;
+	DataVariable dataVar;
+	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
+		return false;
+	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
+		return false;
+	DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
+	if (buf.GetLength() == 0)
+		return false;
+	if (buf.GetLength() >= 4)
+	{
+		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+		const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+		const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
+		if (allZero || allFF)
+			return false;
+	}
+	InstructionInfo info;
+	if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
+		return false;
+	return info.length != 0;
+}
+
 // Track a small alive token per view instance that background tasks can use to
 // determine whether the view is still alive without touching view pointers.
 static std::unordered_map<InstanceId, std::shared_ptr<std::atomic<bool>>> &FirmwareViewAliveMap()
@@ -112,6 +175,21 @@ static void OnFirmwareInitialAnalysisComplete(BinaryView *view)
 		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
+
+	const auto& config = Armv5Settings::PluginConfig::Get();
+	if (config.AreAllScansDisabled())
+	{
+		if (logger)
+			logger->LogInfo("OnFirmwareInitialAnalysisComplete: scans disabled by env");
+		return;
+	}
+	// If workflow is enabled, it will schedule scans. Avoid double scheduling here.
+	if (!config.IsWorkflowDisabled())
+	{
+		if (logger)
+			logger->LogInfo("OnFirmwareInitialAnalysisComplete: workflow enabled, skipping");
+		return;
+	}
 
 	InstanceId instanceId = GetInstanceIdFromView(view);
 	if (logger)
@@ -157,6 +235,39 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
 	if (logger)
 		logger->LogInfo("OnFirmwareViewFinalization: analysis finalization event");
+
+	InstanceId instanceId = GetInstanceIdFromView(view);
+	if (instanceId == 0)
+		return;
+	auto previous = LoadFirmwareFunctionSnapshot(instanceId);
+	if (previous.empty())
+		return;
+	auto current = SnapshotFunctionsForView(Ref<BinaryView>(view));
+	if (current.empty())
+		return;
+
+	if (logger)
+		logger->LogInfo("Firmware finalization: functions before=%zu after=%zu",
+			previous.size(), current.size());
+
+	std::vector<uint64_t> removed;
+	removed.reserve(previous.size());
+	for (uint64_t addr : previous)
+	{
+		if (current.find(addr) == current.end())
+			removed.push_back(addr);
+	}
+	if (!removed.empty() && logger)
+	{
+		sort(removed.begin(), removed.end());
+		string line = "Firmware finalization: functions removed after scans:";
+		const size_t kMaxLog = 50;
+		for (size_t i = 0; i < removed.size() && i < kMaxLog; ++i)
+			line += fmt::format(" 0x{:x}", removed[i]);
+		if (removed.size() > kMaxLog)
+			line += fmt::format(" ... (+{} more)", removed.size() - kMaxLog);
+		logger->LogWarn("%s", line.c_str());
+	}
 }
 
 static void RegisterFirmwareViewDestructionCallbacks()
@@ -189,7 +300,10 @@ static void RegisterFirmwareViewDestructionCallbacks()
 					FirmwareViewPointerToInstanceMap().erase(itPtrErase);
 				auto itAlive = FirmwareViewAliveMap().find(instanceId);
 				if (itAlive != FirmwareViewAliveMap().end())
+				{
 					itAlive->second->store(false);
+					FirmwareViewAliveMap().erase(itAlive);
+				}
 			}
 		}
 
@@ -264,6 +378,33 @@ bool BinaryNinja::IsFirmwareViewAliveById(uint64_t instanceId)
 	return it->second && it->second->load();
 }
 
+void BinaryNinja::StoreFirmwareFunctionSnapshot(uint64_t instanceId, const std::unordered_set<uint64_t>& snapshot)
+{
+	if (instanceId == 0)
+		return;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	FirmwareFunctionSnapshotMap()[instanceId] = snapshot;
+}
+
+std::unordered_set<uint64_t> BinaryNinja::LoadFirmwareFunctionSnapshot(uint64_t instanceId)
+{
+	if (instanceId == 0)
+		return {};
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto it = FirmwareFunctionSnapshotMap().find(instanceId);
+	if (it == FirmwareFunctionSnapshotMap().end())
+		return {};
+	return it->second;
+}
+
+void BinaryNinja::ClearFirmwareFunctionSnapshot(uint64_t instanceId)
+{
+	if (instanceId == 0)
+		return;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	FirmwareFunctionSnapshotMap().erase(instanceId);
+}
+
 Armv5FirmwareView::Armv5FirmwareView(BinaryView *data, bool parseOnly)
 		: BinaryView("ARMv5 Firmware", data->GetFile(), data), m_parseOnly(parseOnly), m_entryPoint(0), m_endian(LittleEndian), m_addressSize(4), m_postAnalysisScansDone(false), m_seededFunctions(), m_seededUserFunctions(), m_seededDataDefines(), m_seededSymbols(), m_instanceId(0), m_fileSessionId(0), m_viewPtr(0)
 {
@@ -329,6 +470,7 @@ Armv5FirmwareView::~Armv5FirmwareView()
 			if (itPtr != FirmwareViewPointerToInstanceMap().end() && itPtr->second == m_instanceId)
 				FirmwareViewPointerToInstanceMap().erase(itPtr);
 		}
+		FirmwareFunctionSnapshotMap().erase(m_instanceId);
 	}
 }
 
@@ -427,6 +569,29 @@ bool Armv5FirmwareView::Init()
 		}
 	}
 
+	// Determine whether the vector table entries are code-like instructions or raw pointers.
+	bool vectorIsCode = true;
+	if (length >= 0x20)
+	{
+		auto isLdrPcLiteral = [](uint32_t instr) -> bool {
+			return ((instr & 0x0FFFF000u) == 0x059FF000u) || ((instr & 0x0FFFF000u) == 0x051FF000u);
+		};
+		auto isBranchImm = [](uint32_t instr) -> bool {
+			return (instr & 0x0E000000u) == 0x0A000000u;
+		};
+		uint32_t codeLike = 0;
+		for (uint64_t i = 0; i < 8; i++)
+		{
+			uint32_t instr = 0;
+			if (!ReadU32At(reader, fileData, fileDataLen, m_endian, i * 4, instr, length))
+				continue;
+			if (isLdrPcLiteral(instr) || isBranchImm(instr))
+				codeLike++;
+		}
+		// Require a majority of entries to look like instructions.
+		vectorIsCode = (codeLike >= 4);
+	}
+
 	// Add a single segment covering the entire file
 	AddAutoSegment(imageBase, length, 0, length, SegmentExecutable | SegmentReadable);
 
@@ -435,7 +600,8 @@ bool Armv5FirmwareView::Init()
 	// Vector literal pool (0x20-0x3F): data
 	// Rest: code
 	if (length >= 0x20)
-		AddAutoSection("vectors", imageBase, 0x20, ReadOnlyCodeSectionSemantics);
+		AddAutoSection("vectors", imageBase, 0x20,
+			vectorIsCode ? ReadOnlyCodeSectionSemantics : ReadOnlyDataSectionSemantics);
 	if (length >= 0x40)
 	{
 		AddAutoSection("vector_ptrs", imageBase + 0x20, 0x20, ReadOnlyDataSectionSemantics);
@@ -589,6 +755,12 @@ bool Armv5FirmwareView::Init()
 	m_entryPoint = handlerAddrs[0];
 	if (m_entryPoint == 0)
 		m_entryPoint = imageBase;
+	if (!IsValidFunctionStart(Ref<BinaryView>(this), m_plat, m_entryPoint))
+	{
+		m_logger->LogWarn("Entry point invalid at 0x%llx, falling back to image base",
+			(unsigned long long)m_entryPoint);
+		m_entryPoint = imageBase;
+	}
 
 	m_logger->LogDebug("Entry point: 0x%llx", (unsigned long long)m_entryPoint);
 
@@ -600,14 +772,6 @@ bool Armv5FirmwareView::Init()
 	if (m_plat)
 	{
 		std::set<uint64_t> seededFunctions;
-
-		// Collect vector table entries for analysis (deferred until post-analysis scans)
-		for (int i = 0; i < 8; i++)
-		{
-			uint64_t vectorAddr = imageBase + (static_cast<uint64_t>(i) * 4);
-			seededFunctions.insert(vectorAddr);
-			m_seededUserFunctions.insert(vectorAddr);
-		}
 
 		// Collect resolved handler functions for analysis (deferred)
 		for (int i = 0; i < 8; i++)
@@ -688,6 +852,11 @@ bool Armv5FirmwareView::Init()
 				{
 					m_logger->LogWarn("Seeded function outside view: 0x%llx",
 														(unsigned long long)funcAddr);
+					continue;
+				}
+				if (!IsValidFunctionStart(Ref<BinaryView>(this), targetPlat, funcAddr))
+				{
+					m_logger->LogWarn("Seeded function invalid at 0x%llx", (unsigned long long)funcAddr);
 					continue;
 				}
 
@@ -784,6 +953,14 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView> &view)
 	{
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: wrong view type %s", view->GetTypeName().c_str());
+		return;
+	}
+
+	const auto& config = Armv5Settings::PluginConfig::Get();
+	if (config.AreAllScansDisabled())
+	{
+		if (logger)
+			logger->LogInfo("Firmware workflow scan: scans disabled by env");
 		return;
 	}
 
@@ -900,6 +1077,11 @@ Armv5FirmwareView* BinaryNinja::GetFirmwareViewForFileSessionId(uint64_t fileSes
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 	auto itFile = FirmwareFileSessionMap().find(fileSessionId);
 	if (itFile == FirmwareFileSessionMap().end())
+		return nullptr;
+	auto itAlive = FirmwareViewAliveMap().find(itFile->second);
+	if (itAlive == FirmwareViewAliveMap().end() || !itAlive->second->load())
+		return nullptr;
+	if (FirmwareViewClosingSet().find(itFile->second) != FirmwareViewClosingSet().end())
 		return nullptr;
 	auto it = FirmwareViewMap().find(itFile->second);
 	if (it == FirmwareViewMap().end())

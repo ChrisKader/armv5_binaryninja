@@ -21,8 +21,8 @@ int thumb_decompose(struct decomp_request *info, struct decomp_result *result)
 	int rc;
 
 	/* initialize result */
-	result->flags = STATUS_OK;
-	result->status = FLAG_NONE;
+	result->status = STATUS_OK;
+	result->flags = FLAG_NONE;
 	result->addrMode = ADDRMODE_UNSPECIFIED;
 	memset(result->fields_mask, 0, sizeof(result->fields_mask));
 	result->format = nullptr;

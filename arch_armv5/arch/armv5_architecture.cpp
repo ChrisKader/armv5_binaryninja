@@ -45,6 +45,47 @@ static bool GetNextFunctionAfterAddress(Ref<BinaryView> data, Ref<Platform> plat
   return nextFunc != nullptr;
 }
 
+static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform, uint64_t addr)
+{
+  if (!view || !view->GetObject())
+    return false;
+  Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
+  if (!arch)
+    return false;
+  const bool enforceExecutable = !view->GetSegments().empty();
+  const bool enforceCodeSemantics = !view->GetSections().empty();
+  uint64_t checkAddr = addr;
+  size_t align = arch->GetInstructionAlignment();
+  if (align > 1)
+    checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+  if (!view->IsValidOffset(checkAddr))
+    return false;
+  if (!view->IsOffsetBackedByFile(checkAddr))
+    return false;
+  if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
+    return false;
+  DataVariable dataVar;
+  if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
+    return false;
+  if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
+    return false;
+  DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
+  if (buf.GetLength() == 0)
+    return false;
+  if (buf.GetLength() >= 4)
+  {
+    const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+    const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+    const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
+    if (allZero || allFF)
+      return false;
+  }
+  InstructionInfo info;
+  if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
+    return false;
+  return info.length != 0;
+}
+
 static bool IsRelatedCondition(Condition orig, Condition candidate)
 {
   switch (orig)
@@ -138,6 +179,15 @@ protected:
     if (armv5_decompose(*(uint32_t*)data, &result, (uint32_t)addr, (uint32_t)(m_endian == BigEndian)) != 0)
       return false;
     return true;
+  }
+
+  uint32_t ReadInstructionWord(const uint8_t* data) const
+  {
+    uint32_t word = 0;
+    memcpy(&word, data, sizeof(word));
+    if (m_endian == BigEndian)
+      word = __builtin_bswap32(word);
+    return word;
   }
 
   void SetInstructionInfoForInstruction(uint64_t addr, const Instruction &instr, InstructionInfo &result)
@@ -237,6 +287,7 @@ protected:
             }
             else if (regList & (1U << REG_PC))
             {
+              result.archTransitionByTargetAddr = true;
               result.AddBranch(FunctionReturn);
             }
             break;
@@ -256,6 +307,7 @@ protected:
           uint32_t regList = instr.operands[i].imm;
           if (regList & (1U << REG_PC))
           {
+            result.archTransitionByTargetAddr = true;
             result.AddBranch(FunctionReturn);
             if (CONDITIONAL(instr.cond))
               result.AddBranch(FalseBranch, addr + 4, this);
@@ -940,7 +992,15 @@ public:
       return false;
     Instruction instr;
     if (!Disassemble(data, addr, maxLen, instr))
+    {
+      uint32_t instrWord = ReadInstructionWord(data);
+      if (instrWord == 0xE1A00000)
+      {
+        result.length = 4;
+        return true;
+      }
       return false;
+    }
 
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
     if (instr.operation == ARMV5_UNDEFINED || instr.operation == ARMV5_UDF ||
@@ -950,11 +1010,11 @@ public:
   }
 
     /* Check for patterns that are likely data, not code */
-    uint32_t instrWord = *(const uint32_t*)data;
-    if (IsLikelyData(instrWord, instr))
-  {
-    return false;
-  }
+    uint32_t instrWord = ReadInstructionWord(data);
+    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
+    {
+      return false;
+    }
 
     SetInstructionInfoForInstruction(addr, instr, result);
     return true;
@@ -966,6 +1026,13 @@ public:
     Instruction instr;
     if (!Disassemble(data, addr, 4, instr))
     {
+      uint32_t instrWord = ReadInstructionWord(data);
+      if (instrWord == 0xE1A00000)
+      {
+        len = 4;
+        result.emplace_back(InstructionToken, "nop");
+        return true;
+      }
       len = 4;
       return false;
     }
@@ -979,8 +1046,8 @@ public:
     }
 
     /* Check for patterns that are likely data, not code */
-    uint32_t instrWord = *(const uint32_t*)data;
-    if (IsLikelyData(instrWord, instr))
+    uint32_t instrWord = ReadInstructionWord(data);
+    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
     {
       len = 4;
       return false;
@@ -1291,6 +1358,13 @@ public:
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
     {
+      uint32_t instrWord = ReadInstructionWord(data);
+      if (instrWord == 0xE1A00000)
+      {
+        il.AddInstruction(il.Nop());
+        len = 4;
+        return true;
+      }
       il.AddInstruction(il.Undefined());
       len = 4;
       return false;
@@ -1306,8 +1380,8 @@ public:
     }
 
     /* Treat likely data as invalid instructions */
-    uint32_t instrWord = *(const uint32_t*)data;
-    if (IsLikelyData(instrWord, instr))
+    uint32_t instrWord = ReadInstructionWord(data);
+    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
     {
       il.AddInstruction(il.Undefined());
       len = 4;
@@ -1569,7 +1643,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-    return false;
+      return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -1577,7 +1651,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-    return false;
+      return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -1585,7 +1659,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-    return false;
+      return false;
     return (instr.operation == ARMV5_B && CONDITIONAL(instr.cond));
   }
 
@@ -1593,7 +1667,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-    return false;
+      return false;
     return (instr.operation == ARMV5_BL) || (instr.operation == ARMV5_BLX);
   }
 
@@ -1601,7 +1675,7 @@ public:
   {
     Instruction instr;
     if (!Disassemble(data, addr, len, instr))
-    return false;
+      return false;
     return (instr.operation == ARMV5_BL) || (instr.operation == ARMV5_BLX);
   }
 
@@ -2598,6 +2672,8 @@ public:
                 if (translateTailCalls && (info.branchType[i] == UnconditionalBranch) &&
                     (target.address < function->GetStart()))
                 {
+                  if (!IsValidFunctionStart(data, targetPlatform, target.address))
+                    break;
                   Ref<Function> forcedFunc = data->AddFunctionForAnalysis(targetPlatform, target.address, true);
                   if (forcedFunc)
                   {
@@ -2699,6 +2775,8 @@ public:
                 if (data->ShouldSkipTargetAnalysis(location, function, instrEnd, target))
                   break;
 
+                if (!IsValidFunctionStart(data, platform, target.address))
+                  break;
                 Ref<Function> func = data->AddFunctionForAnalysis(platform, target.address, true);
                 if (!func)
                 {

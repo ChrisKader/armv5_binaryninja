@@ -186,7 +186,6 @@ static void ConditionExecute(LowLevelILFunction &il, uint32_t cond, ExprId trueC
  *   - If condition false: jump to fallthrough label (continues to next instruction)
  *
  * The fallthrough label must be explicitly marked so BN knows where to continue.
- * After the terminator block, we jump to an end label to ensure clean CFG.
  */
 static void ConditionExecuteTerminator(LowLevelILFunction &il, uint32_t cond, ExprId terminator)
 {
@@ -196,7 +195,7 @@ static void ConditionExecuteTerminator(LowLevelILFunction &il, uint32_t cond, Ex
         return;
     }
 
-    LowLevelILLabel doTerminator, fallthrough, endLabel;
+    LowLevelILLabel doTerminator, fallthrough;
     il.AddInstruction(il.If(GetCondition(il, cond), doTerminator, fallthrough));
 
     /* True path: execute terminator */
@@ -840,8 +839,17 @@ bool LiftBranch(Architecture *arch, LowLevelILFunction &il,
 
     case ARMV5_BX:
     {
-        ConditionExecute(il, instr.cond,
-                         il.Jump(ReadILOperand(il, instr.operands[0], addr, true)));
+        ExprId target = ReadILOperand(il, instr.operands[0], addr, true);
+        if (instr.operands[0].cls == REG && instr.operands[0].reg == REG_LR)
+        {
+            ConditionExecuteTerminator(
+                il, instr.cond,
+                il.Return(il.Register(4, RegisterToIndex(REG_LR))));
+        }
+        else
+        {
+            ConditionExecuteTerminator(il, instr.cond, il.TailCall(target));
+        }
         return true;
     }
 

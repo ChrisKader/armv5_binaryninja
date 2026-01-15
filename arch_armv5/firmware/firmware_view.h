@@ -10,6 +10,7 @@
 #include "binaryninjaapi.h"
 #include "firmware_scan_types.h"
 #include <set>
+#include <unordered_set>
 
 namespace BinaryNinja
 {
@@ -76,4 +77,9 @@ namespace BinaryNinja
 
 	// Lifecycle helpers
 	bool IsFirmwareViewAliveById(uint64_t instanceId);
+
+	// Snapshot helpers for tracking post-scan function changes
+	void StoreFirmwareFunctionSnapshot(uint64_t instanceId, const std::unordered_set<uint64_t>& snapshot);
+	std::unordered_set<uint64_t> LoadFirmwareFunctionSnapshot(uint64_t instanceId);
+	void ClearFirmwareFunctionSnapshot(uint64_t instanceId);
 }

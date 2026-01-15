@@ -9,15 +9,18 @@ import pytest
 from test.helpers import assert_instruction_case
 
 
-def thumb_case(name, instruction, expected_mnemonic, expected_operands, address=0x1000):
+def thumb_case(name, instruction, expected_mnemonic, expected_operands, address=0x1000, expected_info=None):
     """Helper to create Thumb test cases with 2-byte length."""
+    info = {'length': 2}
+    if expected_info:
+        info.update(expected_info)
     return {
         'name': name,
         'instruction': instruction,
         'address': address,
         'expected_mnemonic': expected_mnemonic,
         'expected_operands': expected_operands,
-        'expected_info': {'length': 2},
+        'expected_info': info,
     }
 
 
@@ -109,9 +112,27 @@ THUMB_TESTS = [
 
     # PUSH/POP
     thumb_case('PUSH registers', 0xb501, 'push', ['{r0, lr}']),
-    thumb_case('POP registers', 0xbd01, 'pop', ['{r0, pc}']),
+    thumb_case(
+        'POP registers',
+        0xbd01,
+        'pop',
+        ['{r0, pc}'],
+        expected_info={
+            'arch_transition_by_target_addr': True,
+            'branches': [{'type': 'FunctionReturn'}],
+        },
+    ),
     thumb_case('PUSH multiple', 0xb50f, 'push', ['{r0, r1, r2, r3, lr}']),
-    thumb_case('POP multiple', 0xbd0f, 'pop', ['{r0, r1, r2, r3, pc}']),
+    thumb_case(
+        'POP multiple',
+        0xbd0f,
+        'pop',
+        ['{r0, r1, r2, r3, pc}'],
+        expected_info={
+            'arch_transition_by_target_addr': True,
+            'branches': [{'type': 'FunctionReturn'}],
+        },
+    ),
 
     # SP adjust
     thumb_case('ADD SP immediate', 0xb001, 'add', ['sp', '#4']),
