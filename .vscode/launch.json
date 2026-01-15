@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Binary Ninja DEV",
+      "type": "lldb",
+      "request": "launch",
+      "program": "/Applications/Binary Ninja DEV.app/Contents/MacOS/binaryninja",
+      "args": ["-d", "-l", "${workspaceFolder}/bnlog.log"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "BN_USER_DIRECTORY": "/Users/ck/.binaryninja-dev"
+      },
+      "preLaunchTask": "make install_plugin"
+    }
+  ]
+}

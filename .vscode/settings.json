@@ -1,4 +1,15 @@
 {
-  "cmake.sourceDirectory": "/Users/ck/dev/armv5_binaryninja/arch_armv5",
-  "python.analysis.exclude": ["**/node_modules", "**/large_data_dir", "**/.git", "binaryninja-api/**"]
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/.build",
+  "cmake.configureOnOpen": false,
+  "cmake.configureOnEdit": false,
+  "cmake.buildOnSave": false,
+  "cmake.useCMakePresets": "never",
+  "python.analysis.exclude": ["**/node_modules", "**/large_data_dir", "**/.git", "binaryninja-api/**"],
+  "files.exclude": {
+    "binaryninja-api/**": false
+  },
+  "rust-analyzer.files.exclude": [
+    "binaryninja-api/rust"
+  ]
 }
