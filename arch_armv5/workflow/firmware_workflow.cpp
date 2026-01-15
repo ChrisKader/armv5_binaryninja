@@ -15,8 +15,7 @@ using namespace std;
 
 static Ref<Logger> GetFirmwareWorkflowLogger()
 {
-	static Ref<Logger> logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
-	return logger;
+	return LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
 }
 
 static bool FirmwareWorkflowDisabledByEnv()
@@ -38,15 +37,13 @@ static bool FirmwareWorkflowDisabledByEnv()
 
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
 {
+	if (BNIsShutdownRequested())
+		return;
+
 	auto logger = GetFirmwareWorkflowLogger();
 	if (logger)
 		logger->LogInfo("RunArmv5FirmwareWorkflow: called");
-	if (BNIsShutdownRequested())
-	{
-		if (logger)
-			logger->LogInfo("RunArmv5FirmwareWorkflow: shutdown requested, returning");
-		return;
-	}
+
 	if (!analysisContext)
 	{
 		if (logger)
@@ -70,6 +67,7 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 		logger->LogInfo("RunArmv5FirmwareWorkflow: view type = %s", view->GetTypeName().c_str());
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
+	
 	if (IsFirmwareViewClosing(view.GetPtr()))
 	{
 		if (logger)
@@ -163,6 +161,14 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 
 	// Insert before loadDebugInfo (like RTTI does with rttiAnalysis)
 	bool inserted = firmwareWorkflow->InsertAfter("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
+	if (!inserted)
+	{
+		// Fallback for older API versions or different workflow structures
+		if (logger)
+			logger->LogInfo("RegisterArmv5FirmwareWorkflow: failed to insert after core.module.extendedAnalysis, trying core.module.analysis");
+		inserted = firmwareWorkflow->InsertAfter("core.module.analysis", "analysis.armv5.firmwareScan");
+	}
+	
 	if (logger)
 		logger->LogInfo("RegisterArmv5FirmwareWorkflow: Insert returned %s", inserted ? "true" : "false");
 

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -23,6 +24,7 @@ namespace
 	struct FirmwareScanJobState
 	{
 		uint64_t viewId = 0;
+		uint64_t instanceId = 0;
 		atomic<bool> cancelled{false};
 		atomic<bool> running{false};
 		Ref<BackgroundTask> task;
@@ -40,20 +42,20 @@ namespace
 		return *map;
 	}
 
-	shared_ptr<FirmwareScanJobState> GetJob(uint64_t viewId)
-	{
-		lock_guard<mutex> lock(FirmwareScanJobMutex());
-		auto it = FirmwareScanJobs().find(viewId);
-		if (it == FirmwareScanJobs().end())
-			return nullptr;
-		return it->second;
-	}
+shared_ptr<FirmwareScanJobState> GetJob(uint64_t instanceId)
+{
+	lock_guard<mutex> lock(FirmwareScanJobMutex());
+	auto it = FirmwareScanJobs().find(instanceId);
+	if (it == FirmwareScanJobs().end())
+		return nullptr;
+	return it->second;
+}
 
-	void RemoveJob(uint64_t viewId)
-	{
-		lock_guard<mutex> lock(FirmwareScanJobMutex());
-		FirmwareScanJobs().erase(viewId);
-		SetFirmwareViewScanCancelled(viewId, false);
+void RemoveJob(uint64_t instanceId)
+{
+	lock_guard<mutex> lock(FirmwareScanJobMutex());
+	FirmwareScanJobs().erase(instanceId);
+	SetFirmwareViewScanCancelled(instanceId, false);
 	}
 
 	bool ShouldCancel(const shared_ptr<FirmwareScanJobState>& job, const Ref<BinaryView>& view)
@@ -74,25 +76,58 @@ namespace
 			return true;
 		if (!view || !view->GetObject())
 			return true;
-		if (IsFirmwareViewClosingById(job->viewId))
-			return true;
-		// Note: We no longer check AnalysisIsAborted() here because it returns true when
-		// maxFunctionUpdateCount is hit, which would stop our scans prematurely.
-		// The BNIsShutdownRequested() and job->cancelled checks are sufficient.
-		return false;
+	// If the alive token indicates the view is gone, cancel
+	if (!IsFirmwareViewAliveById(job->instanceId))
+		return true;
+	return false;
 	}
 
-	bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<BinaryView>& view,
-		const Ref<Logger>& logger)
+bool CanUpdateTaskProgress(const shared_ptr<FirmwareScanJobState>& job, const Ref<Logger>& logger = nullptr)
+{
+	if (!job)
 	{
-		if (!view || !view->GetObject())
-			return false;
-		const auto start = chrono::steady_clock::now();
-		constexpr auto kSleep = chrono::milliseconds(100);
-		constexpr auto kLogInterval = chrono::seconds(5);
+		if (logger) logger->LogInfo("CanUpdateTaskProgress: job null");
+		return false;
+	}
+	if (!job->task)
+	{
+		if (logger) logger->LogDebug("CanUpdateTaskProgress: task not yet created");
+		return false;
+	}
+	if (BNIsShutdownRequested())
+	{
+		if (logger) logger->LogInfo("CanUpdateTaskProgress: shutting down");
+		return false;
+	}
+	if (!IsFirmwareViewAliveById(job->instanceId))
+	{
+		if (logger) logger->LogInfoF("CanUpdateTaskProgress: instanceId=%llx not alive", (unsigned long long)job->instanceId);
+		return false;
+	}
+	if (IsFirmwareViewClosingById(job->instanceId))
+	{
+		if (logger) logger->LogInfoF("CanUpdateTaskProgress: instanceId=%llx closing", (unsigned long long)job->instanceId);
+		return false;
+	}
+	return true;
+}
+
+bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<BinaryView>& view,
+	const Ref<Logger>& logger)
+{
+	if (!view || !view->GetObject())
+		return false;
+	const auto start = chrono::steady_clock::now();
+	constexpr auto kSleep = chrono::milliseconds(100);
+	constexpr auto kLogInterval = chrono::seconds(5);
 		auto nextLog = start + kLogInterval;
-		if (job->task)
-			job->task->SetProgressText("ARMv5 firmware scans: waiting for analysis to idle");
+	if (CanUpdateTaskProgress(job, logger))
+	{
+		ExecuteOnMainThread([job, logger]() {
+			if (job && job->task && CanUpdateTaskProgress(job, logger))
+				job->task->SetProgressText("ARMv5 firmware scans: waiting for analysis to idle");
+		});
+	}
 		while (true)
 		{
 			if (ShouldCancel(job, view))
@@ -108,8 +143,13 @@ namespace
 			}
 			this_thread::sleep_for(kSleep);
 		}
-		if (job->task)
-			job->task->SetProgressText("ARMv5 firmware scans: running");
+	if (CanUpdateTaskProgress(job, logger))
+	{
+		ExecuteOnMainThread([job, logger]() {
+			if (job && job->task && CanUpdateTaskProgress(job, logger))
+				job->task->SetProgressText("ARMv5 firmware scans: running");
+		});
+	}
 		return true;
 	}
 
@@ -352,15 +392,46 @@ namespace
 			return false;
 		bool result = false;
 
-		ExecuteOnMainThreadAndWait([view, &fwSettings, &plan, &logger, &result]() {
-			if (!view || !view->GetObject())
-				return;
-			if (BNIsShutdownRequested())
-				return;
-			if (IsFirmwareViewClosing(view.GetPtr()))
-				return;
-			result = ApplyPlanBatchesDirect(view, fwSettings, plan, logger);
-		});
+		if (BNIsShutdownRequested())
+			return false;
+
+		// Schedule the work on the main thread without blocking it. Use a promise to get the result and
+	// poll the future periodically while checking lifecycle state so we can abort during shutdown.
+	std::promise<bool> promise;
+	auto fut = promise.get_future();
+	ExecuteOnMainThread([view, &fwSettings, &plan, &logger, &promise]() mutable {
+		if (!view || !view->GetObject())
+		{
+			promise.set_value(false);
+			return;
+		}
+		if (BNIsShutdownRequested())
+		{
+			promise.set_value(false);
+			return;
+		}
+		if (IsFirmwareViewClosing(view.GetPtr()))
+		{
+			promise.set_value(false);
+			return;
+		}
+		bool r = ApplyPlanBatchesDirect(view, fwSettings, plan, logger);
+		promise.set_value(r);
+	});
+
+	// Wait for the main-thread work to complete, but poll periodically so we can bail out cleanly
+	// if shutdown or view-closing happens.
+	using namespace std::chrono_literals;
+	while (fut.wait_for(100ms) != std::future_status::ready)
+	{
+		if (BNIsShutdownRequested() || IsFirmwareViewClosing(view.GetPtr()))
+		{
+			if (logger)
+				logger->LogInfo("ApplyPlanBatchesOnMainThread: aborted due to shutdown or view closing");
+			return false;
+		}
+	}
+	result = fut.get();
 		return result;
 	}
 
@@ -375,16 +446,38 @@ namespace
 		} runningGuard{job};
 
 		Ref<Logger> logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
-		if (job->task)
-			job->task->SetProgressText("ARMv5 firmware scans: preparing");
-		auto finishTask = [&]() {
-			if (job->task && !job->task->IsFinished())
-				job->task->Finish();
-		};
+
+	auto finishTask = [&]() {
+		// Avoid touching UI/main-thread during shutdown or when the view is closing.
+		if (!job || !job->task)
+			return;
+		if (job->task->IsFinished())
+			return;
+		// Schedule finish on main thread without waiting to avoid shutdown deadlocks.
+		ExecuteOnMainThread([job, logger]() {
+			if (!job || !job->task)
+				return;
+			if (job->task->IsFinished())
+				return;
+			if (!CanUpdateTaskProgress(job, logger))
+				return;
+			job->task->Finish();
+		});
+	};
+
+	try
+	{
+		if (BNIsShutdownRequested() || IsFirmwareViewClosingById(job->instanceId))
+		{
+			RemoveJob(job->instanceId);
+			return;
+		}
 		auto resolveView = [&]() -> Ref<BinaryView> {
-			if (IsFirmwareViewClosingById(job->viewId))
+			if (IsFirmwareViewClosingById(job->instanceId))
 				return nullptr;
-			Armv5FirmwareView* firmwareView = GetFirmwareViewForSessionId(job->viewId);
+			if (!IsFirmwareViewAliveById(job->instanceId))
+				return nullptr;
+			Armv5FirmwareView* firmwareView = GetFirmwareViewForInstanceId(job->instanceId);
 			if (!firmwareView)
 				return nullptr;
 			Ref<BinaryView> view = firmwareView;
@@ -399,19 +492,34 @@ namespace
 			if (logger)
 				logger->LogInfo("Firmware workflow scan: view lookup failed");
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
+
+		// Create BackgroundTask on main thread after we have a valid view and know it's safe.
+		if (!job->task && CanUpdateTaskProgress(job, logger))
+		{
+			ExecuteOnMainThread([job, logger]() {
+				if (!CanUpdateTaskProgress(job, logger))
+					return;
+				if (!job->task)
+					job->task = new BackgroundTask("ARMv5 firmware scans...", true);
+				if (job->task && CanUpdateTaskProgress(job, logger))
+					job->task->SetProgressText("ARMv5 firmware scans: preparing");
+			});
+		}
+
+		uint64_t length = view->GetParentView()->GetLength();
 		if (ScanCancelled(view))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (!WaitForAnalysisIdle(job, view, logger))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
@@ -424,15 +532,7 @@ namespace
 			if (logger)
 				logger->LogInfo("Firmware workflow scan skipped (skipFirmwareScans enabled)");
 			finishTask();
-			RemoveJob(job->viewId);
-			return;
-		}
-
-		uint64_t length = view->GetLength();
-		if (!length)
-		{
-			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
@@ -444,7 +544,7 @@ namespace
 		if (!fileData || fileDataLen == 0)
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
@@ -452,7 +552,7 @@ namespace
 		if (!parentView)
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		BinaryReader reader(parentView);
@@ -460,11 +560,9 @@ namespace
 
 		Armv5FirmwareView* firmwareView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
 		if (!firmwareView)
-			firmwareView = GetFirmwareViewForSessionId(job->viewId);
-		if (!firmwareView)
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
@@ -526,7 +624,7 @@ namespace
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableLiteralPoolTyping)
@@ -539,14 +637,14 @@ namespace
 		if (ScanCancelled(view))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enablePrologueScan)
@@ -562,14 +660,14 @@ namespace
 		if (ScanCancelled(view))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableClearAutoDataOnCodeRefs)
@@ -582,7 +680,7 @@ namespace
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableCallTargetScan)
@@ -597,14 +695,14 @@ namespace
 		if (ScanCancelled(view))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enablePointerTargetScan)
@@ -619,14 +717,14 @@ namespace
 		if (ScanCancelled(view))
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableOrphanCodeScan)
@@ -646,7 +744,7 @@ namespace
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableClearAutoDataOnCodeRefs && !addedFunctions.empty())
@@ -659,7 +757,7 @@ namespace
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (fwSettings.enableInvalidFunctionCleanup)
@@ -685,7 +783,7 @@ namespace
 		if (!refreshViewForPhase())
 		{
 			finishTask();
-			RemoveJob(job->viewId);
+			RemoveJob(job->instanceId);
 			return;
 		}
 		if (!ScanCancelled(view))
@@ -695,9 +793,27 @@ namespace
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");
 
 		finishTask();
-		SetFirmwareViewScanCancelled(job->viewId, false);
-		RemoveJob(job->viewId);
+		SetFirmwareViewScanCancelled(job->instanceId, false);
+		RemoveJob(job->instanceId);
 	}
+	catch (const std::exception& e)
+	{
+		if (logger)
+			logger->LogError("Firmware workflow scan: exception caught: %s", e.what());
+		finishTask();
+		SetFirmwareViewScanCancelled(job->instanceId, false);
+		RemoveJob(job->instanceId);
+	}
+	catch (...)
+	{
+		if (logger)
+			logger->LogError("Firmware workflow scan: unknown exception caught");
+		finishTask();
+		SetFirmwareViewScanCancelled(job->instanceId, false);
+		RemoveJob(job->instanceId);
+	}
+}
+
 }
 
 void BinaryNinja::ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view)
@@ -705,34 +821,38 @@ void BinaryNinja::ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view)
 	// Run scans in a background thread (pattern used by EFI resolver).
 	if (!view || !view->GetObject())
 		return;
+	if (BNIsShutdownRequested())
+		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
-	Ref<FileMetadata> file = view->GetFile();
-	if (!file)
+	// Use the view's instanceId so we can map back to the tracked Armv5FirmwareView
+	Armv5FirmwareView* fwView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
+	if (!fwView)
 		return;
-	uint64_t viewId = file->GetSessionId();
-	if (viewId == 0)
+	uint64_t instanceId = fwView->GetInstanceId();
+	if (instanceId == 0)
+		return;
+	if (IsFirmwareViewClosingById(instanceId))
 		return;
 
 	// Check if already running
 	{
 		lock_guard<mutex> lock(FirmwareScanJobMutex());
-		auto it = FirmwareScanJobs().find(viewId);
+		auto it = FirmwareScanJobs().find(instanceId);
 		if (it != FirmwareScanJobs().end() && it->second && it->second->running.load())
 			return;
 	}
 
-	SetFirmwareViewScanCancelled(viewId, false);
+	SetFirmwareViewScanCancelled(instanceId, false);
 	auto job = make_shared<FirmwareScanJobState>();
-	job->viewId = viewId;
+		job->instanceId = instanceId; // ensure instanceId is set
+		job->viewId = instanceId; // maintain backward-compatible viewId for now
 	job->running.store(true);
-	job->task = new BackgroundTask("ARMv5 firmware scans...", true);
-
+	// Defer creating the BackgroundTask until we are sure the view still exists and we are not shutting down.
 	{
 		lock_guard<mutex> lock(FirmwareScanJobMutex());
-		FirmwareScanJobs()[viewId] = job;
+		FirmwareScanJobs()[instanceId] = job;
 	}
-
 	// Run in a background thread (pattern used by EFI resolver).
 	std::thread([job]() { RunFirmwareScanJob(job); }).detach();
 }
@@ -744,6 +864,6 @@ void BinaryNinja::CancelArmv5FirmwareScanJob(uint64_t viewId)
 		return;
 	SetFirmwareViewScanCancelled(viewId, true);
 	job->cancelled.store(true);
-	if (job->task && job->task->CanCancel())
+	if (CanUpdateTaskProgress(job) && job->task->CanCancel())
 		job->task->Cancel();
 }

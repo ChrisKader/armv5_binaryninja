@@ -27,7 +27,8 @@ namespace BinaryNinja
 	std::set<uint64_t> m_seededUserFunctions;
 		std::vector<FirmwareScanDataDefine> m_seededDataDefines;
 		std::vector<BinaryNinja::Ref<BinaryNinja::Symbol>> m_seededSymbols;
-		uint64_t m_viewId;
+		uint64_t m_instanceId;
+		uint64_t m_fileSessionId;
 		uintptr_t m_viewPtr;
 
 		virtual uint64_t PerformGetEntryPoint() const override;
@@ -46,6 +47,9 @@ namespace BinaryNinja
 	const std::set<uint64_t>& GetSeededUserFunctions() const;
 	const std::vector<FirmwareScanDataDefine>& GetSeededDataDefines() const;
 	const std::vector<BinaryNinja::Ref<BinaryNinja::Symbol>>& GetSeededSymbols() const;
+	uint64_t GetInstanceId() const { return m_instanceId; }
+	uint64_t GetFileSessionId() const { return m_fileSessionId; }
+	bool IsParseOnly() const { return m_parseOnly; }
 	};
 
 	class Armv5FirmwareViewType: public BinaryViewType
@@ -63,9 +67,13 @@ namespace BinaryNinja
 	void InitArmv5FirmwareViewType();
 	void RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view);
 	bool IsFirmwareViewClosing(const BinaryView* view);
-	bool IsFirmwareViewClosingById(uint64_t viewId);
+	bool IsFirmwareViewClosingById(uint64_t instanceId);
 	bool IsFirmwareViewScanCancelled(const BinaryView* view);
-	bool IsFirmwareViewScanCancelledById(uint64_t viewId);
-	void SetFirmwareViewScanCancelled(uint64_t viewId, bool cancelled);
-	Armv5FirmwareView* GetFirmwareViewForSessionId(uint64_t viewId);
+	bool IsFirmwareViewScanCancelledById(uint64_t instanceId);
+	void SetFirmwareViewScanCancelled(uint64_t instanceId, bool cancelled);
+	Armv5FirmwareView* GetFirmwareViewForInstanceId(uint64_t instanceId);
+	Armv5FirmwareView* GetFirmwareViewForFileSessionId(uint64_t fileSessionId);
+
+	// Lifecycle helpers
+	bool IsFirmwareViewAliveById(uint64_t instanceId);
 }

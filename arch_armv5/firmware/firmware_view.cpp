@@ -34,69 +34,114 @@ std::mutex &FirmwareViewMutex()
 	return *m;
 }
 
-using ViewId = uint64_t;
+using InstanceId = uint64_t;
 
-static std::unordered_set<ViewId> &FirmwareViewClosingSet()
+static InstanceId &GetNextInstanceId()
 {
-	static auto *set = new std::unordered_set<ViewId>();
+	static InstanceId id = 1;
+	return id;
+}
+
+static std::unordered_set<InstanceId> &FirmwareViewClosingSet()
+{
+	static auto *set = new std::unordered_set<InstanceId>();
 	return *set;
 }
 
-static std::unordered_set<ViewId> &FirmwareViewScanCancelSet()
+static std::unordered_set<InstanceId> &FirmwareViewScanCancelSet()
 {
-	static auto *set = new std::unordered_set<ViewId>();
+	static auto *set = new std::unordered_set<InstanceId>();
 	return *set;
 }
 
-static std::unordered_map<ViewId, Armv5FirmwareView *> &FirmwareViewMap()
+static std::unordered_map<InstanceId, Armv5FirmwareView*> &FirmwareViewMap()
 {
-	static auto *map = new std::unordered_map<ViewId, Armv5FirmwareView *>();
+	static auto *map = new std::unordered_map<InstanceId, Armv5FirmwareView*>();
 	return *map;
 }
 
-static std::unordered_map<uintptr_t, ViewId> &FirmwareViewPointerMap()
+static std::unordered_map<uint64_t, InstanceId> &FirmwareFileSessionMap()
 {
-	static auto *map = new std::unordered_map<uintptr_t, ViewId>();
+	static auto *map = new std::unordered_map<uint64_t, InstanceId>();
 	return *map;
 }
 
-// Track raw BNBinaryView* pointers (as uintptr_t) of real (non-parse-only) views.
-// This is used in destruction callbacks to distinguish real views from parse-only views
-// without calling any methods on potentially-invalid objects.
-static ViewId GetViewIdFromFileMetadata(const FileMetadata &file)
+static std::unordered_map<uintptr_t, InstanceId> &FirmwareViewPointerToInstanceMap()
 {
-	return file.GetSessionId();
+	static auto *map = new std::unordered_map<uintptr_t, InstanceId>();
+	return *map;
 }
 
-static ViewId GetViewIdFromView(const BinaryView *view)
+// Track a small alive token per view instance that background tasks can use to
+// determine whether the view is still alive without touching view pointers.
+static std::unordered_map<InstanceId, std::shared_ptr<std::atomic<bool>>> &FirmwareViewAliveMap()
+{
+	static auto *map = new std::unordered_map<InstanceId, std::shared_ptr<std::atomic<bool>>>();
+	return *map;
+}
+
+static InstanceId GetInstanceIdFromView(const BinaryView *view)
 {
 	if (!view)
 		return 0;
-	auto file = view->GetFile();
-	if (!file)
+	
+	// If it's our own view type, we can just get the ID safely
+	const Armv5FirmwareView* fwView = dynamic_cast<const Armv5FirmwareView*>(view);
+	if (fwView)
+		return fwView->GetInstanceId();
+	
+	// Fallback to lookup via object pointer if it's a wrapper view.
+	// NOTE: This is susceptible to pointer reuse if not handled carefully,
+	// but we only track real views in the map.
+	if (!view->GetObject())
 		return 0;
-	return file->GetSessionId();
+	
+	uintptr_t viewPtr = reinterpret_cast<uintptr_t>(view->GetObject());
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto it = FirmwareViewPointerToInstanceMap().find(viewPtr);
+	if (it != FirmwareViewPointerToInstanceMap().end())
+		return it->second;
+	
+	return 0;
 }
 
 static void OnFirmwareInitialAnalysisComplete(BinaryView *view)
 {
+	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
 	if (!view || !view->GetObject())
 		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
 
-	ViewId viewId = GetViewIdFromView(view);
-	if (viewId == 0)
-		return;
-	if (IsFirmwareViewClosingById(viewId))
-		return;
+	InstanceId instanceId = GetInstanceIdFromView(view);
+	if (logger)
+		logger->LogInfo("OnFirmwareInitialAnalysisComplete: instanceId=%llx", (unsigned long long)instanceId);
 
-	Armv5FirmwareView *firmwareView = GetFirmwareViewForSessionId(viewId);
+	if (instanceId == 0)
+		return;
+	if (IsFirmwareViewClosingById(instanceId))
+	{
+		if (logger)
+			logger->LogInfo("OnFirmwareInitialAnalysisComplete: view closing");
+		return;
+	}
+
+	auto firmwareView = GetFirmwareViewForInstanceId(instanceId);
 	if (!firmwareView)
+	{
+		if (logger)
+			logger->LogInfo("OnFirmwareInitialAnalysisComplete: firmwareView not found in map");
 		return;
+	}
 	if (!firmwareView->TryBeginWorkflowScans())
+	{
+		if (logger)
+			logger->LogInfo("OnFirmwareInitialAnalysisComplete: scans already scheduled");
 		return;
+	}
 
+	if (logger)
+		logger->LogInfo("OnFirmwareInitialAnalysisComplete: scheduling scan job");
 	ScheduleArmv5FirmwareScanJob(Ref<BinaryView>(firmwareView));
 }
 
@@ -107,83 +152,59 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 	// Only process ARMv5 Firmware views
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
-
-	auto *obj = view->GetObject();
-	if (!obj)
-		return;
-
-	uintptr_t viewPtr = reinterpret_cast<uintptr_t>(obj);
-	ViewId viewId = 0;
-
-	{
-		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-		auto it = FirmwareViewPointerMap().find(viewPtr);
-		if (it == FirmwareViewPointerMap().end())
-			return; // not a tracked real view (likely parse-only)
-		viewId = it->second;
-		FirmwareViewClosingSet().insert(viewId);
-	}
-
-	CancelArmv5FirmwareScanJob(viewId);
-	SetFirmwareViewScanCancelled(viewId, true);
+	// Finalization is an analysis event, not a teardown signal. Avoid mutating
+	// lifetime state here; destruction callbacks and the view destructor handle cleanup.
+	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+	if (logger)
+		logger->LogInfo("OnFirmwareViewFinalization: analysis finalization event");
 }
 
 static void RegisterFirmwareViewDestructionCallbacks()
 {
-	static std::once_flag once;
-	std::call_once(once, []()
-								 {
-		BNObjectDestructionCallbacks callbacks = {};
-		callbacks.destructBinaryView = [](void* ctxt, BNBinaryView* bnView) -> void
+	BNObjectDestructionCallbacks callbacks = {};
+	callbacks.destructFileMetadata = [](void* ctx, BNFileMetadata* obj) -> void {
+		(void)ctx;
+		if (!obj)
+			return;
+
+		const auto file = FileMetadata(obj);
+		const uint64_t fileSessionId = file.GetSessionId();
+		InstanceId instanceId = 0;
+
 		{
-			(void)ctxt;
-			if (!bnView)
-				return;
-
-			// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
-			uintptr_t viewPtr = reinterpret_cast<uintptr_t>(bnView);
-			ViewId viewId = 0;
-
+			std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+			auto& fileMap = FirmwareFileSessionMap();
+			auto it = fileMap.find(fileSessionId);
+			if (it != fileMap.end())
 			{
-				std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-				auto& ptrMap = FirmwareViewPointerMap();
-				auto it = ptrMap.find(viewPtr);
-				if (it != ptrMap.end())
+				instanceId = it->second;
+				fileMap.erase(it);
+				FirmwareViewMap().erase(instanceId);
+				for (auto itPtr = FirmwareViewPointerToInstanceMap().begin();
+						 itPtr != FirmwareViewPointerToInstanceMap().end(); )
 				{
-					viewId = it->second;
-					ptrMap.erase(it);
-					if (viewId != 0)
-						FirmwareViewClosingSet().insert(viewId);
+					if (itPtr->second == instanceId)
+						itPtr = FirmwareViewPointerToInstanceMap().erase(itPtr);
+					else
+						++itPtr;
+				}
+				FirmwareViewClosingSet().insert(instanceId);
+				auto itAlive = FirmwareViewAliveMap().find(instanceId);
+				if (itAlive != FirmwareViewAliveMap().end())
+				{
+					itAlive->second->store(false);
+					FirmwareViewAliveMap().erase(itAlive);
 				}
 			}
+		}
 
-			if (viewId != 0)
-				CancelArmv5FirmwareScanJob(viewId);
-		};
-
-		// Handle FileMetadata destruction - final cleanup after all views are gone.
-		callbacks.destructFileMetadata = [](void* ctxt, BNFileMetadata* fileMetadata) -> void
+		if (instanceId != 0)
 		{
-			(void)ctxt;
-			if (!fileMetadata)
-				return;
+			SetFirmwareViewScanCancelled(instanceId, true);
+		}
+	};
 
-			// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
-			FileMetadata file(fileMetadata);
-			ViewId viewId = GetViewIdFromFileMetadata(file);
-
-			{
-				std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-				FirmwareViewClosingSet().insert(viewId);
-				auto it = FirmwareViewMap().find(viewId);
-				if (it != FirmwareViewMap().end())
-					FirmwareViewMap().erase(it);
-			}
-
-			CancelArmv5FirmwareScanJob(viewId);
-		};
-
-		BNRegisterObjectDestructionCallbacks(&callbacks); });
+	BNRegisterObjectDestructionCallbacks(&callbacks);
 }
 
 void BinaryNinja::InitArmv5FirmwareViewType()
@@ -197,55 +218,80 @@ void BinaryNinja::InitArmv5FirmwareViewType()
 	BinaryViewType::RegisterBinaryViewFinalizationEvent(OnFirmwareViewFinalization);
 }
 
+bool BinaryNinja::IsFirmwareViewAliveById(uint64_t instanceId)
+{
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto it = FirmwareViewAliveMap().find(instanceId);
+	if (it == FirmwareViewAliveMap().end())
+		return false;
+	return it->second && it->second->load();
+}
+
 Armv5FirmwareView::Armv5FirmwareView(BinaryView *data, bool parseOnly)
-		: BinaryView("ARMv5 Firmware", data->GetFile(), data), m_parseOnly(parseOnly), m_entryPoint(0), m_endian(LittleEndian), m_addressSize(4), m_postAnalysisScansDone(false), m_seededFunctions(), m_seededUserFunctions(), m_seededDataDefines(), m_seededSymbols(), m_viewId(0), m_viewPtr(0)
+		: BinaryView("ARMv5 Firmware", data->GetFile(), data), m_parseOnly(parseOnly), m_entryPoint(0), m_endian(LittleEndian), m_addressSize(4), m_postAnalysisScansDone(false), m_seededFunctions(), m_seededUserFunctions(), m_seededDataDefines(), m_seededSymbols(), m_instanceId(0), m_fileSessionId(0), m_viewPtr(0)
 {
 	CreateLogger("BinaryView");
 	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
 
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-		ViewId viewId = GetViewIdFromView(this);
-		m_viewId = viewId;
+		m_instanceId = GetNextInstanceId()++;
+		if (GetFile())
+			m_fileSessionId = GetFile()->GetSessionId();
+		m_viewPtr = reinterpret_cast<uintptr_t>(GetObject());
 
-		if (!m_parseOnly && viewId != 0)
+		if (!m_parseOnly && m_viewPtr != 0)
 		{
-			bool wasClosing = FirmwareViewClosingSet().count(viewId) > 0;
-			FirmwareViewClosingSet().erase(viewId);
-			FirmwareViewScanCancelSet().erase(viewId);
-			FirmwareViewMap()[viewId] = this;
+			FirmwareViewClosingSet().erase(m_instanceId);
+			FirmwareViewScanCancelSet().erase(m_instanceId);
+			FirmwareViewMap()[m_instanceId] = this;
+			FirmwareViewPointerToInstanceMap()[m_viewPtr] = m_instanceId;
+			if (m_fileSessionId != 0)
+				FirmwareFileSessionMap()[m_fileSessionId] = m_instanceId;
+			// Create alive token for background jobs to reference without holding view pointers
+			FirmwareViewAliveMap()[m_instanceId] = std::make_shared<std::atomic<bool>>(true);
 
-			m_viewPtr = reinterpret_cast<uintptr_t>(GetObject());
-			if (m_viewPtr != 0)
-				FirmwareViewPointerMap()[m_viewPtr] = viewId;
-
-			m_logger->LogInfo("FirmwareView ctor: viewId=%llu parseOnly=%d wasClosing=%d ptr=0x%llx",
-				(unsigned long long)viewId, m_parseOnly, wasClosing, (unsigned long long)m_viewPtr);
+			m_logger->LogInfo("FirmwareView ctor: instanceId=%llx parseOnly=%d ptr=0x%llx",
+				(unsigned long long)m_instanceId, m_parseOnly, (unsigned long long)m_viewPtr);
 		}
 		else
 		{
-			m_logger->LogInfo("FirmwareView ctor: viewId=%llu parseOnly=%d (not tracking)",
-				(unsigned long long)viewId, m_parseOnly);
+			m_logger->LogInfo("FirmwareView ctor: instanceId=%llx parseOnly=%d (not tracking)",
+				(unsigned long long)m_instanceId, m_parseOnly);
 		}
 	}
 }
 
 Armv5FirmwareView::~Armv5FirmwareView()
 {
-	// Do not call BinaryView APIs from the destructor. The core object has already
-	// been released by the time this runs. Cleanup happens via the object
-	// destruction callback registered in InitArmv5FirmwareViewType().
-	// NOTE: Do NOT use LogRegistry here - it may be invalid during shutdown.
-	if (m_viewId != 0)
+	if (m_instanceId != 0)
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 
-		auto it = FirmwareViewMap().find(m_viewId);
-		if (it != FirmwareViewMap().end() && it->second == this)
+		auto it = FirmwareViewMap().find(m_instanceId);
+		if (it != FirmwareViewMap().end())
 			FirmwareViewMap().erase(it);
+		if (m_fileSessionId != 0)
+		{
+			auto itFile = FirmwareFileSessionMap().find(m_fileSessionId);
+			if (itFile != FirmwareFileSessionMap().end() && itFile->second == m_instanceId)
+				FirmwareFileSessionMap().erase(itFile);
+		}
 
+		// Mark alive token false and remove it so jobs know the view is gone.
+		auto itAlive = FirmwareViewAliveMap().find(m_instanceId);
+		if (itAlive != FirmwareViewAliveMap().end())
+		{
+			itAlive->second->store(false);
+			FirmwareViewAliveMap().erase(itAlive);
+		}
+		
 		if (m_viewPtr != 0)
-			FirmwareViewPointerMap().erase(m_viewPtr);
+		{
+			auto itPtr = FirmwareViewPointerToInstanceMap().find(m_viewPtr);
+			if (itPtr != FirmwareViewPointerToInstanceMap().end() && itPtr->second == m_instanceId)
+				FirmwareViewPointerToInstanceMap().erase(itPtr);
+		}
 	}
 }
 
@@ -632,12 +678,12 @@ void Armv5FirmwareView::RunFirmwareWorkflowScans()
 
 	m_logger->LogInfo("Firmware workflow scan: RunFirmwareWorkflowScans invoked");
 
-	if (m_viewId == 0)
+	if (m_instanceId == 0)
 	{
 		m_logger->LogInfo("Firmware workflow scan: skipped (missing view id)");
 		return;
 	}
-	if (IsFirmwareViewClosingById(m_viewId))
+	if (IsFirmwareViewClosingById(m_instanceId))
 	{
 		m_logger->LogInfo("Firmware workflow scan: skipped (view closing)");
 		return;
@@ -707,19 +753,12 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView> &view)
 	Armv5FirmwareView *firmwareView = dynamic_cast<Armv5FirmwareView *>(view.GetPtr());
 	if (!firmwareView)
 	{
-		auto file = view->GetFile();
-		if (file)
-		{
-			ViewId viewId = file->GetSessionId();
-			std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-			auto it = FirmwareViewMap().find(viewId);
-			if (it != FirmwareViewMap().end())
-				firmwareView = it->second;
-		}
+		InstanceId instanceId = GetInstanceIdFromView(view.GetPtr());
+		firmwareView = GetFirmwareViewForInstanceId(instanceId);
 		if (!firmwareView)
 		{
 			if (logger)
-				logger->LogInfo("Firmware workflow scan: view lookup failed");
+				logger->LogInfo("Firmware workflow scan: view lookup failed for instanceId=%llx", (unsigned long long)instanceId);
 			return;
 		}
 	}
@@ -734,21 +773,28 @@ bool BinaryNinja::IsFirmwareViewClosing(const BinaryView *view)
 	if (!view->GetObject())
 		return true;
 
-	ViewId viewId = GetViewIdFromView(view);
-	if (viewId == 0)
+	InstanceId instanceId = GetInstanceIdFromView(view);
+	if (instanceId == 0)
 		return true;
 
-	return IsFirmwareViewClosingById(viewId);
+	return IsFirmwareViewClosingById(instanceId);
 }
 
-bool BinaryNinja::IsFirmwareViewClosingById(uint64_t viewId)
+bool BinaryNinja::IsFirmwareViewClosingById(uint64_t instanceId)
 {
-	if (viewId == 0)
+	if (instanceId == 0)
 		return true;
 
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 	auto &closing = FirmwareViewClosingSet();
-	return closing.find(viewId) != closing.end();
+	bool isClosing = closing.find(instanceId) != closing.end();
+	if (isClosing)
+	{
+		auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+		if (logger)
+			logger->LogInfo("IsFirmwareViewClosingById: instanceId=%llx is closing", (unsigned long long)instanceId);
+	}
+	return isClosing;
 }
 
 bool BinaryNinja::IsFirmwareViewScanCancelled(const BinaryView *view)
@@ -756,46 +802,61 @@ bool BinaryNinja::IsFirmwareViewScanCancelled(const BinaryView *view)
 	if (!view)
 		return true;
 
-	ViewId viewId = GetViewIdFromView(view);
-	if (viewId == 0)
+	InstanceId instanceId = GetInstanceIdFromView(view);
+	if (instanceId == 0)
 		return true;
 
-	return IsFirmwareViewScanCancelledById(viewId);
+	return IsFirmwareViewScanCancelledById(instanceId);
 }
 
-bool BinaryNinja::IsFirmwareViewScanCancelledById(uint64_t viewId)
+bool BinaryNinja::IsFirmwareViewScanCancelledById(uint64_t instanceId)
 {
-	if (viewId == 0)
+	if (instanceId == 0)
 		return true;
 
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 	auto &cancelled = FirmwareViewScanCancelSet();
-	return cancelled.find(viewId) != cancelled.end();
+	return cancelled.find(instanceId) != cancelled.end();
 }
 
-void BinaryNinja::SetFirmwareViewScanCancelled(uint64_t viewId, bool cancelled)
+void BinaryNinja::SetFirmwareViewScanCancelled(uint64_t instanceId, bool cancelled)
 {
-	if (viewId == 0)
+	if (instanceId == 0)
 		return;
 
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
 	auto &set = FirmwareViewScanCancelSet();
 	if (cancelled)
-		set.insert(viewId);
+		set.insert(instanceId);
 	else
-		set.erase(viewId);
+		set.erase(instanceId);
 }
 
-Armv5FirmwareView *BinaryNinja::GetFirmwareViewForSessionId(uint64_t viewId)
+Armv5FirmwareView* BinaryNinja::GetFirmwareViewForInstanceId(uint64_t instanceId)
 {
-	if (viewId == 0)
+	if (instanceId == 0)
 		return nullptr;
 
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
-	auto it = FirmwareViewMap().find(viewId);
+	auto it = FirmwareViewMap().find(instanceId);
 	if (it == FirmwareViewMap().end())
 		return nullptr;
 
+	return it->second;
+}
+
+Armv5FirmwareView* BinaryNinja::GetFirmwareViewForFileSessionId(uint64_t fileSessionId)
+{
+	if (fileSessionId == 0)
+		return nullptr;
+
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto itFile = FirmwareFileSessionMap().find(fileSessionId);
+	if (itFile == FirmwareFileSessionMap().end())
+		return nullptr;
+	auto it = FirmwareViewMap().find(itFile->second);
+	if (it == FirmwareViewMap().end())
+		return nullptr;
 	return it->second;
 }
 
