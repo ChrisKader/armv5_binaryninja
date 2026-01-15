@@ -6,7 +6,7 @@ all: build
 
 configure:
 	@mkdir -p .build
-	@cd .build && cmake ..
+	@cd .build && cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
 
 build: configure
 	@$(MAKE) -C .build -j8

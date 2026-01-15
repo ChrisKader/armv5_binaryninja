@@ -2475,8 +2475,20 @@ public:
 
               if (!resolvedTargets.empty())
               {
+                constexpr size_t kMaxIndirectTargets = 4095;
+                size_t emittedTargets = 0;
+                if (resolvedTargets.size() > kMaxIndirectTargets)
+                {
+                  auto clampLogger = LogRegistry::CreateLogger("BinaryView.ARMv5Architecture");
+                  if (clampLogger)
+                    clampLogger->LogWarn("Clamping indirect branch targets at 0x%llx from %zu to %zu",
+                                         (unsigned long long)location.address,
+                                         resolvedTargets.size(), kMaxIndirectTargets);
+                }
                 for (auto &branch : resolvedTargets)
                 {
+                  if (emittedTargets++ >= kMaxIndirectTargets)
+                    break;
                   directRefs[branch.address].emplace(location);
                   Ref<Platform> targetPlatform = funcPlatform;
                   if (branch.arch != function->GetArchitecture())

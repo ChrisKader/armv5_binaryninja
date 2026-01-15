@@ -1,0 +1,27 @@
+CompileFlags:
+  Add: [
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api",
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api/base",
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api/arch/armv7",
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api/arch/armv7/armv7_disasm",
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api/arch/armv7/thumb2_disasm",
+    "-I/Users/ck/dev/armv5_binaryninja/binaryninja-api/vendor/fmt/include",
+    "-stdlib=libc++",
+    "-isystem",
+    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1"
+  ]
+---
+If:
+  PathMatch: ^binaryninja-api/.*
+CompileFlags:
+  CompilationDatabase: /Users/ck/dev/armv5_binaryninja/binaryninja-api/build
+---
+If:
+  PathMatch: ^binaryninja-api/arch/armv7/thumb2_disasm/(disassembler\\.h|arch_thumb2\\.h)$
+CompileFlags:
+  Add: [
+    "-include",
+    "string",
+    "-include",
+    "/Users/ck/dev/armv5_binaryninja/binaryninja-api/arch/armv7/thumb2_disasm/spec.h"
+  ]

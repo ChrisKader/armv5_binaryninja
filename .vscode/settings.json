@@ -1,10 +1,11 @@
 {
-  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.sourceDirectory": "${workspaceFolder}/arch_armv5",
   "cmake.buildDirectory": "${workspaceFolder}/.build",
   "cmake.configureOnOpen": false,
   "cmake.configureOnEdit": false,
   "cmake.buildOnSave": false,
   "cmake.useCMakePresets": "never",
+  "clangd.arguments": ["--compile-commands-dir=${workspaceFolder}/.build"],
   "python.analysis.exclude": ["**/node_modules", "**/large_data_dir", "**/.git", "binaryninja-api/**"],
   "files.exclude": {
     "binaryninja-api/**": false

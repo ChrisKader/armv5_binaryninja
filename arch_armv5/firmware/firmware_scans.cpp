@@ -2160,6 +2160,9 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			break;
 		if (!actionPolicy.allowRemoveFunction)
 			continue;
+		if (verboseLog && logger)
+			logger->LogInfo("Cleanup invalid: removing function at 0x%llx",
+				(unsigned long long)start);
 		if (plan)
 		{
 			PlanRemoveFunction(plan, start);

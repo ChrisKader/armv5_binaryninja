@@ -392,46 +392,49 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 			return false;
 		bool result = false;
 
-		if (BNIsShutdownRequested())
-			return false;
+		// Schedule the work on the main thread without blocking it. Use shared state so the
+		// lambda cannot outlive referenced stack locals during shutdown.
+		auto promise = std::make_shared<std::promise<bool>>();
+		auto fut = promise->get_future();
+		auto cancelled = std::make_shared<std::atomic<bool>>(false);
+		FirmwareSettings fwSettingsCopy = fwSettings;
+		FirmwareScanPlan planCopy = plan;
+		Ref<Logger> loggerCopy = logger;
 
-		// Schedule the work on the main thread without blocking it. Use a promise to get the result and
-	// poll the future periodically while checking lifecycle state so we can abort during shutdown.
-	std::promise<bool> promise;
-	auto fut = promise.get_future();
-	ExecuteOnMainThread([view, &fwSettings, &plan, &logger, &promise]() mutable {
-		if (!view || !view->GetObject())
-		{
-			promise.set_value(false);
-			return;
-		}
-		if (BNIsShutdownRequested())
-		{
-			promise.set_value(false);
-			return;
-		}
-		if (IsFirmwareViewClosing(view.GetPtr()))
-		{
-			promise.set_value(false);
-			return;
-		}
-		bool r = ApplyPlanBatchesDirect(view, fwSettings, plan, logger);
-		promise.set_value(r);
-	});
+		ExecuteOnMainThread([view, fwSettingsCopy, planCopy, loggerCopy, promise, cancelled]() mutable {
+			if (!view || !view->GetObject())
+			{
+				promise->set_value(false);
+				return;
+			}
+			if (BNIsShutdownRequested() || cancelled->load())
+			{
+				promise->set_value(false);
+				return;
+			}
+			if (IsFirmwareViewClosing(view.GetPtr()))
+			{
+				promise->set_value(false);
+				return;
+			}
+			bool r = ApplyPlanBatchesDirect(view, fwSettingsCopy, planCopy, loggerCopy);
+			promise->set_value(r);
+		});
 
-	// Wait for the main-thread work to complete, but poll periodically so we can bail out cleanly
-	// if shutdown or view-closing happens.
-	using namespace std::chrono_literals;
-	while (fut.wait_for(100ms) != std::future_status::ready)
-	{
-		if (BNIsShutdownRequested() || IsFirmwareViewClosing(view.GetPtr()))
+		// Wait for the main-thread work to complete, but poll periodically so we can bail out cleanly
+		// if shutdown or view-closing happens.
+		using namespace std::chrono_literals;
+		while (fut.wait_for(100ms) != std::future_status::ready)
 		{
-			if (logger)
-				logger->LogInfo("ApplyPlanBatchesOnMainThread: aborted due to shutdown or view closing");
-			return false;
+			if (BNIsShutdownRequested() || IsFirmwareViewClosing(view.GetPtr()))
+			{
+				if (logger)
+					logger->LogInfo("ApplyPlanBatchesOnMainThread: aborted due to shutdown or view closing");
+				cancelled->store(true);
+				return false;
+			}
 		}
-	}
-	result = fut.get();
+		result = fut.get();
 		return result;
 	}
 
@@ -762,8 +765,15 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		}
 		if (fwSettings.enableInvalidFunctionCleanup)
 		{
-			std::set<uint64_t> protectedStarts = seededFunctions;
-			protectedStarts.insert(seededUserFunctions.begin(), seededUserFunctions.end());
+			std::set<uint64_t> protectedStarts;
+			auto addProtected = [&](uint64_t addr) {
+				protectedStarts.insert(addr);
+				protectedStarts.insert(addr & ~1ULL); // cover Thumb-bit addresses
+			};
+			for (uint64_t addr : seededFunctions)
+				addProtected(addr);
+			for (uint64_t addr : seededUserFunctions)
+				addProtected(addr);
 			timePass("Cleanup invalid functions", [&]() {
 				CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
