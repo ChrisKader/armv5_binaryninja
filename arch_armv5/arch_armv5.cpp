@@ -10,6 +10,7 @@
 #include "platforms/platform_recognizers.h"
 #include "relocations/relocations.h"
 #include "firmware/firmware_view.h"
+#include "workflow/firmware_workflow.h"
 #include "settings/plugin_settings.h"
 
 using namespace BinaryNinja;
@@ -58,8 +59,7 @@ extern "C"
     Armv5Settings::InitPluginSettings();
     RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
     InitArmv5FirmwareViewType();
-    // Temporarily disable firmware workflow registration to isolate close-time crashes.
-    // Re-enable by restoring RegisterArmv5FirmwareWorkflow() when ready.
+    RegisterArmv5FirmwareWorkflow();
     return true;
   }
 }

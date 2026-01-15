@@ -11,6 +11,8 @@
 
 namespace BinaryNinja
 {
-	void ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view);
+	// Takes Ref<> that must be passed through from workflow callback - do NOT
+	// create a new Ref<> from a raw pointer as that causes shutdown crashes.
+	void ScheduleArmv5FirmwareScanJob(Ref<BinaryView> view);
 	void CancelArmv5FirmwareScanJob(uint64_t instanceId, bool allowRelease = true);
 }

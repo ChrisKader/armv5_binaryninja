@@ -42,7 +42,8 @@ namespace BinaryNinja
 		Armv5FirmwareView(BinaryView* data, bool parseOnly = false);
 		virtual ~Armv5FirmwareView();
 		virtual bool Init() override;
-		void RunFirmwareWorkflowScans();
+		// Takes Ref<> passed through from workflow callback - do NOT create new Ref<> from this
+		void RunFirmwareWorkflowScans(Ref<BinaryView> viewRef);
 	bool TryBeginWorkflowScans();
 	const std::set<uint64_t>& GetSeededFunctions() const;
 	const std::set<uint64_t>& GetSeededUserFunctions() const;
@@ -67,6 +68,7 @@ namespace BinaryNinja
 
 	void InitArmv5FirmwareViewType();
 	void RunArmv5FirmwareWorkflowScans(const Ref<BinaryView>& view);
+	uint64_t GetInstanceIdFromView(const BinaryView* view);
 	bool IsFirmwareViewClosing(const BinaryView* view);
 	bool IsFirmwareViewClosingById(uint64_t instanceId);
 	bool IsFirmwareViewScanCancelled(const BinaryView* view);
