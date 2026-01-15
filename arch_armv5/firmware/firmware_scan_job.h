@@ -12,5 +12,5 @@
 namespace BinaryNinja
 {
 	void ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view);
-	void CancelArmv5FirmwareScanJob(uint64_t instanceId);
+	void CancelArmv5FirmwareScanJob(uint64_t instanceId, bool allowRelease = true);
 }

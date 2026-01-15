@@ -161,7 +161,43 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 
 static void RegisterFirmwareViewDestructionCallbacks()
 {
-	BNObjectDestructionCallbacks callbacks = {};
+	static BNObjectDestructionCallbacks callbacks = {};
+	static bool registered = false;
+	if (registered)
+		return;
+
+	callbacks.destructBinaryView = [](void* ctx, BNBinaryView* obj) -> void {
+		(void)ctx;
+		if (!obj)
+			return;
+
+		InstanceId instanceId = 0;
+		{
+			std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+			uintptr_t viewPtr = reinterpret_cast<uintptr_t>(obj);
+			auto itPtr = FirmwareViewPointerToInstanceMap().find(viewPtr);
+			if (itPtr != FirmwareViewPointerToInstanceMap().end())
+				instanceId = itPtr->second;
+			if (instanceId != 0)
+			{
+				FirmwareViewClosingSet().insert(instanceId);
+				auto itView = FirmwareViewMap().find(instanceId);
+				if (itView != FirmwareViewMap().end())
+					FirmwareViewMap().erase(itView);
+				auto itPtrErase = FirmwareViewPointerToInstanceMap().find(viewPtr);
+				if (itPtrErase != FirmwareViewPointerToInstanceMap().end())
+					FirmwareViewPointerToInstanceMap().erase(itPtrErase);
+				auto itAlive = FirmwareViewAliveMap().find(instanceId);
+				if (itAlive != FirmwareViewAliveMap().end())
+					itAlive->second->store(false);
+			}
+		}
+
+		if (instanceId != 0)
+	{
+			SetFirmwareViewScanCancelled(instanceId, true);
+	}
+	};
 	callbacks.destructFileMetadata = [](void* ctx, BNFileMetadata* obj) -> void {
 		(void)ctx;
 		if (!obj)
@@ -205,6 +241,7 @@ static void RegisterFirmwareViewDestructionCallbacks()
 	};
 
 	BNRegisterObjectDestructionCallbacks(&callbacks);
+	registered = true;
 }
 
 void BinaryNinja::InitArmv5FirmwareViewType()
@@ -754,6 +791,13 @@ void BinaryNinja::RunArmv5FirmwareWorkflowScans(const Ref<BinaryView> &view)
 	if (!firmwareView)
 	{
 		InstanceId instanceId = GetInstanceIdFromView(view.GetPtr());
+		if (instanceId == 0 || IsFirmwareViewClosingById(instanceId) || !IsFirmwareViewAliveById(instanceId))
+		{
+			if (logger)
+				logger->LogInfo("Firmware workflow scan: view is closing or not alive (instanceId=%llx)",
+					(unsigned long long)instanceId);
+			return;
+		}
 		firmwareView = GetFirmwareViewForInstanceId(instanceId);
 		if (!firmwareView)
 		{
@@ -838,6 +882,9 @@ Armv5FirmwareView* BinaryNinja::GetFirmwareViewForInstanceId(uint64_t instanceId
 		return nullptr;
 
 	std::lock_guard<std::mutex> lock(FirmwareViewMutex());
+	auto itAlive = FirmwareViewAliveMap().find(instanceId);
+	if (itAlive == FirmwareViewAliveMap().end() || !itAlive->second->load())
+		return nullptr;
 	auto it = FirmwareViewMap().find(instanceId);
 	if (it == FirmwareViewMap().end())
 		return nullptr;

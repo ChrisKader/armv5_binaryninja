@@ -27,6 +27,7 @@ namespace
 		uint64_t instanceId = 0;
 		atomic<bool> cancelled{false};
 		atomic<bool> running{false};
+		Ref<BinaryView> view;
 		Ref<BackgroundTask> task;
 	};
 
@@ -51,6 +52,25 @@ shared_ptr<FirmwareScanJobState> GetJob(uint64_t instanceId)
 	return it->second;
 }
 
+void ClearJobView(const shared_ptr<FirmwareScanJobState>& job)
+{
+	if (!job)
+		return;
+	lock_guard<mutex> lock(FirmwareScanJobMutex());
+	job->view = nullptr;
+}
+
+bool ShouldReleaseJobView(const shared_ptr<FirmwareScanJobState>& job)
+{
+	if (!job)
+		return false;
+	if (BNIsShutdownRequested())
+		return false;
+	if (IsFirmwareViewClosingById(job->instanceId))
+		return false;
+	return true;
+}
+
 void RemoveJob(uint64_t instanceId)
 {
 	lock_guard<mutex> lock(FirmwareScanJobMutex());
@@ -61,6 +81,8 @@ void RemoveJob(uint64_t instanceId)
 	bool ShouldCancel(const shared_ptr<FirmwareScanJobState>& job, const Ref<BinaryView>& view)
 	{
 		if (!job)
+			return true;
+		if (IsFirmwareViewClosingById(job->instanceId))
 			return true;
 		if (BNIsShutdownRequested())
 		{
@@ -442,6 +464,11 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 	{
 		if (!job)
 			return;
+		Ref<BinaryView> view;
+		{
+			lock_guard<mutex> lock(FirmwareScanJobMutex());
+			view = job->view;
+		}
 		struct RunningGuard
 		{
 			const shared_ptr<FirmwareScanJobState>& jobRef;
@@ -455,6 +482,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (!job || !job->task)
 			return;
 		if (job->task->IsFinished())
+			return;
+		if (BNIsShutdownRequested() || IsFirmwareViewClosingById(job->instanceId))
 			return;
 		// Schedule finish on main thread without waiting to avoid shutdown deadlocks.
 		ExecuteOnMainThread([job, logger]() {
@@ -470,31 +499,20 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 
 	try
 	{
-		if (BNIsShutdownRequested() || IsFirmwareViewClosingById(job->instanceId))
+		if (job->cancelled.load() || BNIsShutdownRequested() || IsFirmwareViewClosingById(job->instanceId))
 		{
+			if (ShouldReleaseJobView(job))
+				ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
-		auto resolveView = [&]() -> Ref<BinaryView> {
-			if (IsFirmwareViewClosingById(job->instanceId))
-				return nullptr;
-			if (!IsFirmwareViewAliveById(job->instanceId))
-				return nullptr;
-			Armv5FirmwareView* firmwareView = GetFirmwareViewForInstanceId(job->instanceId);
-			if (!firmwareView)
-				return nullptr;
-			Ref<BinaryView> view = firmwareView;
-			if (!view || !view->GetObject())
-				return nullptr;
-			return view;
-		};
-
-		Ref<BinaryView> view = resolveView();
 		if (!view)
 		{
 			if (logger)
 				logger->LogInfo("Firmware workflow scan: view lookup failed");
 			finishTask();
+			if (ShouldReleaseJobView(job))
+				ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
@@ -516,12 +534,16 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (ScanCancelled(view))
 		{
 			finishTask();
+			if (ShouldReleaseJobView(job))
+				ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
 		if (!WaitForAnalysisIdle(job, view, logger))
 		{
 			finishTask();
+			if (ShouldReleaseJobView(job))
+				ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
@@ -547,6 +569,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (!fileData || fileDataLen == 0)
 		{
 			finishTask();
+			if (ShouldReleaseJobView(job))
+				ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
@@ -555,6 +579,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (!parentView)
 		{
 			finishTask();
+			ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
@@ -611,8 +636,9 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 			logger, fwSettings.enableVerboseLogging, view, &plan
 		};
 		auto refreshViewForPhase = [&]() -> bool {
-			view = resolveView();
-			if (!view)
+			if (!view || !view->GetObject())
+				return false;
+			if (IsFirmwareViewClosingById(job->instanceId) || !IsFirmwareViewAliveById(job->instanceId))
 				return false;
 			scanCtx.view = view.GetPtr();
 			scanCtx.arch = view->GetDefaultArchitecture();
@@ -627,6 +653,7 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (!refreshViewForPhase())
 		{
 			finishTask();
+			ClearJobView(job);
 			RemoveJob(job->instanceId);
 			return;
 		}
@@ -803,6 +830,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");
 
 		finishTask();
+		if (ShouldReleaseJobView(job))
+			ClearJobView(job);
 		SetFirmwareViewScanCancelled(job->instanceId, false);
 		RemoveJob(job->instanceId);
 	}
@@ -811,6 +840,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (logger)
 			logger->LogError("Firmware workflow scan: exception caught: %s", e.what());
 		finishTask();
+		if (ShouldReleaseJobView(job))
+			ClearJobView(job);
 		SetFirmwareViewScanCancelled(job->instanceId, false);
 		RemoveJob(job->instanceId);
 	}
@@ -819,6 +850,8 @@ bool WaitForAnalysisIdle(const shared_ptr<FirmwareScanJobState>& job, const Ref<
 		if (logger)
 			logger->LogError("Firmware workflow scan: unknown exception caught");
 		finishTask();
+		if (ShouldReleaseJobView(job))
+			ClearJobView(job);
 		SetFirmwareViewScanCancelled(job->instanceId, false);
 		RemoveJob(job->instanceId);
 	}
@@ -857,6 +890,7 @@ void BinaryNinja::ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view)
 	auto job = make_shared<FirmwareScanJobState>();
 		job->instanceId = instanceId; // ensure instanceId is set
 		job->viewId = instanceId; // maintain backward-compatible viewId for now
+	job->view = view;
 	job->running.store(true);
 	// Defer creating the BackgroundTask until we are sure the view still exists and we are not shutting down.
 	{
@@ -867,13 +901,15 @@ void BinaryNinja::ScheduleArmv5FirmwareScanJob(const Ref<BinaryView>& view)
 	std::thread([job]() { RunFirmwareScanJob(job); }).detach();
 }
 
-void BinaryNinja::CancelArmv5FirmwareScanJob(uint64_t viewId)
+void BinaryNinja::CancelArmv5FirmwareScanJob(uint64_t viewId, bool allowRelease)
 {
 	shared_ptr<FirmwareScanJobState> job = GetJob(viewId);
 	if (!job)
 		return;
 	SetFirmwareViewScanCancelled(viewId, true);
 	job->cancelled.store(true);
-	if (CanUpdateTaskProgress(job) && job->task->CanCancel())
+	if (job->task && job->task->CanCancel() && !job->task->IsCancelled())
 		job->task->Cancel();
+	if (allowRelease && ShouldReleaseJobView(job))
+		ClearJobView(job);
 }
