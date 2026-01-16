@@ -1,10 +1,98 @@
 /*
  * ARMv5 Firmware Scan Job
+ *
+ * ============================================================================
+ * OVERVIEW
+ * ============================================================================
+ *
+ * This file implements the background task system for firmware scans.
+ * Firmware analysis involves multiple compute-intensive passes that shouldn't
+ * block the UI. We run them in a detached background thread with proper
+ * cancellation support.
+ *
+ * ============================================================================
+ * THREADING MODEL
+ * ============================================================================
+ *
+ * Pattern: Detached thread with BackgroundTask for UI feedback
+ *
+ *   Main Thread                      Background Thread
+ *   -----------                      -----------------
+ *   ScheduleArmv5FirmwareScanJob()
+ *       |
+ *       +-- Create BackgroundTask
+ *       +-- std::thread(...).detach()
+ *                                    RunFirmwareScanJob()
+ *                                        |
+ *                                        +-- WaitForAnalysisIdle()
+ *                                        +-- Run scan passes
+ *                                        +-- ApplyPlanBatchesDirect()
+ *                                        +-- task->Finish()
+ *
+ * This is the same pattern used by Binary Ninja's EFI resolver and other
+ * analysis plugins. The detached thread is self-managing - it finishes
+ * the BackgroundTask and releases references before exiting.
+ *
+ * ============================================================================
+ * CANCELLATION
+ * ============================================================================
+ *
+ * Scans can be cancelled via multiple mechanisms:
+ * 1. User clicks Cancel on the BackgroundTask progress bar
+ * 2. User closes the view (triggers IsFirmwareViewClosingById)
+ * 3. Binary Ninja shutdown (BNIsShutdownRequested)
+ * 4. Explicit cancel via CancelArmv5FirmwareScanJob
+ *
+ * ShouldCancel() checks all of these conditions. Scan passes call it
+ * periodically to bail out cleanly.
+ *
+ * ============================================================================
+ * LIFETIME SAFETY
+ * ============================================================================
+ *
+ * CRITICAL: The background thread must handle lifetime correctly:
+ *
+ * 1. Ref<BinaryView> is passed by VALUE to the thread
+ *    - This ensures the view stays alive while the thread runs
+ *    - Do NOT create new Ref<> from raw pointers in the thread
+ *
+ * 2. BackgroundTask MUST be finished before thread exits
+ *    - Call task->Finish() in all exit paths
+ *    - Wrap in try/catch because Finish() may fail during shutdown
+ *
+ * 3. Check instanceId validity before accessing view
+ *    - IsFirmwareViewAliveById() confirms the view is still valid
+ *    - Don't assume dynamic_cast will work (wrappers may be used)
+ *
+ * 4. Release references before thread exits
+ *    - Set view = nullptr, task = nullptr explicitly
+ *    - This prevents reference cycles and ensures clean shutdown
+ *
+ * ============================================================================
+ * PLAN SYSTEM
+ * ============================================================================
+ *
+ * Scans don't modify the view directly. They populate a FirmwareScanPlan
+ * with proposed changes (functions to add/remove, data to define, etc.).
+ * ApplyPlanBatchesDirect() then commits the plan atomically.
+ *
+ * Benefits:
+ * - Cancellation discards partial work cleanly
+ * - Undo support (entire plan is one undo action)
+ * - Debugging (can log the plan before applying)
+ *
+ * ============================================================================
+ * REFERENCE: Similar patterns in:
+ * - Binary Ninja EFI resolver
+ * - Binary Ninja SharedCache view
+ * ============================================================================
  */
 
 #include "firmware_scan_job.h"
 #include "firmware_settings.h"
 #include "firmware_view.h"
+#include "common/armv5_utils.h"
+#include "analysis/rtos_detector.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +102,7 @@
 using namespace BinaryNinja;
 using namespace std;
 
-// Forward declarations for functions in firmware_view.cpp
+/* Forward declaration for mutex defined in firmware_view.cpp */
 extern std::mutex FirmwareViewMutex;
 
 namespace
@@ -861,6 +949,29 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		auto afterFunctions = SnapshotFunctionStarts(view);
 		LogFunctionDiff(logger, beforeFunctions, afterFunctions, fwSettings.enableVerboseLogging);
 		StoreFirmwareFunctionSnapshot(instanceId, afterFunctions);
+
+		// Run RTOS detection after scans complete
+		if (!ScanCancelled(view))
+		{
+			UpdateTaskText(task, instanceId, "ARMv5 firmware scans: detecting RTOS");
+			auto rtosResult = armv5::RTOSDetector::DetectRTOS(view.GetPtr());
+			if (rtosResult.type != armv5::RTOSType::Unknown)
+			{
+				if (logger)
+					logger->LogInfo("RTOS detected: %s (%zu tasks)", 
+						armv5::RTOSTypeToString(rtosResult.type), rtosResult.tasks.size());
+				
+				// Define RTOS types
+				armv5::RTOSDetector::DefineRTOSTypes(view.GetPtr(), rtosResult.type);
+				
+				// Apply task conventions
+				if (!rtosResult.tasks.empty())
+				{
+					armv5::RTOSDetector::ApplyTaskConventions(view.GetPtr(), rtosResult.tasks);
+					armv5::RTOSDetector::AnnotateTCBs(view.GetPtr(), rtosResult.tasks, rtosResult.type);
+				}
+			}
+		}
 
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");

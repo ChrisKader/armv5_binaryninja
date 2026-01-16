@@ -2705,7 +2705,8 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 								if (litAddrb + 4 <= length)
 								{
 									uint32_t valueb = 0;
-									ReadU32At(reader, data, dataLen, endian, litAddrb, valueb, length);
+									if (!ReadU32At(reader, data, dataLen, endian, litAddrb, valueb, length))
+										continue;
 
 									if (value < valueb && (valueb - value) <= 0x10000)
 									{
@@ -2782,7 +2783,8 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 				for (uint64_t off = 0; off + 4 <= length && callerFileOffs.size() < 32; off += 4)
 				{
 					uint32_t ins = 0;
-					ReadU32At(reader, data, dataLen, endian, off, ins, length);
+					if (!ReadU32At(reader, data, dataLen, endian, off, ins, length))
+						continue;
 
 					// BL instruction: cond 1011 imm24
 					if ((ins & 0x0F000000) == 0x0B000000)

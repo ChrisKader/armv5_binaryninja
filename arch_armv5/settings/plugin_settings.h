@@ -68,6 +68,12 @@ std::shared_ptr<SettingsComponent> GetComponent(const std::string& name);
 // Initialize the plugin settings system (called from CorePluginInit)
 void InitPluginSettings();
 
+// Register analysis-specific settings (calling conventions, signatures, RTOS)
+void RegisterAnalysisSettings();
+
+// Register global firmware settings in the Settings panel
+void RegisterGlobalFirmwareSettings();
+
 /*
  * PluginConfig - singleton for cached environment variable state.
  *

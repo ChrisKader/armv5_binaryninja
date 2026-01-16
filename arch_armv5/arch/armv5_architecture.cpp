@@ -1,5 +1,33 @@
 /*
  * ARMv5 Architecture Implementation (ARM mode)
+ *
+ * This file implements the Armv5Architecture class, which provides disassembly,
+ * instruction text rendering, and IL lifting for 32-bit ARM mode instructions.
+ *
+ * ARCHITECTURE HIERARCHY:
+ * -----------------------
+ *   ArmCommonArchitecture (base class in arch_armv5.h)
+ *       |
+ *       +-- Armv5Architecture (this file) - 32-bit ARM mode ("armv5")
+ *       |
+ *       +-- ThumbArchitecture (thumb_disasm/arch_thumb.cpp) - 16-bit Thumb mode ("armv5t")
+ *
+ * Both architectures reference each other via m_armArch/m_thumbArch for ARM/Thumb
+ * interworking. When a BX/BLX instruction switches modes (indicated by bit 0 of
+ * the target address), Binary Ninja uses GetAssociatedArchitectureByAddress() to
+ * find the appropriate architecture for the target.
+ *
+ * KEY DESIGN PATTERNS (matching ARMv7):
+ * -------------------------------------
+ * 1. Instruction coalescing: Multiple conditional instructions with related
+ *    conditions (e.g., MOVEQ + MOVNE) are coalesced into a single IL if/else
+ *    block for cleaner decompilation.
+ *
+ * 2. PC handling: PC reads return addr+8 (ARM pipeline), PC writes become jumps.
+ *
+ * 3. Flag handling: The S suffix on instructions sets flags via flagWriteType.
+ *
+ * REFERENCE: binaryninja-api/arch/armv7/arch_armv7.cpp
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -17,6 +45,7 @@
 #include "lowlevelilinstruction.h"
 #include "arch_armv5.h"
 #include "arch/armv5_architecture.h"
+#include "common/armv5_utils.h"
 #include "il/il.h"
 
 using namespace BinaryNinja;
@@ -27,76 +56,55 @@ using namespace std;
 #define snprintf _snprintf
 #endif
 
+/*
+ * Error codes for disassembly text generation.
+ * These are returned by GetInstructionText when operand rendering fails.
+ */
 #define DISASM_SUCCESS 0
 #define FAILED_TO_DISASSEMBLE_OPERAND 1
 #define FAILED_TO_DISASSEMBLE_REGISTER 2
 
+/*
+ * Maximum number of instructions to consider for conditional coalescing.
+ * Coalescing combines sequences like:
+ *   MOVEQ r0, #1
+ *   MOVNE r0, #0
+ * into a single IL if/else block. This limit prevents runaway analysis
+ * on pathological cases.
+ */
 #define COALESCE_MAX_INSTRS 100
 
+/*
+ * Helper macro for IsRelatedCondition switch statement.
+ * Handles both directions of a condition pair (e.g., EQ/NE, CS/CC).
+ */
 #define HANDLE_CASE(orig, opposite) \
   case orig:                        \
   case opposite:                    \
     return (candidate == orig) || (candidate == opposite)
 
-static bool GetNextFunctionAfterAddress(Ref<BinaryView> data, Ref<Platform> platform, uint64_t address, Ref<Function>& nextFunc)
-{
-  uint64_t nextFuncAddr = data->GetNextFunctionStartAfterAddress(address);
-  nextFunc = data->GetAnalysisFunction(platform, nextFuncAddr);
-  return nextFunc != nullptr;
-}
-
-static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform, uint64_t addr)
-{
-  if (!view || !view->GetObject())
-    return false;
-  Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
-  if (!arch)
-    return false;
-  const bool enforceExecutable = !view->GetSegments().empty();
-  const bool enforceCodeSemantics = !view->GetSections().empty();
-  uint64_t checkAddr = addr;
-  size_t align = arch->GetInstructionAlignment();
-  if (align > 1)
-    checkAddr &= ~(static_cast<uint64_t>(align) - 1);
-  if (!view->IsValidOffset(checkAddr))
-    return false;
-  if (!view->IsOffsetBackedByFile(checkAddr))
-    return false;
-  if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
-    return false;
-  DataVariable dataVar;
-  if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
-    return false;
-  if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
-    return false;
-  DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
-  if (buf.GetLength() == 0)
-    return false;
-  if (buf.GetLength() >= 4)
-  {
-    const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-    const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
-    const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
-    if (allZero || allFF)
-      return false;
-  }
-  InstructionInfo info;
-  if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
-    return false;
-  return info.length != 0;
-}
-
+/*
+ * Check if two condition codes are related (opposite pairs).
+ *
+ * ARM conditional instructions often come in pairs with opposite conditions.
+ * For example, MOVEQ followed by MOVNE. This function identifies such pairs
+ * for instruction coalescing, which produces cleaner IL.
+ *
+ * @param orig      The original condition code.
+ * @param candidate The candidate condition to check.
+ * @return true if the conditions are opposites of the same test.
+ */
 static bool IsRelatedCondition(Condition orig, Condition candidate)
 {
   switch (orig)
   {
-    HANDLE_CASE(COND_EQ, COND_NE);
-    HANDLE_CASE(COND_CS, COND_CC);
-    HANDLE_CASE(COND_MI, COND_PL);
-    HANDLE_CASE(COND_VS, COND_VC);
-    HANDLE_CASE(COND_HI, COND_LS);
-    HANDLE_CASE(COND_GE, COND_LT);
-    HANDLE_CASE(COND_GT, COND_LE);
+    HANDLE_CASE(COND_EQ, COND_NE);  /* Equal / Not Equal */
+    HANDLE_CASE(COND_CS, COND_CC);  /* Carry Set / Carry Clear */
+    HANDLE_CASE(COND_MI, COND_PL);  /* Minus / Plus */
+    HANDLE_CASE(COND_VS, COND_VC);  /* Overflow Set / Overflow Clear */
+    HANDLE_CASE(COND_HI, COND_LS);  /* Unsigned Higher / Lower or Same */
+    HANDLE_CASE(COND_GE, COND_LT);  /* Signed Greater or Equal / Less Than */
+    HANDLE_CASE(COND_GT, COND_LE);  /* Signed Greater Than / Less or Equal */
   default:
     return false;
   }
@@ -144,18 +152,10 @@ static bool CanCoalesceAfterInstruction(Instruction &instr)
   }
 }
 
-/* Intrinsic names table removed - using switch statement in GetIntrinsicName like ARMv7 */
-
-
-static int GetOperandCount(const Instruction &instr)
-{
-  for (int i = 0; i < MAX_OPERANDS; i++)
-  {
-    if (instr.operands[i].cls == NONE)
-      return i;
-  }
-  return MAX_OPERANDS;
-}
+/*
+ * NOTE: GetOperandCount is now in common/armv5_utils.h
+ * Use armv5::GetOperandCount(instr) instead.
+ */
 
 /*
  * Armv5Architecture class definition with inline implementations (matches ARMv7 pattern)

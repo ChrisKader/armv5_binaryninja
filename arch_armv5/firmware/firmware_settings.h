@@ -14,8 +14,9 @@
 
 enum class FirmwareSettingsMode
 {
-	Init,
-	Workflow
+	Init,     // Initial load/analysis
+	Workflow, // Workflow callback
+	Command   // Plugin command (on-demand scan)
 };
 
 // Firmware component name for settings registration

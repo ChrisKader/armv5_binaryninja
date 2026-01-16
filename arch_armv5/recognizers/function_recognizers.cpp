@@ -1,11 +1,40 @@
 /*
  * ARMv5 Function Recognizers
+ *
+ * ============================================================================
+ * OVERVIEW
+ * ============================================================================
+ *
+ * Function recognizers analyze newly-discovered functions and apply
+ * metadata such as calling conventions, signatures, and type information.
+ *
+ * RECOGNIZERS:
+ * ------------
+ *
+ * 1. ArmFunctionRecognizer
+ *    - Detects thunks (B target, LDR PC patterns)
+ *    - Identifies constant-return functions
+ *    - Marks import wrappers
+ *
+ * 2. ThumbImportedFunctionRecognizer
+ *    - Detects Thumb->ARM veneers
+ *    - Handles inline switching stubs
+ *
+ * 3. ArmAnalysisRecognizer
+ *    - Applies calling convention detection
+ *    - Performs signature recovery
+ *    - Only runs when analysis features are enabled
+ *
+ * ============================================================================
  */
 
 #include "binaryninjaapi.h"
 #include "lowlevelilinstruction.h"
 #include "arch_armv5.h"
 #include "recognizers/function_recognizers.h"
+#include "analysis/calling_convention_detector.h"
+#include "analysis/signature_recovery.h"
+#include "settings/plugin_settings.h"
 
 using namespace BinaryNinja;
 using namespace armv5;
@@ -114,10 +143,117 @@ public:
   }
 };
 
+/*
+ * Analysis-based Function Recognizer
+ *
+ * Applies automatic calling convention detection and signature recovery
+ * to analyzed functions. This runs after the basic IL is available.
+ *
+ * Features:
+ * - Detects IRQ/exception handlers and applies irq-handler convention
+ * - Identifies task entry functions and applies task-entry convention
+ * - Recovers function signatures from register usage patterns
+ *
+ * Can be disabled via settings:
+ * - armv5.analysis.autoDetectCallingConvention
+ * - armv5.analysis.recoverSignatures
+ */
+class ArmAnalysisRecognizer : public FunctionRecognizer
+{
+public:
+  virtual bool RecognizeLowLevelIL(BinaryView *data, Function *func, LowLevelILFunction *il) override
+  {
+    if (!data || !func || !il)
+      return false;
+
+    bool modified = false;
+
+    /*
+     * Calling Convention Detection
+     *
+     * Analyze function patterns to determine the appropriate calling
+     * convention. This is particularly useful for:
+     * - IRQ/exception handlers (need irq-handler convention)
+     * - RTOS task entry functions (need task-entry convention)
+     * - Leaf functions (optimization hints)
+     */
+    if (IsCallingConventionDetectionEnabled(data))
+    {
+      auto result = CallingConventionDetector::DetectConvention(data, func, il);
+      if (result.confidence >= 128)
+      {
+        if (CallingConventionDetector::ApplyDetectedConvention(data, func, result))
+        {
+          modified = true;
+        }
+      }
+    }
+
+    /*
+     * Signature Recovery
+     *
+     * Analyze register usage to infer function parameters and return type.
+     * This helps with:
+     * - Determining parameter count from r0-r3 reads
+     * - Inferring pointer vs integer types from dereference patterns
+     * - Detecting void vs non-void returns from r0 writes
+     */
+    if (IsSignatureRecoveryEnabled(data))
+    {
+      auto sig = SignatureRecovery::RecoverSignature(data, func, il);
+      if (sig.overallConfidence >= 128)
+      {
+        if (SignatureRecovery::ApplyRecoveredSignature(data, func, sig))
+        {
+          modified = true;
+        }
+      }
+    }
+
+    return modified;
+  }
+
+private:
+  /*
+   * Check if calling convention detection is enabled in settings.
+   * Default: enabled
+   */
+  static bool IsCallingConventionDetectionEnabled(BinaryView* view)
+  {
+    // Check Binary Ninja settings
+    Ref<Settings> settings = Settings::Instance();
+    if (settings->Contains("analysis.armv5.autoDetectCallingConvention"))
+    {
+      return settings->Get<bool>("analysis.armv5.autoDetectCallingConvention", view);
+    }
+    return true;  // Default enabled
+  }
+
+  /*
+   * Check if signature recovery is enabled in settings.
+   * Default: enabled
+   */
+  static bool IsSignatureRecoveryEnabled(BinaryView* view)
+  {
+    Ref<Settings> settings = Settings::Instance();
+    if (settings->Contains("analysis.armv5.recoverSignatures"))
+    {
+      return settings->Get<bool>("analysis.armv5.recoverSignatures", view);
+    }
+    return true;  // Default enabled
+  }
+};
+
 void RegisterArmv5FunctionRecognizers(Architecture* armv5, Architecture* thumb)
 {
   if (armv5)
+  {
     armv5->RegisterFunctionRecognizer(new ArmFunctionRecognizer());
+    armv5->RegisterFunctionRecognizer(new ArmAnalysisRecognizer());
+  }
   if (thumb)
+  {
     thumb->RegisterFunctionRecognizer(new ThumbImportedFunctionRecognizer());
+    thumb->RegisterFunctionRecognizer(new ArmAnalysisRecognizer());
+  }
 }

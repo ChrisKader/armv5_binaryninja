@@ -1,3 +1,70 @@
+/*
+ * ARMv5 Thumb Architecture Implementation
+ *
+ * ============================================================================
+ * OVERVIEW
+ * ============================================================================
+ *
+ * This file implements ThumbArchitecture, which handles 16-bit Thumb mode
+ * instructions. Thumb is a compact instruction encoding for ARM processors
+ * that uses 16-bit instructions (vs 32-bit ARM instructions).
+ *
+ * THUMB VS ARM:
+ * -------------
+ * - Thumb instructions are 16 bits (2 bytes aligned)
+ * - ARM instructions are 32 bits (4 bytes aligned)
+ * - Thumb has smaller immediate ranges and fewer registers accessible
+ * - Code size is ~65% of equivalent ARM code
+ * - Slightly slower execution on some cores (more instructions needed)
+ *
+ * ARM/THUMB INTERWORKING:
+ * -----------------------
+ * Processors can switch between ARM and Thumb modes:
+ * - BX Rn: Branch to address in Rn, switch mode based on bit 0
+ *   - Bit 0 = 0: Switch to ARM mode
+ *   - Bit 0 = 1: Switch to Thumb mode (bit 0 cleared for execution)
+ * - BLX: Same switching, but also saves return address
+ *
+ * This architecture class is linked to Armv5Architecture via:
+ * - m_armArch / m_thumbArch pointers in ArmCommonArchitecture
+ * - GetAssociatedArchitectureByAddress() returns the appropriate architecture
+ *
+ * ============================================================================
+ * DISASSEMBLER DESIGN
+ * ============================================================================
+ *
+ * The Thumb disassembler uses a spec-based code generator:
+ *
+ * 1. spec.txt - Human-readable instruction specification
+ * 2. generator.py - Converts spec to C++ code
+ * 3. disassembler.cpp - Generated disassembler (do not edit by hand)
+ * 4. spec.cpp - Spec string literals and metadata
+ *
+ * To modify the disassembler:
+ * 1. Edit spec.txt with new/modified instructions
+ * 2. Run: python3 generator.py
+ * 3. Rebuild
+ *
+ * ============================================================================
+ * PC VALUE HANDLING
+ * ============================================================================
+ *
+ * CRITICAL: Thumb PC reads return addr+4 (not addr+8 like ARM):
+ *
+ *   Thumb: PC = current_address + 4
+ *   ARM:   PC = current_address + 8
+ *
+ * This difference is due to the pipeline stages:
+ * - ARM: 3-stage pipeline, PC points 2 instructions ahead (2*4=8)
+ * - Thumb: Effective 2-stage for PC-relative, 1 instruction ahead (2*2=4)
+ *
+ * The IL lifting must use the correct offset for proper address calculation.
+ *
+ * ============================================================================
+ * REFERENCE: binaryninja-api/arch/armv7/thumb2.cpp
+ * ============================================================================
+ */
+
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <inttypes.h>
@@ -6,7 +73,6 @@
 
 #include "binaryninjaapi.h"
 
-// registers, etc.
 #include "arch_armv5.h"
 #include "spec.h"
 #include "disassembler.h"

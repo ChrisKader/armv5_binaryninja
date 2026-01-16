@@ -1,10 +1,75 @@
 /*
  * ARMv5 Firmware Scans
+ *
+ * This file implements the firmware analysis scan passes that discover
+ * functions, data structures, and other metadata in bare metal ARM firmware.
+ *
+ * ============================================================================
+ * SCAN ARCHITECTURE
+ * ============================================================================
+ *
+ * Firmware analysis runs as a series of scan passes, each discovering
+ * different types of code/data:
+ *
+ * PHASE 1: Prologue Scanning (ScanForFunctionPrologues)
+ *   - Scans the binary for ARM function prologue patterns
+ *   - Examples: PUSH {r4-r7,lr}, STM sp!, {regs}, SUB sp, sp, #imm
+ *   - Most reliable heuristic for finding function starts
+ *
+ * PHASE 2: Call Target Discovery (ScanForCallTargets)
+ *   - Finds BL/BLX instruction targets that aren't already functions
+ *   - Works backward from known code to find new functions
+ *
+ * PHASE 3: Pointer Table Scanning (ScanForPointerTargets)
+ *   - Looks for tables of pointers that target code
+ *   - Common in vtables, interrupt vectors, callback arrays
+ *
+ * PHASE 4: Orphan Block Recovery (ScanForOrphanCodeBlocks)
+ *   - Finds valid code that wasn't reached by other passes
+ *   - Uses more aggressive heuristics, may have false positives
+ *
+ * PHASE 5: Cleanup (CleanupInvalidFunctions)
+ *   - Removes functions that analysis revealed to be invalid
+ *   - Examples: functions that are actually data, unreachable code
+ *
+ * ============================================================================
+ * SCAN PLAN SYSTEM
+ * ============================================================================
+ *
+ * Scans don't directly modify the BinaryView. Instead, they populate a
+ * FirmwareScanPlan with proposed changes:
+ *   - addFunctions: addresses to create functions at
+ *   - removeFunctions: addresses to remove functions from
+ *   - defineData: data variable definitions
+ *   - undefineData: data variables to remove
+ *   - defineSymbols: symbols to create
+ *
+ * The plan is then committed atomically by the scan job executor.
+ * This approach:
+ *   - Avoids partial modifications on cancellation
+ *   - Enables dry-run/preview modes
+ *   - Simplifies debugging (can log the plan)
+ *
+ * ============================================================================
+ * CANCELLATION
+ * ============================================================================
+ *
+ * Scans check ScanShouldAbort() periodically. This returns true if:
+ *   - Binary Ninja shutdown is requested
+ *   - The view is closing
+ *   - The scan was explicitly cancelled
+ *
+ * When cancelled, scans bail out cleanly and return partial results.
+ *
+ * ============================================================================
+ * REFERENCE: Firmware analysis inspired by patterns from IDA Pro and Ghidra
+ * ============================================================================
  */
 
 #include "firmware_internal.h"
 #include "firmware_view.h"
 #include "settings/action_policy.h"
+#include "common/armv5_utils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -94,51 +159,10 @@ static inline void PlanDefineSymbol(FirmwareScanPlan* plan, const Ref<Symbol>& s
 		plan->defineSymbols.push_back(symbol);
 }
 
-static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform,
-	uint64_t addr, Logger* logger, const char* label)
-{
-	if (!view || !view->GetObject())
-		return false;
-	Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
-	if (!arch)
-		return false;
-	const bool enforceExecutable = !view->GetSegments().empty();
-	const bool enforceCodeSemantics = !view->GetSections().empty();
-	uint64_t checkAddr = addr;
-	const size_t align = arch->GetInstructionAlignment();
-	if (align > 1)
-		checkAddr &= ~(static_cast<uint64_t>(align) - 1);
-	if (!view->IsValidOffset(checkAddr))
-		return false;
-	if (!view->IsOffsetBackedByFile(checkAddr))
-		return false;
-	if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
-		return false;
-	DataVariable dataVar;
-	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
-		return false;
-	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
-		return false;
-	DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
-	if (buf.GetLength() == 0)
-		return false;
-	if (buf.GetLength() >= 4)
-	{
-		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-		const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
-		const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
-		if (allZero || allFF)
-			return false;
-	}
-	InstructionInfo info;
-	if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
-	{
-		if (logger)
-			logger->LogDebug("%s: no instruction at 0x%llx", label, (unsigned long long)checkAddr);
-		return false;
-	}
-	return info.length != 0;
-}
+/*
+ * NOTE: IsValidFunctionStart is now in common/armv5_utils.h
+ * Use armv5::IsValidFunctionStart(view, platform, addr, logger, label) instead.
+ */
 
 static bool HasExplicitCodeSemantics(const Ref<BinaryView>& view)
 {

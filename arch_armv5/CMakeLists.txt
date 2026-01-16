@@ -1,3 +1,24 @@
+# ============================================================================
+# ARMv5 Architecture Plugin - Standalone/Internal CMakeLists.txt
+# ============================================================================
+#
+# This CMakeLists.txt supports two build scenarios:
+#
+# 1. STANDALONE BUILD (from within arch_armv5/ directory):
+#    cd arch_armv5 && mkdir build && cd build
+#    cmake .. && make
+#
+# 2. BN_INTERNAL_BUILD (building as part of Binary Ninja itself):
+#    Used when this plugin is included in Binary Ninja's source tree.
+#    Binary Ninja sets BN_INTERNAL_BUILD and provides the API.
+#
+# For development, prefer the ROOT CMakeLists.txt which also builds:
+# - test_armv5 - Standalone disassembler test tool
+# - libdisasm.dylib - Shared library for Python ctypes tests
+# - install_plugin target - Symlinks to plugin directory
+#
+# ============================================================================
+
 cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
 
 project(arch_armv5)
@@ -25,6 +46,7 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     *.h
     arch/*.cpp
     arch/*.h
+    common/*.h
     conventions/*.cpp
     conventions/*.h
     recognizers/*.cpp
@@ -57,6 +79,7 @@ endif()
 # Include directories
 target_include_directories(arch_armv5
     PRIVATE ${PROJECT_SOURCE_DIR}
+    PRIVATE ${PROJECT_SOURCE_DIR}/common
     PRIVATE ${PROJECT_SOURCE_DIR}/armv5_disasm
     PRIVATE ${PROJECT_SOURCE_DIR}/thumb_disasm)
 

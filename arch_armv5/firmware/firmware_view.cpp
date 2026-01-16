@@ -1,14 +1,99 @@
 /*
  * ARMv5 Firmware BinaryViewType
  *
- * Custom BinaryViewType for bare metal ARM firmware detection.
- * Detects ARM binaries by looking for vector table patterns at offset 0.
+ * Custom BinaryViewType for bare metal ARM firmware detection and analysis.
+ * This is one of the most complex and carefully designed components in the plugin.
+ *
+ * ============================================================================
+ * WHY A CUSTOM BINARYVIEWTYPE?
+ * ============================================================================
+ *
+ * Standard Binary Ninja loaders (ELF, PE, Mach-O) require structured file formats
+ * with headers that describe segments, sections, and entry points. Bare metal
+ * firmware (bootloaders, RTOS images, embedded systems code) lacks these headers.
+ *
+ * This custom BinaryViewType:
+ * 1. Detects ARM firmware by recognizing vector table patterns at offset 0
+ * 2. Automatically determines the image base address from vector table entries
+ * 3. Creates a single executable segment spanning the entire image
+ * 4. Seeds initial functions from exception vector handlers
+ * 5. Runs firmware-specific scan passes to discover additional functions
+ *
+ * ============================================================================
+ * LIFETIME MANAGEMENT - CRITICAL DESIGN DECISIONS
+ * ============================================================================
+ *
+ * BinaryView lifetime management in Binary Ninja is complex. Views can be closed
+ * by the user at any time, and background analysis tasks may still hold references.
+ * We learned through extensive trial and error that:
+ *
+ * 1. NEVER store raw BinaryView* pointers in global maps
+ *    - Views can be destroyed while your pointer is still "valid"
+ *    - Use InstanceId (uint64_t) as keys instead
+ *
+ * 2. NEVER hold Ref<BinaryView> across workflow callback boundaries
+ *    - This extends the view's lifetime beyond user expectations
+ *    - Can cause memory leaks and prevent proper cleanup
+ *    - Re-acquire the view from AnalysisContext in each callback
+ *
+ * 3. Use heap-allocated static maps (new std::unordered_map)
+ *    - Stack-allocated static variables can be destroyed during shutdown
+ *    - Heap-allocated maps survive until process exit
+ *    - Access them through getter functions that handle null checks
+ *
+ * 4. Use alive tokens for background task cancellation
+ *    - std::shared_ptr<std::atomic<bool>> shared between view and tasks
+ *    - Set to false when view is closing
+ *    - Tasks check periodically and bail out cleanly
+ *
+ * ============================================================================
+ * INSTANCE TRACKING SYSTEM
+ * ============================================================================
+ *
+ * We use a unique InstanceId (incrementing uint64_t) for each firmware view:
+ *
+ * - FirmwareViewMap: InstanceId -> Armv5FirmwareView*
+ *   Primary registry of all active firmware views.
+ *
+ * - FirmwareFileSessionMap: FileSession -> InstanceId
+ *   Maps Binary Ninja's file session ID to our instance ID.
+ *   Used to find our instance from workflow callbacks.
+ *
+ * - FirmwareViewPointerToInstanceMap: uintptr_t -> InstanceId
+ *   Maps raw pointer values to instance IDs.
+ *   Used when we only have the pointer but need the ID.
+ *
+ * - FirmwareViewClosingSet: Set of InstanceIds currently closing
+ *   Prevents new operations from starting on a closing view.
+ *
+ * - FirmwareViewScanCancelSet: Set of InstanceIds with cancelled scans
+ *   Signals background scan tasks to abort.
+ *
+ * - FirmwareViewAliveMap: InstanceId -> shared_ptr<atomic<bool>>
+ *   Alive tokens for safe background task cancellation.
+ *
+ * ============================================================================
+ * THREAD SAFETY
+ * ============================================================================
+ *
+ * All access to the global maps is protected by FirmwareViewMutex.
+ * This is a single global mutex (not per-view) because:
+ * 1. Simplifies reasoning about locking order
+ * 2. View creation/destruction is rare, so contention is minimal
+ * 3. Matches the pattern used by KernelCacheController in Binary Ninja
+ *
+ * LOCK ORDERING: Always acquire FirmwareViewMutex before any BinaryView locks.
+ *
+ * ============================================================================
+ * REFERENCE: binaryninja-api/view/kernelcache/core/KernelCacheController.cpp
+ * ============================================================================
  */
 
 #include "firmware_internal.h"
 #include "firmware_view.h"
 #include "firmware_scan_job.h"
 #include "firmware_settings.h"
+#include "common/armv5_utils.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -24,65 +109,201 @@ using namespace std;
 using namespace BinaryNinja;
 using namespace armv5;
 
+/*
+ * Maximum size for buffering the entire binary in memory.
+ * Larger binaries will use on-demand reads via BinaryReader.
+ * 64MB should cover most embedded firmware images.
+ */
 static constexpr uint64_t kMaxBufferedLength = 64ULL * 1024 * 1024;
 
+/*
+ * Global view type singleton.
+ * Registered once at plugin init, lives for the lifetime of Binary Ninja.
+ */
 static Armv5FirmwareViewType *g_armv5FirmwareViewType = nullptr;
 
+/*
+ * ============================================================================
+ * LIFETIME TRACKING IMPLEMENTATION
+ * ============================================================================
+ *
+ * The following code implements the instance tracking system described in the
+ * file header. This is one of the most carefully designed parts of the plugin.
+ *
+ * KEY INSIGHT: Binary Ninja views can be closed at any time by the user, but
+ * background analysis tasks may still be running. We cannot safely use raw
+ * pointers because the view may be destroyed while a task holds the pointer.
+ *
+ * SOLUTION: Assign each view a unique InstanceId (uint64_t). Background tasks
+ * store the InstanceId, not the pointer. Before using a view, tasks look up
+ * the InstanceId in FirmwareViewMap to get the current pointer (if still valid).
+ *
+ * WHY NOT JUST USE Ref<BinaryView>?
+ * ---------------------------------
+ * Holding a Ref<> extends the view's lifetime. This causes problems:
+ * 1. User closes the view, but it stays alive due to our reference
+ * 2. Analysis continues on a "closed" view, confusing the user
+ * 3. Memory isn't released until our reference goes away
+ * 4. Workflow callbacks may access stale state
+ *
+ * By using InstanceId, we can detect when a view is closing and abort
+ * gracefully without preventing cleanup.
+ */
+
+/**
+ * Check if we should skip lifetime tracking.
+ *
+ * During Binary Ninja shutdown, we might want to skip tracking to avoid
+ * races with destruction. Currently we always track because destruction
+ * callbacks handle cleanup properly.
+ */
 static bool ShouldSkipLifetimeTracking()
 {
-	// Don't check shutdown - rely on destruction callbacks to clean up properly
-	// Destruction callbacks are called when objects are destroyed, which happens during shutdown
+	/*
+	 * Don't check BNIsShutdownRequested() here. Destruction callbacks are
+	 * invoked during shutdown before the process exits, so we need tracking
+	 * to work until then.
+	 */
 	return false;
 }
 
-// Use global static mutex like KernelCacheController/SharedCacheController
-// Global statics are safe to use during shutdown (destroyed after main() exits)
+/*
+ * Global mutex protecting all instance tracking maps.
+ *
+ * WHY A SINGLE GLOBAL MUTEX?
+ * --------------------------
+ * 1. Simplifies reasoning about lock ordering (only one lock to acquire)
+ * 2. View creation/destruction is rare - contention is minimal
+ * 3. Matches the pattern used by KernelCacheController in Binary Ninja
+ *
+ * LOCK ORDERING RULE: Always acquire FirmwareViewMutex before any
+ * Binary Ninja internal locks (implicitly acquired by API calls).
+ */
 static std::mutex FirmwareViewMutex;
 
+/*
+ * InstanceId: A unique identifier for each firmware view instance.
+ *
+ * We use uint64_t instead of pointers because:
+ * 1. Pointers can be reused after view destruction (ABA problem)
+ * 2. Comparing uint64_t is safe; comparing freed pointers is UB
+ * 3. InstanceIds never wrap in practice (2^64 is huge)
+ */
 using InstanceId = uint64_t;
 
+/**
+ * Get the next unique instance ID.
+ *
+ * Thread-safe due to being called under FirmwareViewMutex.
+ * Starts at 1 so that 0 can indicate "no instance".
+ */
 static InstanceId &GetNextInstanceId()
 {
 	static InstanceId id = 1;
 	return id;
 }
 
+/*
+ * ============================================================================
+ * INSTANCE TRACKING MAPS
+ * ============================================================================
+ *
+ * These maps track the state of all firmware view instances. They are all
+ * heap-allocated via `new` to ensure they survive until process exit.
+ *
+ * WHY HEAP-ALLOCATED?
+ * -------------------
+ * Static local variables are destroyed in reverse order of construction
+ * when main() exits. If these maps were stack-allocated statics, they
+ * might be destroyed while destruction callbacks are still running,
+ * causing use-after-free. Heap allocation ensures the maps exist until
+ * the process truly exits.
+ */
+
+/**
+ * Set of instance IDs for views that are currently closing.
+ *
+ * When a view begins closing, its ID is added here. Background tasks
+ * check this set to abort early rather than continuing on a dying view.
+ */
 static std::unordered_set<InstanceId> &FirmwareViewClosingSet()
 {
 	static auto *set = new std::unordered_set<InstanceId>();
 	return *set;
 }
 
+/**
+ * Set of instance IDs with cancelled firmware scans.
+ *
+ * Scans can be cancelled explicitly (e.g., user action) or implicitly
+ * (view closing). Tasks check this set periodically and bail out cleanly.
+ */
 static std::unordered_set<InstanceId> &FirmwareViewScanCancelSet()
 {
 	static auto *set = new std::unordered_set<InstanceId>();
 	return *set;
 }
 
+/**
+ * Primary registry: InstanceId -> Armv5FirmwareView*
+ *
+ * This is the authoritative map of active firmware views. When a view
+ * is destroyed, its entry is removed. Background tasks use this to
+ * check if a view is still alive before accessing it.
+ */
 static std::unordered_map<InstanceId, Armv5FirmwareView*> &FirmwareViewMap()
 {
 	static auto *map = new std::unordered_map<InstanceId, Armv5FirmwareView*>();
 	return *map;
 }
 
+/**
+ * FileSession -> InstanceId mapping.
+ *
+ * Binary Ninja's FileMetadata has a session ID that persists across
+ * saves/reloads. We use this to find our instance from workflow callbacks
+ * that only have access to the FileMetadata.
+ */
 static std::unordered_map<uint64_t, InstanceId> &FirmwareFileSessionMap()
 {
 	static auto *map = new std::unordered_map<uint64_t, InstanceId>();
 	return *map;
 }
 
+/**
+ * Raw pointer -> InstanceId reverse lookup.
+ *
+ * Sometimes we receive a raw BinaryView* (e.g., from C API callbacks)
+ * and need to find our InstanceId. This map provides that lookup.
+ *
+ * CAUTION: The pointer is cast to uintptr_t for the key. This is safe
+ * because we only use it for lookup while the view is alive.
+ */
 static std::unordered_map<uintptr_t, InstanceId> &FirmwareViewPointerToInstanceMap()
 {
 	static auto *map = new std::unordered_map<uintptr_t, InstanceId>();
 	return *map;
 }
 
+/**
+ * Snapshot of function starts for each instance.
+ *
+ * Before running firmware scans, we snapshot the current functions.
+ * After scans complete, we compare to detect which functions were added.
+ * This helps with incremental analysis and avoiding duplicate work.
+ */
 static std::unordered_map<InstanceId, std::unordered_set<uint64_t>> &FirmwareFunctionSnapshotMap()
 {
 	static auto *map = new std::unordered_map<InstanceId, std::unordered_set<uint64_t>>();
 	return *map;
 }
 
+/**
+ * Create a snapshot of all function start addresses in a view.
+ *
+ * Used before/after firmware scans to track which functions were added.
+ * Returns an empty set if the view is invalid.
+ */
 static std::unordered_set<uint64_t> SnapshotFunctionsForView(const Ref<BinaryView>& view)
 {
 	std::unordered_set<uint64_t> starts;
@@ -99,75 +320,97 @@ static std::unordered_set<uint64_t> SnapshotFunctionsForView(const Ref<BinaryVie
 	return starts;
 }
 
-static bool IsValidFunctionStart(const Ref<BinaryView>& view, const Ref<Platform>& platform, uint64_t addr)
-{
-	if (!view || !view->GetObject())
-		return false;
-	Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
-	if (!arch)
-		return false;
-	const bool enforceExecutable = !view->GetSegments().empty();
-	const bool enforceCodeSemantics = !view->GetSections().empty();
-	uint64_t checkAddr = addr;
-	const size_t align = arch->GetInstructionAlignment();
-	if (align > 1)
-		checkAddr &= ~(static_cast<uint64_t>(align) - 1);
-	if (!view->IsValidOffset(checkAddr))
-		return false;
-	if (!view->IsOffsetBackedByFile(checkAddr))
-		return false;
-	if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
-		return false;
-	DataVariable dataVar;
-	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
-		return false;
-	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
-		return false;
-	DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
-	if (buf.GetLength() == 0)
-		return false;
-	if (buf.GetLength() >= 4)
-	{
-		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-		const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
-		const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
-		if (allZero || allFF)
-			return false;
-	}
-	InstructionInfo info;
-	if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
-		return false;
-	return info.length != 0;
-}
+/*
+ * NOTE: IsValidFunctionStart is now in common/armv5_utils.h
+ * Use armv5::IsValidFunctionStart(view, platform, addr) instead.
+ */
 
-// Track a small alive token per view instance that background tasks can use to
-// determine whether the view is still alive without touching view pointers.
+/*
+ * ============================================================================
+ * ALIVE TOKENS FOR BACKGROUND TASKS
+ * ============================================================================
+ *
+ * Background tasks need to know when a view is being destroyed so they can
+ * abort cleanly. But they can't safely access the view pointer to check!
+ *
+ * SOLUTION: Each view gets an "alive token" - a shared_ptr<atomic<bool>>.
+ * - When the view is created, the token is set to true
+ * - When the view starts closing, the token is set to false
+ * - Background tasks hold a copy of the shared_ptr and check the bool
+ *
+ * This is safe because:
+ * 1. shared_ptr ensures the atomic<bool> stays allocated
+ * 2. atomic<bool> ensures thread-safe read/write
+ * 3. The task never touches the view pointer after seeing false
+ */
+
+/**
+ * Alive tokens for each instance.
+ *
+ * Maps InstanceId to a shared alive flag. The shared_ptr ensures the flag
+ * outlives both the view and any background tasks referencing it.
+ */
 static std::unordered_map<InstanceId, std::shared_ptr<std::atomic<bool>>> &FirmwareViewAliveMap()
 {
 	static auto *map = new std::unordered_map<InstanceId, std::shared_ptr<std::atomic<bool>>>();
 	return *map;
 }
 
-// Don't track BackgroundTask - let the detached thread manage it (like EFI resolver).
-// The thread checks for cancellation via ShouldCancel() which checks BNIsShutdownRequested()
-// and IsFirmwareViewClosingById(). During shutdown, we just let the task be dropped.
+/*
+ * NOTE ON BACKGROUND TASKS:
+ * -------------------------
+ * We don't track BackgroundTask objects explicitly. Instead, we use the
+ * detached-thread pattern (like the EFI resolver in Binary Ninja).
+ * Tasks check for cancellation via ShouldCancel(), which internally
+ * checks BNIsShutdownRequested() and IsFirmwareViewClosingById().
+ * During shutdown, tasks are simply abandoned (their threads exit naturally).
+ */
 
+/*
+ * ============================================================================
+ * PUBLIC INTERFACE FUNCTIONS
+ * ============================================================================
+ *
+ * These functions provide the external API for querying view state.
+ * They are used by workflow callbacks, scan passes, and other components.
+ */
+
+/**
+ * Get the InstanceId for a BinaryView.
+ *
+ * This is the primary way to safely identify a view from external code.
+ * Returns 0 if the view is not a firmware view or has been destroyed.
+ *
+ * USAGE:
+ *   InstanceId id = GetInstanceIdFromView(view);
+ *   if (id == 0) { return; }  // Not our view or invalid
+ *   // Now use id for lookups instead of storing the view pointer
+ *
+ * @param view The view to look up (can be null).
+ * @return The InstanceId, or 0 if not found/invalid.
+ */
 InstanceId BinaryNinja::GetInstanceIdFromView(const BinaryView *view)
 {
 	if (!view)
 		return 0;
 	
-	// If it's our own view type, we can just get the ID safely
+	/*
+	 * Fast path: If it's our own Armv5FirmwareView type, get ID directly.
+	 * This avoids map lookup and is the common case.
+	 */
 	const Armv5FirmwareView* fwView = dynamic_cast<const Armv5FirmwareView*>(view);
 	if (fwView)
 		return fwView->GetInstanceId();
 	
-	// Fallback to lookup via object pointer if it's a wrapper view.
-	// NOTE: This is susceptible to pointer reuse if not handled carefully,
-	// but we only track real views in the map.
+	/*
+	 * Slow path: Look up by object pointer.
+	 * This handles cases where we receive a wrapper BinaryView that
+	 * delegates to our firmware view.
+	 */
 	if (!view->GetObject())
 		return 0;
-	// During shutdown, don't access static objects (mutex, maps) - they may be destroyed
+
+	/* During shutdown, static objects may be destroyed - bail out */
 	if (BNIsShutdownRequested())
 		return 0;
 	

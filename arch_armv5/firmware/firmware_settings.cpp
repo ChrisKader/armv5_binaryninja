@@ -125,6 +125,7 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.enableInvalidFunctionCleanup = true;
 	settings.disablePointerSweep = false;
 	settings.disableLinearSweep = false;
+	// Partial linear sweep only during initial analysis
 	settings.enablePartialLinearSweep = (mode == FirmwareSettingsMode::Init);
 	settings.skipFirmwareScans = false;
 	settings.cleanupMaxSizeBytes = 8;
@@ -133,7 +134,9 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.orphanMinValidInstr = 4;
 	settings.orphanMinBodyInstr = 2;
 	settings.orphanMinSpacingBytes = 0x80;
+	// More aggressive orphan scanning for command/workflow modes
 	settings.orphanMaxPerPage = (mode == FirmwareSettingsMode::Init) ? 6 : 8;
+	// Require prologue only during initial analysis
 	settings.orphanRequirePrologue = (mode == FirmwareSettingsMode::Init);
 	settings.maxFunctionAdds = 2000;
 	settings.tuning = FirmwareScanTuning{};

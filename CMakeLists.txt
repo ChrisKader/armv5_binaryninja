@@ -48,6 +48,11 @@ file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/*.h
     ${ARCH_ARMV5_DIR}/arch/*.cpp
     ${ARCH_ARMV5_DIR}/arch/*.h
+    ${ARCH_ARMV5_DIR}/analysis/*.cpp
+    ${ARCH_ARMV5_DIR}/analysis/*.h
+    ${ARCH_ARMV5_DIR}/commands/*.cpp
+    ${ARCH_ARMV5_DIR}/commands/*.h
+    ${ARCH_ARMV5_DIR}/common/*.h
     ${ARCH_ARMV5_DIR}/conventions/*.cpp
     ${ARCH_ARMV5_DIR}/conventions/*.h
     ${ARCH_ARMV5_DIR}/recognizers/*.cpp
@@ -74,6 +79,8 @@ add_library(arch_armv5 SHARED ${ARCH_ARMV5_SOURCES})
 
 target_include_directories(arch_armv5 PRIVATE
     ${ARCH_ARMV5_DIR}
+    ${ARCH_ARMV5_DIR}/analysis
+    ${ARCH_ARMV5_DIR}/common
     ${ARCH_ARMV5_DIR}/armv5_disasm
     ${ARCH_ARMV5_DIR}/thumb_disasm)
 

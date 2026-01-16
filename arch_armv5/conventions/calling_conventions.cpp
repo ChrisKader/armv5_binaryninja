@@ -1,5 +1,83 @@
 /*
  * ARMv5 Calling Conventions
+ *
+ * ============================================================================
+ * OVERVIEW
+ * ============================================================================
+ *
+ * This file defines calling conventions for ARMv5 code. Calling conventions
+ * specify how functions pass arguments, return values, and preserve registers.
+ * Correct calling conventions are essential for accurate decompilation.
+ *
+ * CONVENTIONS DEFINED:
+ * --------------------
+ *
+ * 1. AAPCS (ARM EABI) - "aapcs"
+ *    - Modern standard for ARM embedded and Linux
+ *    - 8-byte stack alignment at public interfaces
+ *    - r0-r3 for arguments, r0-r1 for return values
+ *    - Default convention for this plugin
+ *
+ * 2. CDECL - "cdecl"
+ *    - Compatibility alias for AAPCS
+ *    - Used by Binary Ninja for default function handling
+ *
+ * 3. APCS (Legacy ARM) - "apcs"
+ *    - Older ARM/Thumb Procedure Call Standard
+ *    - 4-byte stack alignment (vs 8-byte in AAPCS)
+ *    - Common in older ARM SDKs (ADS, ARM SDT)
+ *
+ * 4. IRQ Handler - "irq-handler"
+ *    - For interrupt and exception handlers
+ *    - No arguments (hardware-initiated)
+ *    - All registers treated as volatile (conservative)
+ *    - Apply manually to irq_handler, fiq_handler, etc.
+ *
+ * 5. Task Entry - "task-entry"
+ *    - For RTOS task entry points
+ *    - r0/r1 as parameters (argc/argv or task-specific)
+ *    - Apply manually to RTOS task functions
+ *
+ * 6. Linux Syscall - "linux-syscall"
+ *    - For Linux kernel system call interface
+ *    - r7 = syscall number, r0-r6 = arguments
+ *    - Apply to syscall stubs if analyzing Linux binaries
+ *
+ * ============================================================================
+ * USAGE
+ * ============================================================================
+ *
+ * Most functions should use the default AAPCS convention. For special cases:
+ *
+ * 1. In Binary Ninja UI:
+ *    - Right-click function -> "Edit Function Properties"
+ *    - Change "Calling Convention" dropdown
+ *
+ * 2. In Python API:
+ *    func.calling_convention = arch.calling_conventions['irq-handler']
+ *
+ * 3. Apply to exception handlers discovered by firmware view:
+ *    - Functions named irq_handler, fiq_handler should use irq-handler
+ *    - Functions named reset_handler may use aapcs (normal startup code)
+ *
+ * ============================================================================
+ * REGISTER USAGE SUMMARY
+ * ============================================================================
+ *
+ *   Register   AAPCS/APCS    IRQ Handler   Purpose
+ *   --------   ----------    -----------   -------
+ *   r0-r3      Volatile      Volatile      Arguments/scratch
+ *   r4-r11     Preserved     Volatile*     Callee-saved
+ *   r12 (IP)   Volatile      Volatile      Intra-procedure scratch
+ *   r13 (SP)   Preserved     Special       Stack pointer
+ *   r14 (LR)   Volatile      Special       Link register / return address
+ *   r15 (PC)   -             -             Program counter
+ *
+ *   * IRQ handlers save/restore all registers explicitly
+ *
+ * ============================================================================
+ * REFERENCE: ARM AAPCS (ARM IHI 0042), ARM APCS (ARM DUI 0041)
+ * ============================================================================
  */
 
 #include <vector>

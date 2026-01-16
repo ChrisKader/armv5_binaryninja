@@ -1,5 +1,53 @@
 /*
  * ARMv5 Firmware Action Policy
+ *
+ * ============================================================================
+ * OVERVIEW
+ * ============================================================================
+ *
+ * This file implements the action policy system for firmware scans. The
+ * policy controls which types of mutations scans are allowed to perform.
+ *
+ * WHY ACTION POLICIES?
+ * --------------------
+ *
+ * During debugging and development, it's useful to disable specific actions
+ * to isolate problems:
+ *
+ * - "Functions keep disappearing" -> Disable remove_function
+ * - "Too many false positive data variables" -> Disable define_data
+ * - "Want to see what scans find without changes" -> Disable all (dry run)
+ *
+ * ============================================================================
+ * POLICY STRUCTURE
+ * ============================================================================
+ *
+ * FirmwareActionPolicy contains boolean flags for each action type:
+ *
+ *   allowAddFunction    - Create new functions (AddFunctionForAnalysis)
+ *   allowDefineData     - Define data variables (DefineDataVariable)
+ *   allowClearData      - Undefine data variables (UndefineDataVariable)
+ *   allowDefineSymbol   - Create symbols (DefineAutoSymbol)
+ *   allowRemoveFunction - Remove functions (RemoveAnalysisFunction)
+ *
+ * Default: All actions enabled (policy = allow everything)
+ *
+ * ============================================================================
+ * CONFIGURATION
+ * ============================================================================
+ *
+ * Set BN_ARMV5_FIRMWARE_DISABLE_ACTIONS environment variable:
+ *
+ *   # Disable all actions (dry run - see what would happen)
+ *   export BN_ARMV5_FIRMWARE_DISABLE_ACTIONS=all
+ *
+ *   # Disable function removal only
+ *   export BN_ARMV5_FIRMWARE_DISABLE_ACTIONS=remove_function
+ *
+ *   # Disable multiple actions
+ *   export BN_ARMV5_FIRMWARE_DISABLE_ACTIONS="add_function,define_data"
+ *
+ * ============================================================================
  */
 
 #include "action_policy.h"

@@ -3,6 +3,30 @@
  *
  * Translates ARMv5 and Thumb instructions to Binary Ninja's Low-Level IL.
  * Follows the same patterns as the ARMv7 plugin in binaryninja-api/arch/armv7/.
+ *
+ * KEY CONCEPTS:
+ * -------------
+ * 1. PC OFFSET HANDLING:
+ *    - ARM mode: PC reads return addr+8 (3-stage pipeline)
+ *    - Thumb mode: PC reads return addr+4 (2-stage effective)
+ *    This is critical for correct PC-relative addressing (LDR, ADR, branches).
+ *
+ * 2. CONSTPOINTER VS CONST:
+ *    - Use il.ConstPointer() for addresses - enables Binary Ninja's xref tracking
+ *    - Use il.Const() for plain numeric values
+ *    Getting this wrong breaks cross-reference analysis.
+ *
+ * 3. FLAG COMPUTATION:
+ *    - Flags are set via flagWriteType parameter to SetRegister
+ *    - IL_FLAGWRITE_ALL, IL_FLAGWRITE_NZ, etc. control which flags update
+ *    - The architecture's GetFlagWriteLowLevelIL() handles the details
+ *
+ * 4. CONDITIONAL EXECUTION:
+ *    - ARM supports conditional execution on most instructions
+ *    - Wrap conditional instructions in il.If(GetCondition(...), trueLabel, falseLabel)
+ *    - Unconditional instructions (COND_AL) skip the wrapper
+ *
+ * REFERENCE: binaryninja-api/arch/armv7/il.cpp
  */
 
 #include <stdarg.h>
@@ -10,13 +34,42 @@
 #include <map>
 #include "il.h"
 #include "lowlevelilinstruction.h"
+#include "common/armv5_utils.h"
 
 using namespace BinaryNinja;
 using namespace armv5;
 
 /*
- * Detect ARM switch table pattern: ADD PC, PC, Rn followed by branch offsets.
- * Returns true if a switch table was detected, fills targets with destinations.
+ * ============================================================================
+ * SWITCH TABLE DETECTION
+ * ============================================================================
+ *
+ * ARM compilers often generate switch statements as:
+ *
+ *   CMP Rn, #max_case      ; bounds check
+ *   BHI default_case       ; branch if out of range
+ *   ADD PC, PC, Rn, LSL #2 ; computed jump: PC = PC + (case * 4)
+ *   ; followed by branch offset table:
+ *   B case_0
+ *   B case_1
+ *   B case_2
+ *   ...
+ *
+ * The ADD PC, PC, Rn pattern is distinctive and relatively rare outside
+ * switch statements. When we see it, we scan ahead for branch instructions
+ * to identify case targets.
+ *
+ * This function is called during IL lifting to identify switch tables and
+ * provide proper branch targets to Binary Ninja's analysis.
+ */
+
+/**
+ * Detect ARM switch table pattern and extract case targets.
+ *
+ * @param il      The IL function being built.
+ * @param addr    Address of the ADD PC, PC, Rn instruction.
+ * @param targets Output: vector of case target addresses.
+ * @return true if a valid switch table was detected.
  */
 static bool DetectSwitchTableFromIL(LowLevelILFunction &il, uint64_t addr,
                                     std::vector<uint64_t> &targets)
@@ -106,63 +159,117 @@ static inline ExprId ReadRegisterOrPointerThumb(LowLevelILFunction &il, Register
     return il.Register(get_register_size(reg), RegisterToIndex(reg));
 }
 
-/* Helper to count operands in instruction (find first NONE operand) */
-static int GetOperandCount(const Instruction &instr)
-{
-    for (int i = 0; i < MAX_OPERANDS; i++)
-    {
-        if (instr.operands[i].cls == NONE)
-            return i;
-    }
-    return MAX_OPERANDS;
-}
+/*
+ * NOTE: GetOperandCount is now in common/armv5_utils.h
+ * Use armv5::GetOperandCount(instr) instead.
+ */
 
-/* Get IL condition for ARM condition code */
+/*
+ * ============================================================================
+ * CONDITION CODE HANDLING
+ * ============================================================================
+ *
+ * ARM instructions can be conditionally executed based on flags set by
+ * previous instructions. The condition code is encoded in bits 31:28.
+ *
+ * CONDITION CODES:
+ * ----------------
+ *   EQ (0000) - Equal (Z=1)
+ *   NE (0001) - Not Equal (Z=0)
+ *   CS (0010) - Carry Set / Unsigned >= (C=1)
+ *   CC (0011) - Carry Clear / Unsigned < (C=0)
+ *   MI (0100) - Minus / Negative (N=1)
+ *   PL (0101) - Plus / Positive or Zero (N=0)
+ *   VS (0110) - Overflow Set (V=1)
+ *   VC (0111) - Overflow Clear (V=0)
+ *   HI (1000) - Unsigned Higher (C=1 and Z=0)
+ *   LS (1001) - Unsigned Lower or Same (C=0 or Z=1)
+ *   GE (1010) - Signed >= (N=V)
+ *   LT (1011) - Signed < (N!=V)
+ *   GT (1100) - Signed > (Z=0 and N=V)
+ *   LE (1101) - Signed <= (Z=1 or N!=V)
+ *   AL (1110) - Always (unconditional)
+ *   NV (1111) - Never (reserved, treated as always in ARMv5)
+ *
+ * The GetCondition function maps ARM conditions to Binary Ninja's
+ * LLFC_* flag condition constants.
+ */
+
+/**
+ * Get Binary Ninja IL condition expression for an ARM condition code.
+ *
+ * @param il   The IL function being built.
+ * @param cond ARM condition code (0-15).
+ * @return IL expression that evaluates to the condition result.
+ */
 ExprId GetCondition(LowLevelILFunction &il, uint32_t cond)
 {
     switch (cond)
     {
     case armv5::COND_EQ:
-        return il.FlagCondition(LLFC_E);
+        return il.FlagCondition(LLFC_E);      /* Z=1 */
     case armv5::COND_NE:
-        return il.FlagCondition(LLFC_NE);
+        return il.FlagCondition(LLFC_NE);     /* Z=0 */
     case armv5::COND_CS:
-        return il.FlagCondition(LLFC_UGE);
+        return il.FlagCondition(LLFC_UGE);    /* C=1 (unsigned >=) */
     case armv5::COND_CC:
-        return il.FlagCondition(LLFC_ULT);
+        return il.FlagCondition(LLFC_ULT);    /* C=0 (unsigned <) */
     case armv5::COND_MI:
-        return il.FlagCondition(LLFC_NEG);
+        return il.FlagCondition(LLFC_NEG);    /* N=1 (negative) */
     case armv5::COND_PL:
-        return il.FlagCondition(LLFC_POS);
+        return il.FlagCondition(LLFC_POS);    /* N=0 (positive/zero) */
     case armv5::COND_VS:
-        return il.FlagCondition(LLFC_O);
+        return il.FlagCondition(LLFC_O);      /* V=1 (overflow) */
     case armv5::COND_VC:
-        return il.FlagCondition(LLFC_NO);
+        return il.FlagCondition(LLFC_NO);     /* V=0 (no overflow) */
     case armv5::COND_HI:
-        return il.FlagCondition(LLFC_UGT);
+        return il.FlagCondition(LLFC_UGT);    /* C=1 and Z=0 (unsigned >) */
     case armv5::COND_LS:
-        return il.FlagCondition(LLFC_ULE);
+        return il.FlagCondition(LLFC_ULE);    /* C=0 or Z=1 (unsigned <=) */
     case armv5::COND_GE:
-        return il.FlagCondition(LLFC_SGE);
+        return il.FlagCondition(LLFC_SGE);    /* N=V (signed >=) */
     case armv5::COND_LT:
-        return il.FlagCondition(LLFC_SLT);
+        return il.FlagCondition(LLFC_SLT);    /* N!=V (signed <) */
     case armv5::COND_GT:
-        return il.FlagCondition(LLFC_SGT);
+        return il.FlagCondition(LLFC_SGT);    /* Z=0 and N=V (signed >) */
     case armv5::COND_LE:
-        return il.FlagCondition(LLFC_SLE);
+        return il.FlagCondition(LLFC_SLE);    /* Z=1 or N!=V (signed <=) */
     case armv5::COND_AL:
     case armv5::COND_NV:
     default:
-        return il.Const(1, 1);
+        return il.Const(1, 1);                /* Always true */
     }
 }
 
-/* Returns true if condition is unconditional */
+/**
+ * Check if a condition code is unconditional (always executes).
+ */
 static inline bool IsUnconditional(uint32_t cond)
 {
     return (cond == COND_AL) || (cond == COND_NV);
 }
 
+/**
+ * Wrap an IL instruction with condition checking.
+ *
+ * For unconditional instructions (AL/NV), just adds the instruction.
+ * For conditional instructions, wraps in an if/else with the condition.
+ *
+ * EXAMPLE:
+ * --------
+ *   MOVEQ r0, #1
+ *
+ * Becomes:
+ *   if (Z == 1) goto doOp else goto fallthrough
+ *   doOp:
+ *     r0 = 1
+ *     goto fallthrough
+ *   fallthrough:
+ *
+ * @param il       The IL function being built.
+ * @param cond     ARM condition code.
+ * @param trueCase IL expression to execute if condition is true.
+ */
 static void ConditionExecute(LowLevelILFunction &il, uint32_t cond, ExprId trueCase)
 {
     if (IsUnconditional(cond))
