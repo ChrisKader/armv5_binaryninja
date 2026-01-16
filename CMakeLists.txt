@@ -145,6 +145,86 @@ else()
 endif()
 
 # ============================================================================
+# ARMv5 UI Plugin (optional, requires Qt6)
+# ============================================================================
+
+option(BUILD_UI_PLUGIN "Build the ARMv5 UI plugin (requires Qt6)" OFF)
+
+if(BUILD_UI_PLUGIN)
+    # Enable Qt MOC
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTOUIC ON)
+    set(CMAKE_AUTORCC ON)
+    
+    find_package(Qt6 COMPONENTS Core Gui Widgets QUIET)
+    
+    if(Qt6_FOUND)
+        # Find Binary Ninja UI library
+        if(APPLE)
+            set(BN_UI_LIB "${BN_INSTALL_DIR}/Contents/MacOS/libbinaryninjaui.dylib")
+        elseif(WIN32)
+            set(BN_UI_LIB "${BN_INSTALL_DIR}/binaryninjaui.lib")
+        else()
+            set(BN_UI_LIB "${BN_INSTALL_DIR}/libbinaryninjaui.so")
+        endif()
+        
+        if(EXISTS "${BN_UI_LIB}")
+            set(ARCH_ARMV5_UI_DIR ${CMAKE_SOURCE_DIR}/arch_armv5_ui)
+            
+            file(GLOB UI_SOURCES CONFIGURE_DEPENDS
+                ${ARCH_ARMV5_UI_DIR}/*.cpp ${ARCH_ARMV5_UI_DIR}/*.h
+                ${ARCH_ARMV5_UI_DIR}/sidebar/*.cpp ${ARCH_ARMV5_UI_DIR}/sidebar/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/*.h)
+            
+            # Filter out MOC-generated files
+            list(FILTER UI_SOURCES EXCLUDE REGEX "moc_.*")
+            list(FILTER UI_SOURCES EXCLUDE REGEX "qrc_.*")
+            
+            add_library(arch_armv5_ui SHARED ${UI_SOURCES})
+            
+            target_include_directories(arch_armv5_ui PRIVATE
+                ${ARCH_ARMV5_UI_DIR}
+                ${ARCH_ARMV5_DIR}
+                ${BN_API_PATH}
+                ${BN_API_PATH}/ui)
+            
+            target_link_libraries(arch_armv5_ui
+                binaryninjaapi
+                ${BN_UI_LIB}
+                Qt6::Core
+                Qt6::Gui
+                Qt6::Widgets)
+            
+            set_target_properties(arch_armv5_ui PROPERTIES
+                CXX_STANDARD 20
+                CXX_STANDARD_REQUIRED ON
+                CXX_VISIBILITY_PRESET hidden
+                VISIBILITY_INLINES_HIDDEN ON
+                POSITION_INDEPENDENT_CODE ON)
+            
+            if(APPLE)
+                set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".dylib")
+                set_target_properties(arch_armv5_ui PROPERTIES
+                    BUILD_RPATH "${BN_INSTALL_DIR}/Contents/MacOS"
+                    INSTALL_RPATH "${BN_INSTALL_DIR}/Contents/MacOS")
+            elseif(WIN32)
+                set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".dll")
+            else()
+                set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".so")
+            endif()
+            
+            message(STATUS "UI Plugin: ENABLED (Qt6 ${Qt6_VERSION})")
+        else()
+            message(STATUS "UI Plugin: DISABLED (Binary Ninja UI library not found)")
+        endif()
+    else()
+        message(STATUS "UI Plugin: DISABLED (Qt6 not found)")
+    endif()
+else()
+    message(STATUS "UI Plugin: DISABLED (use -DBUILD_UI_PLUGIN=ON to enable)")
+endif()
+
+# ============================================================================
 # Installation (creates symlink to plugin)
 # ============================================================================
 
@@ -177,6 +257,26 @@ set(INSTALL_PLUGIN_COMMANDS
 
 set(INSTALL_PLUGIN_DEPS arch_armv5)
 
+# Also install UI plugin if it was built
+# Note: We check BUILD_UI_PLUGIN directly since the target was defined earlier in this file
+if(BUILD_UI_PLUGIN)
+    if(APPLE)
+        set(UI_PLUGIN_FILENAME "libarch_armv5_ui.dylib")
+    elseif(WIN32)
+        set(UI_PLUGIN_FILENAME "arch_armv5_ui.dll")
+    else()
+        set(UI_PLUGIN_FILENAME "libarch_armv5_ui.so")
+    endif()
+    
+    list(APPEND INSTALL_PLUGIN_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E remove -f "${BN_USER_PLUGINS}/${UI_PLUGIN_FILENAME}"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "${CMAKE_SOURCE_DIR}/.build/${UI_PLUGIN_FILENAME}"
+            "${BN_USER_PLUGINS}/${UI_PLUGIN_FILENAME}"
+    )
+    list(APPEND INSTALL_PLUGIN_DEPS arch_armv5_ui)
+endif()
+
 # Custom install target that creates a symlink instead of copying
 add_custom_target(install_plugin
     ${INSTALL_PLUGIN_COMMANDS}
@@ -202,6 +302,9 @@ message(STATUS "  Install: ${BN_USER_PLUGINS}")
 message(STATUS "")
 message(STATUS "Targets:")
 message(STATUS "  arch_armv5        - Binary Ninja architecture plugin")
+if(TARGET arch_armv5_ui)
+message(STATUS "  arch_armv5_ui     - Binary Ninja UI plugin")
+endif()
 message(STATUS "  armv5_disasm_test - Standalone disassembler test tool")
 message(STATUS "  armv5_disasm_lib  - Shared library for Python tests")
 message(STATUS "  install_plugin    - Create symlink in plugins directory")
