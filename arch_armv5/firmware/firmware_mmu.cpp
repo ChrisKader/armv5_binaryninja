@@ -115,7 +115,8 @@ static MMUWalkMode GetMMUWalkMode(const Ref<BinaryView>& view, Ref<Logger> logge
 	(void)view;
 
 
-	return MMUWalkMode::Heuristic;
+	// Default to emulated mode - traces from reset handler for accurate MMU analysis
+	return MMUWalkMode::Emulated;
 }
 struct MapFormat
 {
@@ -994,51 +995,14 @@ static bool ParseArmv5L1Table(BinaryReader& reader, const uint8_t* data, uint64_
 			continue;
 		}
 
-		// Coarse page table (0b01)
+		// Coarse page table (0b01) - skip entirely like the original code
+		// These are often uninitialized data that looks like valid page table pointers
 		if (type == 1)
-		{
-			size_t before = outRegions.size();
-			if (!ParseArmv5L2Coarse(reader, data, dataLen, endian, resolver, length, romCopy, vaBase, desc, outRegions, logger))
-			{
-				bool cacheable = false;
-				bool bufferable = false;
-				bool readable = true;
-				bool writable = true;
-				bool executable = true;
-				const char* rtype = "L2";
-				MemRegion region = {vaBase, 0, 0x100000, readable, writable, executable, cacheable, bufferable, rtype};
-				AppendRegion(outRegions, region);
-			}
-			else
-			{
-				size_t added = outRegions.size() - before;
-				logger->LogDebug("MMU: L2 expanded %zu region(s) for VA 0x%08llx", added, (unsigned long long)vaBase);
-			}
 			continue;
-		}
 
-		// Fine page table (0b11)
+		// Fine page table (0b11) - skip entirely like the original code
 		if (type == 3)
-		{
-			size_t before = outRegions.size();
-			if (!ParseArmv5L2Fine(reader, data, dataLen, endian, resolver, length, romCopy, vaBase, desc, outRegions, logger))
-			{
-				bool cacheable = false;
-				bool bufferable = false;
-				bool readable = true;
-				bool writable = true;
-				bool executable = true;
-				const char* rtype = "L2F";
-				MemRegion region = {vaBase, 0, 0x100000, readable, writable, executable, cacheable, bufferable, rtype};
-				AppendRegion(outRegions, region);
-			}
-			else
-			{
-				size_t added = outRegions.size() - before;
-				logger->LogDebug("MMU: L2 fine expanded %zu region(s) for VA 0x%08llx", added, (unsigned long long)vaBase);
-			}
 			continue;
-		}
 	}
 
 	if (outRegions.empty())
@@ -1276,21 +1240,37 @@ static bool ReadU32Resolved(BinaryReader& reader, const uint8_t* data, uint64_t 
 	BNEndianness endian, const AddressResolver& resolver, uint64_t addr, const RomToSramCopy& romCopy,
 	uint64_t length, uint32_t& out)
 {
-	// If this is an SRAM address that falls within the ROM->SRAM copy range, remap into ROM.
-	if (romCopy.valid && addr >= romCopy.sramDst && addr < romCopy.sramEnd)
+	// IMPORTANT: Check ROM copy FIRST before alias mappings.
+	// The alias mapping (AddLow24Alias) maps SRAM addresses to file offsets directly,
+	// but for addresses in the ROM copy range, we need to read from the ROM source
+	// (where the data was copied from) rather than the uninitialized SRAM location.
+	if (romCopy.valid)
 	{
-		uint64_t offsetInSram = addr - romCopy.sramDst;
-		uint64_t romAddr = romCopy.romSrc + offsetInSram;
-		uint64_t romOff = 0;
-		if (!resolver.CpuToFile(romAddr, romOff))
+		if (addr >= romCopy.sramDst && addr < romCopy.sramEnd)
+		{
+			// Address is within the ROM-to-SRAM copy range - read from ROM source
+			uint64_t offsetInSram = addr - romCopy.sramDst;
+			uint64_t romAddr = romCopy.romSrc + offsetInSram;
+			uint64_t romOff = 0;
+			if (!resolver.CpuToFile(romAddr, romOff))
+				return false;
+			return ReadU32At(reader, data, dataLen, endian, romOff, out, length);
+		}
+
+		// Check if this looks like an SRAM alias address (same high byte as copy destination).
+		// If so, it's uninitialized memory - return false.
+		uint64_t aliasBase = romCopy.sramDst & 0xFF000000ULL;
+		if ((addr & 0xFF000000ULL) == aliasBase)
 			return false;
-		return ReadU32At(reader, data, dataLen, endian, romOff, out, length);
 	}
 
+	// Try direct file mapping - this handles addresses within the loaded image
 	uint64_t fileOff = 0;
-	if (!resolver.CpuToFile(addr, fileOff))
-		return false;
-	return ReadU32At(reader, data, dataLen, endian, fileOff, out, length);
+	if (resolver.CpuToFile(addr, fileOff))
+		return ReadU32At(reader, data, dataLen, endian, fileOff, out, length);
+
+	// Address doesn't map to file and isn't in ROM copy range
+	return false;
 }
 
 static inline uint32_t DecodeImm12(uint32_t instr)
@@ -2770,6 +2750,92 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 											isIdentity ? "identity" : "VA->PA");
 									}
 								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// If still no config arrays, try caller-based emulation.
+		// The TTBR write might be in a small helper function called by the main MMU setup.
+		// Find callers of that helper and emulate from there.
+		if (configArrays.empty() && walkMode == MMUWalkMode::Emulated)
+		{
+			// Find the function containing the TTBR write
+			uint64_t ttbrFuncStart = mmuSetupFuncStart;
+			if (ttbrFuncStart == 0)
+				ttbrFuncStart = findPrologue(ttbrInstrAddr);
+
+			if (ttbrFuncStart != 0)
+			{
+				// Convert to CPU address for call target matching
+				uint64_t ttbrFuncCpu = 0;
+				if (!resolver.FileToCpu(ttbrFuncStart, ttbrFuncCpu, true))
+					ttbrFuncCpu = imageBase + ttbrFuncStart;
+
+				logger->LogInfo("MMU: Searching for callers of TTBR function at CPU 0x%llx",
+					(unsigned long long)ttbrFuncCpu);
+
+				// Scan file for BL instructions that target ttbrFuncCpu
+				std::vector<uint64_t> callerFileOffs;
+				for (uint64_t off = 0; off + 4 <= length && callerFileOffs.size() < 32; off += 4)
+				{
+					uint32_t ins = 0;
+					ReadU32At(reader, data, dataLen, endian, off, ins, length);
+
+					// BL instruction: cond 1011 imm24
+					if ((ins & 0x0F000000) == 0x0B000000)
+					{
+						uint64_t callerCpu = 0;
+						if (!resolver.FileToCpu(off, callerCpu, true))
+							callerCpu = imageBase + off;
+
+						uint64_t target = BranchTarget(callerCpu, ins);
+						if (target == ttbrFuncCpu)
+						{
+							callerFileOffs.push_back(off);
+						}
+					}
+				}
+
+				if (!callerFileOffs.empty())
+				{
+					logger->LogInfo("MMU: Found %zu caller(s) of TTBR function, running emulation from callers",
+						callerFileOffs.size());
+
+					for (uint64_t callerOff : callerFileOffs)
+					{
+						if (!configArrays.empty())
+							break; // Stop once we find arrays
+
+						// Find the caller's function start
+						uint64_t callerFuncStart = findPrologue(callerOff);
+						if (callerFuncStart == 0)
+						{
+							// Fallback: use a window before the call
+							callerFuncStart = (callerOff > 0x400) ? (callerOff - 0x400) : 0;
+						}
+
+						uint64_t callerCpu = 0;
+						resolver.FileToCpu(callerOff, callerCpu, true);
+						logger->LogDebug("MMU: Emulating from caller at file 0x%llx (func start 0x%llx)",
+							(unsigned long long)callerOff, (unsigned long long)callerFuncStart);
+
+						// Run emulation from caller function start to the call site
+						EmuResult callerEmuRes{};
+						uint32_t dummyReg = 0;
+						ResolveRegAtEmulated(reader, data, dataLen, endian, resolver,
+							callerFuncStart, callerOff + 4, 0, dummyReg, &callerEmuRes, nullptr);
+
+						// Extract config arrays from literal loads
+						if (!callerEmuRes.literalLoads.empty())
+						{
+							DiscoverConfigArraysFromLiteralLoads(callerEmuRes.literalLoads, configArrays, logger);
+							for (const auto& arr : configArrays)
+							{
+								logger->LogInfo("MMU: Candidate config array 0x%llx-0x%llx (from caller emulation)",
+									(unsigned long long)arr.startAddr, (unsigned long long)arr.endAddr);
 							}
 						}
 					}

@@ -683,6 +683,13 @@ bool Armv5FirmwareView::Init()
 			// Define symbol for the vector entry (it's code, not data)
 			DefineAutoSymbol(new Symbol(FunctionSymbol, vectorNames[i], vectorAddr, GlobalBinding));
 
+			// Seed vector entry as a function so it gets disassembled
+			if (!m_parseOnly)
+			{
+				m_seededFunctions.insert(vectorAddr);
+				m_seededUserFunctions.insert(vectorAddr);
+			}
+
 			// Resolve the handler address (may return relative offset or absolute VA depending on table)
 			uint64_t handlerAddr = ResolveVectorEntry(
 					reader, fileData, fileDataLen, m_endian, vectorOffset, imageBase, length);
