@@ -44,8 +44,12 @@ endif()
 file(GLOB SOURCES CONFIGURE_DEPENDS
     *.cpp
     *.h
+    analysis/*.cpp
+    analysis/*.h
     arch/*.cpp
     arch/*.h
+    commands/*.cpp
+    commands/*.h
     common/*.h
     conventions/*.cpp
     conventions/*.h
@@ -69,8 +73,9 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     thumb_disasm/*.c
     thumb_disasm/*.h)
 
-# Build as shared library (plugin)
+# Build as shared library (plugin) or static when used as a dependency
 if(DEMO)
+    # When building as part of another project (like UI), build as static
     add_library(arch_armv5 STATIC ${SOURCES})
 else()
     add_library(arch_armv5 SHARED ${SOURCES})

@@ -237,9 +237,9 @@ void RegisterGlobalFirmwareSettings()
 	if (!settings)
 		return;
 
-	// Register the armv5 group
-	settings->RegisterGroup("armv5", "ARMv5");
-	settings->RegisterGroup("armv5.firmware", "ARMv5 Firmware Analysis");
+	// Register the armv5 group (Binary Ninja groups are simple identifiers without dots)
+	// The settings use "armv5.firmware.*" keys but the group is just "armv5"
+	settings->RegisterGroup("armv5", "ARMv5 Firmware Analysis");
 
 	// --- Scan Toggles ---
 

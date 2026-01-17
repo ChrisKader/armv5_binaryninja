@@ -151,21 +151,34 @@ endif()
 option(BUILD_UI_PLUGIN "Build the ARMv5 UI plugin (requires Qt6)" OFF)
 
 if(BUILD_UI_PLUGIN)
-    # Enable Qt MOC
+    # Enable Qt MOC/UIC/RCC - we use Homebrew Qt for the build tools
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTOUIC ON)
     set(CMAKE_AUTORCC ON)
     
+    # Find Homebrew Qt for MOC/UIC tools and headers
     find_package(Qt6 COMPONENTS Core Gui Widgets QUIET)
     
     if(Qt6_FOUND)
         # Find Binary Ninja UI library
         if(APPLE)
             set(BN_UI_LIB "${BN_INSTALL_DIR}/Contents/MacOS/libbinaryninjaui.dylib")
+            # Binary Ninja's bundled Qt frameworks (must link against these, not Homebrew's)
+            set(BN_QT_CORE "${BN_INSTALL_DIR}/Contents/Frameworks/QtCore.framework")
+            set(BN_QT_GUI "${BN_INSTALL_DIR}/Contents/Frameworks/QtGui.framework")
+            set(BN_QT_WIDGETS "${BN_INSTALL_DIR}/Contents/Frameworks/QtWidgets.framework")
         elseif(WIN32)
             set(BN_UI_LIB "${BN_INSTALL_DIR}/binaryninjaui.lib")
+            # On Windows, use Qt6 targets directly (Binary Ninja uses system Qt)
+            set(BN_QT_CORE Qt6::Core)
+            set(BN_QT_GUI Qt6::Gui)
+            set(BN_QT_WIDGETS Qt6::Widgets)
         else()
             set(BN_UI_LIB "${BN_INSTALL_DIR}/libbinaryninjaui.so")
+            # On Linux, use Qt6 targets directly (Binary Ninja uses system Qt)
+            set(BN_QT_CORE Qt6::Core)
+            set(BN_QT_GUI Qt6::Gui)
+            set(BN_QT_WIDGETS Qt6::Widgets)
         endif()
         
         if(EXISTS "${BN_UI_LIB}")
@@ -174,26 +187,58 @@ if(BUILD_UI_PLUGIN)
             file(GLOB UI_SOURCES CONFIGURE_DEPENDS
                 ${ARCH_ARMV5_UI_DIR}/*.cpp ${ARCH_ARMV5_UI_DIR}/*.h
                 ${ARCH_ARMV5_UI_DIR}/sidebar/*.cpp ${ARCH_ARMV5_UI_DIR}/sidebar/*.h
-                ${ARCH_ARMV5_UI_DIR}/widgets/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/*.h)
+                ${ARCH_ARMV5_UI_DIR}/widgets/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/common/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/common/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/discover/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/discover/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/security/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/security/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/health/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/health/*.h
+                ${ARCH_ARMV5_UI_DIR}/widgets/diff/*.cpp ${ARCH_ARMV5_UI_DIR}/widgets/diff/*.h)
             
             # Filter out MOC-generated files
             list(FILTER UI_SOURCES EXCLUDE REGEX "moc_.*")
             list(FILTER UI_SOURCES EXCLUDE REGEX "qrc_.*")
             
-            add_library(arch_armv5_ui SHARED ${UI_SOURCES})
+            # Include shared analysis sources that the UI needs
+            set(SHARED_ANALYSIS_SOURCES
+                ${ARCH_ARMV5_DIR}/analysis/region_detector.cpp
+                ${ARCH_ARMV5_DIR}/analysis/region_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/function_detector.cpp
+                ${ARCH_ARMV5_DIR}/analysis/function_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/string_detector.cpp
+                ${ARCH_ARMV5_DIR}/analysis/string_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/structure_detector.cpp
+                ${ARCH_ARMV5_DIR}/analysis/structure_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/crypto_detector.cpp
+                ${ARCH_ARMV5_DIR}/analysis/crypto_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.cpp
+                ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.h)
             
+            add_library(arch_armv5_ui SHARED ${UI_SOURCES} ${SHARED_ANALYSIS_SOURCES})
+            
+            # Include directories: use Homebrew Qt headers for compilation
+            # (Binary Ninja's frameworks don't include full header sets)
             target_include_directories(arch_armv5_ui PRIVATE
                 ${ARCH_ARMV5_UI_DIR}
                 ${ARCH_ARMV5_DIR}
                 ${BN_API_PATH}
                 ${BN_API_PATH}/ui)
             
+            # Get Qt include directories from Homebrew Qt targets
+            get_target_property(QT_CORE_INCLUDES Qt6::Core INTERFACE_INCLUDE_DIRECTORIES)
+            get_target_property(QT_GUI_INCLUDES Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
+            get_target_property(QT_WIDGETS_INCLUDES Qt6::Widgets INTERFACE_INCLUDE_DIRECTORIES)
+            target_include_directories(arch_armv5_ui PRIVATE
+                ${QT_CORE_INCLUDES}
+                ${QT_GUI_INCLUDES}
+                ${QT_WIDGETS_INCLUDES})
+            
+            # Link against Binary Ninja's bundled Qt (on macOS) or system Qt (elsewhere)
             target_link_libraries(arch_armv5_ui
                 binaryninjaapi
                 ${BN_UI_LIB}
-                Qt6::Core
-                Qt6::Gui
-                Qt6::Widgets)
+                ${BN_QT_CORE}
+                ${BN_QT_GUI}
+                ${BN_QT_WIDGETS})
             
             set_target_properties(arch_armv5_ui PROPERTIES
                 CXX_STANDARD 20
@@ -204,16 +249,17 @@ if(BUILD_UI_PLUGIN)
             
             if(APPLE)
                 set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".dylib")
+                # Set RPATH to find Binary Ninja's Qt frameworks at runtime
                 set_target_properties(arch_armv5_ui PROPERTIES
-                    BUILD_RPATH "${BN_INSTALL_DIR}/Contents/MacOS"
-                    INSTALL_RPATH "${BN_INSTALL_DIR}/Contents/MacOS")
+                    BUILD_RPATH "${BN_INSTALL_DIR}/Contents/MacOS;${BN_INSTALL_DIR}/Contents/Frameworks"
+                    INSTALL_RPATH "${BN_INSTALL_DIR}/Contents/MacOS;${BN_INSTALL_DIR}/Contents/Frameworks")
             elseif(WIN32)
                 set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".dll")
             else()
                 set_target_properties(arch_armv5_ui PROPERTIES SUFFIX ".so")
             endif()
             
-            message(STATUS "UI Plugin: ENABLED (Qt6 ${Qt6_VERSION})")
+            message(STATUS "UI Plugin: ENABLED (Qt6 ${Qt6_VERSION}, linking against Binary Ninja's Qt)")
         else()
             message(STATUS "UI Plugin: DISABLED (Binary Ninja UI library not found)")
         endif()
