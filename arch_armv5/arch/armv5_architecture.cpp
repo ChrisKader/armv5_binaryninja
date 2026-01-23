@@ -257,7 +257,14 @@ protected:
       {
         result.archTransitionByTargetAddr = true;
         result.AddBranch(UnresolvedBranch);
-        /* Conditional LDR PC can fall through */
+        /*
+         * Note: We don't add FalseBranch here because the analysis code in
+         * armv5_architecture.cpp handleAsFallback() detects the 
+         * "mov lr, pc; ldr pc, [rx]" pattern and sets endsBlock = false.
+         * Adding FalseBranch here would override that detection.
+         * 
+         * Conditional LDR PC can fall through naturally.
+         */
         if (CONDITIONAL(instr.cond))
         {
           result.AddBranch(FalseBranch, addr + 4, this);
@@ -776,6 +783,100 @@ public:
 
     // === FAST PATH: Pure bit pattern checks (no struct access) ===
 
+    // Pattern: ASCII string / text data detection
+    // ASCII strings decode to ARM instructions with unusual condition codes
+    // (MI, PL, VS, VC) because printable ASCII has bit 5 or 6 set.
+    //
+    // IMPORTANT: Skip this check for common valid instructions like branches,
+    // because their encoding can accidentally match ASCII patterns.
+    // For example: B 0x... (0xEAxxxxxx) can have printable + null bytes.
+    {
+      // First check if this is a common valid instruction that we should NOT
+      // flag as ASCII even if the bytes look like text.
+      bool isCommonValidInstruction = false;
+      switch (instr.operation)
+      {
+        // Branches - very common, encoding can look like ASCII
+        case ARMV5_B:
+        case ARMV5_BL:
+        case ARMV5_BX:
+        case ARMV5_BLX:
+        // Load/store - common instructions
+        case ARMV5_LDR:
+        case ARMV5_STR:
+        case ARMV5_LDM:
+        case ARMV5_STM:
+        case ARMV5_LDMIA:
+        case ARMV5_LDMIB:
+        case ARMV5_LDMDA:
+        case ARMV5_LDMDB:
+        case ARMV5_STMIA:
+        case ARMV5_STMIB:
+        case ARMV5_STMDA:
+        case ARMV5_STMDB:
+        case ARMV5_PUSH:
+        case ARMV5_POP:
+        // Data processing with common condition codes (AL, EQ, NE, etc.)
+        case ARMV5_MOV:
+        case ARMV5_ADD:
+        case ARMV5_SUB:
+        case ARMV5_CMP:
+        case ARMV5_AND:
+        case ARMV5_ORR:
+          // These are valid if condition is common (AL, EQ, NE, CS, CC, etc.)
+          if (cond <= 0xE)  // Not condition 0xF (unconditional/special)
+            isCommonValidInstruction = true;
+          break;
+        default:
+          break;
+      }
+
+      // Only apply ASCII detection to unusual instructions
+      if (!isCommonValidInstruction)
+      {
+        uint8_t b0 = (instrWord >> 0) & 0xFF;
+        uint8_t b1 = (instrWord >> 8) & 0xFF;
+        uint8_t b2 = (instrWord >> 16) & 0xFF;
+        uint8_t b3 = (instrWord >> 24) & 0xFF;
+        
+        // Printable ASCII: space through tilde
+        auto isPrintable = [](uint8_t c) { return c >= 0x20 && c <= 0x7E; };
+        
+        // Text characters: printable + common control characters found in strings
+        auto isTextChar = [](uint8_t c) { 
+          if (c >= 0x20 && c <= 0x7E) return true;  // Printable
+          if (c == 0x00) return true;  // Null terminator
+          if (c == 0x09) return true;  // Tab
+          if (c == 0x0A) return true;  // LF
+          if (c == 0x0D) return true;  // CR
+          if (c == 0x1B) return true;  // ESC (ANSI escape sequences)
+          return false;
+        };
+        
+        // Control characters that appear in text but not in code
+        auto isControlChar = [](uint8_t c) {
+          return c == 0x00 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0x1B;
+        };
+        
+        int printableCount = isPrintable(b0) + isPrintable(b1) + isPrintable(b2) + isPrintable(b3);
+        int textCount = isTextChar(b0) + isTextChar(b1) + isTextChar(b2) + isTextChar(b3);
+        int controlCount = isControlChar(b0) + isControlChar(b1) + isControlChar(b2) + isControlChar(b3);
+        
+        // All 4 bytes printable ASCII -> definitely a string
+        if (printableCount == 4)
+          return true;
+        
+        // All 4 bytes are text characters (printable + control) -> likely text
+        if (textCount == 4 && printableCount >= 2)
+          return true;
+        
+        // Mix of printable and control chars is very suspicious
+        // Real code rarely has CR/LF/ESC bytes mixed with printable ASCII
+        if (printableCount >= 2 && controlCount >= 1 && (printableCount + controlCount >= 3))
+          return true;
+      }
+    }
+
     // Pattern 1: Condition code 0xF with invalid encoding
     // Only PLD, BLX (immediate), and coprocessor instructions are valid
     if (cond == 0xF)
@@ -853,9 +954,8 @@ public:
 
     // === MEDIUM PATH: Simple operation enum checks ===
 
-    // RSC (Reverse Subtract with Carry) is extremely rare
-    if (instr.operation == ARMV5_RSC)
-      return true;
+    // Note: RSC is rare but valid - don't reject it outright
+    // It's used for multi-word arithmetic (e.g., 64-bit negation)
 
     // Pattern: Long multiply with unusual flags/registers
     if (instr.operation == ARMV5_UMULL || instr.operation == ARMV5_UMLAL ||
@@ -872,12 +972,10 @@ public:
           instr.operands[1].reg == instr.operands[3].reg)
         return true;
 
-      // Destination to LR or PC is very unusual
-      if (instr.operands[0].cls == REG &&
-          (instr.operands[0].reg == REG_LR || instr.operands[0].reg == REG_PC))
+      // Destination to PC is very unusual (LR is fine - often used as scratch after push)
+      if (instr.operands[0].cls == REG && instr.operands[0].reg == REG_PC)
         return true;
-      if (instr.operands[1].cls == REG &&
-          (instr.operands[1].reg == REG_LR || instr.operands[1].reg == REG_PC))
+      if (instr.operands[1].cls == REG && instr.operands[1].reg == REG_PC)
         return true;
 
       // Source from PC or SP is unusual
@@ -1009,13 +1107,6 @@ public:
     return false;
   }
 
-    /* Check for patterns that are likely data, not code */
-    uint32_t instrWord = ReadInstructionWord(data);
-    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
-    {
-      return false;
-    }
-
     SetInstructionInfoForInstruction(addr, instr, result);
     return true;
   }
@@ -1040,14 +1131,6 @@ public:
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
     if (instr.operation == ARMV5_UNDEFINED || instr.operation == ARMV5_UDF ||
         instr.operation == ARMV5_UNPREDICTABLE)
-    {
-      len = 4;
-      return false;
-    }
-
-    /* Check for patterns that are likely data, not code */
-    uint32_t instrWord = ReadInstructionWord(data);
-    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
     {
       len = 4;
       return false;
@@ -1373,15 +1456,6 @@ public:
     /* Return false for undefined/unpredictable instructions - matches ARMv7 pattern */
     if (instr.operation == ARMV5_UNDEFINED || instr.operation == ARMV5_UDF ||
         instr.operation == ARMV5_UNPREDICTABLE)
-    {
-      il.AddInstruction(il.Undefined());
-      len = 4;
-      return false;
-    }
-
-    /* Treat likely data as invalid instructions */
-    uint32_t instrWord = ReadInstructionWord(data);
-    if (instrWord != 0xE1A00000 && IsLikelyData(instrWord, instr))
     {
       il.AddInstruction(il.Undefined());
       len = 4;

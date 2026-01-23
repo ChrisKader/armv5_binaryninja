@@ -336,29 +336,33 @@ bool CallingConventionDetector::IsNoReturn(
 	if (instrCount == 0)
 		return false;
 
-	// Check last instruction for infinite loop patterns
-	LowLevelILInstruction lastInstr = il->GetInstruction(instrCount - 1);
+	// Be extremely conservative about marking functions as __noreturn
+	// Only mark if we have definitive evidence of no-return behavior
 
-	// Pattern: B . (branch to self)
-	if (lastInstr.operation == LLIL_GOTO)
-	{
-		// Would check if target equals current address
-	}
-
-	// Pattern: Function ends without RET
-	bool hasReturn = false;
+	// Pattern 1: Contains syscall (system calls typically don't return)
 	for (size_t i = 0; i < instrCount; ++i)
 	{
 		LowLevelILInstruction instr = il->GetInstruction(i);
-		if (instr.operation == LLIL_RET || instr.operation == LLIL_TAILCALL)
+		if (instr.operation == LLIL_SYSCALL)
 		{
-			hasReturn = true;
-			break;
+			return true;  // System calls like exit() don't return
 		}
 	}
 
-	// If function has no return and no tailcall, likely no-return
-	return !hasReturn && instrCount > 3;
+	// Pattern 2: Contains trap/exception (these don't return)
+	for (size_t i = 0; i < instrCount; ++i)
+	{
+		LowLevelILInstruction instr = il->GetInstruction(i);
+		if (instr.operation == LLIL_TRAP)
+		{
+			return true;  // Trap instructions don't return
+		}
+	}
+
+	// Don't mark functions as __noreturn just because analysis stopped early
+	// or because they don't have RET instructions yet. This prevents analysis
+	// from working properly for functions that do return but call other functions.
+	return false;
 }
 
 bool CallingConventionDetector::HasIRQEpilogue(LowLevelILFunction* il)

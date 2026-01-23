@@ -891,6 +891,12 @@ bool Armv5FirmwareView::Init()
 		Settings::Instance()->Set("triage.linearSweep", "none", this);
 	}
 
+	// Allow normal function analysis - the ARMv5 plugin controls function creation
+	// through the unified recognizer to prevent excessive auto-discovery
+
+	// ARMv5 views need string typing to be handled by the firmware scan workflow
+	// The analysis completion callbacks will handle this on background threads
+
 	// Standard ARM exception vector names and handler names
 	const char *vectorNames[] = {
 			"vec_reset",

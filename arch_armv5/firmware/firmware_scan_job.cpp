@@ -91,8 +91,13 @@
 #include "firmware_scan_job.h"
 #include "firmware_settings.h"
 #include "firmware_view.h"
-#include "common/armv5_utils.h"
+#include "firmware_internal.h"
 #include "analysis/rtos_detector.h"
+#include "analysis/function_recognizer.h"
+#include "analysis/string_detector.h"
+
+#include <binaryninjaapi.h>
+#include <binaryninjacore.h>
 
 #include <algorithm>
 #include <chrono>
@@ -299,13 +304,26 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
 		if (!arch)
 			return false;
-	const bool enforceExecutable = !view->GetSegments().empty();
-	const bool enforceCodeSemantics = !view->GetSections().empty();
+		
+		const bool enforceExecutable = !view->GetSegments().empty();
+		const bool enforceCodeSemantics = !view->GetSections().empty();
 
-		uint64_t checkAddr = addr;
 		const size_t align = arch->GetInstructionAlignment();
-		if (align > 1)
-			checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+		uint64_t checkAddr = addr & ~1ULL;  // Clear potential Thumb bit
+		
+		// Reject misaligned addresses
+		if (align == 4 && (checkAddr & 3))
+		{
+			if (verbose && logger)
+				logger->LogDebug("IsValidFunctionStart: rejected misaligned ARM address 0x%llx", (unsigned long long)addr);
+			return false;
+		}
+		if (align == 2 && (checkAddr & 1))
+		{
+			if (verbose && logger)
+				logger->LogDebug("IsValidFunctionStart: rejected misaligned Thumb address 0x%llx", (unsigned long long)addr);
+			return false;
+		}
 
 		if (!view->IsValidOffset(checkAddr))
 			return false;
@@ -319,25 +337,56 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		if (enforceExecutable && view->IsOffsetExecutable(checkAddr) == false)
 			return false;
 
-		DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
-		if (buf.GetLength() == 0)
+		/*
+		 * Validate multiple consecutive instructions.
+		 * A valid function should have multiple valid instructions in a row.
+		 * Checking just the first instruction isn't enough - data can accidentally
+		 * decode to a single valid instruction.
+		 */
+		constexpr size_t kMinValidInstructions = 3;
+		constexpr size_t kMaxBytesToCheck = 16;
+		
+		DataBuffer buf = view->ReadBuffer(checkAddr, kMaxBytesToCheck);
+		if (buf.GetLength() < 4)
 			return false;
-		if (buf.GetLength() >= 4)
+
+		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+		size_t offset = 0;
+		size_t validCount = 0;
+		
+		while (offset + 4 <= buf.GetLength() && validCount < kMinValidInstructions)
 		{
-			const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-			const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
-			const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
-			if ((allZero || allFF))
+			const uint8_t* instrBytes = bytes + offset;
+			const bool allZero = instrBytes[0] == 0 && instrBytes[1] == 0 && 
+			                     instrBytes[2] == 0 && instrBytes[3] == 0;
+			const bool allFF = instrBytes[0] == 0xFF && instrBytes[1] == 0xFF && 
+			                   instrBytes[2] == 0xFF && instrBytes[3] == 0xFF;
+			if (allZero || allFF)
 				return false;
+
+			InstructionInfo info;
+			if (!arch->GetInstructionInfo(instrBytes, checkAddr + offset, buf.GetLength() - offset, info))
+				return false;
+			
+			if (info.length == 0)
+				return false;
+
+			validCount++;
+			offset += info.length;
+			
+			/* Stop if we hit an unconditional branch/return - function might be short */
+			for (size_t i = 0; i < info.branchCount; i++)
+			{
+				if (info.branchType[i] == UnconditionalBranch ||
+				    info.branchType[i] == FunctionReturn)
+				{
+					if (validCount >= 1)
+						return true;
+				}
+			}
 		}
 
-		InstructionInfo info;
-		if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
-			return false;
-		if (info.length == 0)
-			return false;
-
-		return true;
+		return validCount >= kMinValidInstructions;
 	}
 
 	// Apply plan batches directly (called from workflow context, no main thread dispatch needed)
@@ -355,6 +404,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			Ref<Platform> targetPlat = platform;
 			if (baseArch)
 			{
+				// Only detect Thumb if bit 0 is explicitly set
 				Ref<Architecture> targetArch = baseArch->GetAssociatedArchitectureByAddress(addr);
 				if (targetArch && targetArch != baseArch)
 				{
@@ -439,6 +489,23 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			for (size_t j = i; j < end; ++j)
 			{
 				uint64_t addr = userAddrs[j];
+
+				// HARD BOUNDARY: Don't create functions in known data regions
+				uint64_t dataBoundary = fwSettings.codeDataBoundary;
+				if (dataBoundary == 0)
+				{
+					// Auto-detect: skip addresses that are very high in the binary
+					// Use a conservative heuristic - halfway point in the view
+					dataBoundary = view->GetStart() + (view->GetLength() / 2);
+				}
+				if (addr >= dataBoundary)
+				{
+					if (logger)
+						logger->LogDebug("Plan apply: Skipping user function at 0x%llx - in data region (>= 0x%llx)",
+							(unsigned long long)addr, (unsigned long long)dataBoundary);
+					continue;
+				}
+
 				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
 				if (!targetPlat)
 					targetPlat = platform;
@@ -446,17 +513,20 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					continue;
 				Ref<Function> func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
 				if (!func)
-					func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
-				if (!func)
 				{
-					// Fall back to analysis function creation if user creation fails.
-					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
-					if (logger)
-						logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
-							(unsigned long long)addr);
+					func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
+					if (!func)
+					{
+						// Fall back to analysis function creation if user creation fails.
+						view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+						if (logger)
+							logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
+								(unsigned long long)addr);
+					}
 				}
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			// Delay to prevent overwhelming the analysis system
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
 
 		vector<uint64_t> addrs = plan.addFunctions;
@@ -482,6 +552,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			}
 			addrs.swap(filtered);
 		}
+		// Use configured limit - ARMv7 handles thousands fine, issue must be ARMv5-specific
 		if (fwSettings.maxFunctionAdds > 0 && addrs.size() > fwSettings.maxFunctionAdds)
 		{
 			if (logger)
@@ -502,21 +573,32 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			for (size_t j = i; j < end; ++j)
 			{
 				uint64_t addr = addrs[j];
+
+				// HARD BOUNDARY: Don't create functions in known data regions
+				uint64_t dataBoundary = fwSettings.codeDataBoundary;
+				if (dataBoundary == 0)
+				{
+					// Auto-detect: skip addresses that are very high in the binary
+					// Use a conservative heuristic - halfway point in the view
+					dataBoundary = view->GetStart() + (view->GetLength() / 2);
+				}
+				if (addr >= dataBoundary)
+				{
+					if (logger)
+						logger->LogDebug("Plan apply: Skipping analysis function at 0x%llx - in data region (>= 0x%llx)",
+							(unsigned long long)addr, (unsigned long long)dataBoundary);
+					continue;
+				}
+
 				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
 				if (!targetPlat)
 					targetPlat = platform;
 				if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
 					continue;
+				// Create function with analysis initially disabled for UI stability
 				Ref<Function> func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
 				if (!func)
-					func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
-				if (!func)
-				{
 					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
-					if (logger)
-						logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
-							(unsigned long long)addr);
-				}
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
@@ -789,6 +871,93 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			return;
 		}
 
+		// =====================================================================
+		// UNIFIED RECOGNIZER PATH (when enabled)
+		// =====================================================================
+		// The unified FunctionRecognizer combines all detection heuristics into
+		// a single pass with configurable weights. When enabled, it replaces
+		// the legacy prologue/call/pointer/orphan scan functions.
+		//
+		// DARM APPROACH: When using the unified recognizer, we suppress BN's
+		// automatic function creation at call targets. This prevents false
+		// positives where BN creates functions at epilogue stubs (e.g., BX LR).
+		// Our recognizer explicitly validates each candidate before adding it.
+		if (fwSettings.useUnifiedRecognizer)
+		{
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+
+			UpdateTaskText(task, instanceId, "ARMv5 scans: running unified function recognizer");
+
+			timePass("Unified function recognizer", [&]() {
+				auto* recognizer = Armv5Analysis::GetRecognizerForView(view.GetPtr());
+				if (!recognizer)
+				{
+					if (logger)
+						logger->LogError("Failed to get FunctionRecognizer for view");
+					return;
+				}
+
+				// Apply preset (0=default, 1=aggressive, 2=conservative, 3=prologue, 4=calls)
+				switch (fwSettings.recognizerPreset)
+				{
+				case 1: recognizer->UseAggressiveSettings(); break;
+				case 2: recognizer->UseConservativeSettings(); break;
+				case 3: recognizer->UsePrologueOnlySettings(); break;
+				case 4: recognizer->UseCallTargetOnlySettings(); break;
+				default: recognizer->UseDefaultSettings(); break;
+				}
+
+				// Run recognition
+				auto result = recognizer->RunRecognition();
+
+				if (result.cancelled)
+				{
+					if (logger)
+						logger->LogInfo("Function recognition cancelled");
+					return;
+				}
+
+				if (!result.completed)
+				{
+					if (logger)
+						logger->LogError("Function recognition failed: %s", result.errorMessage.c_str());
+					return;
+				}
+
+				// Use lower threshold to match ARMv7's function discovery capability
+				// ARMv7 finds 2813 mostly valid functions, so ARMv5 should be able to find more
+				double minScore = std::min(0.15, fwSettings.recognizerMinScorePct / 100.0);  // 15% minimum
+
+				// Add candidates to the plan
+				auto candidateAddrs = recognizer->GetCandidateAddresses(result, minScore);
+				for (const auto& [addr, isThumb] : candidateAddrs)
+				{
+					plan.addFunctions.push_back(addr);
+					addedFunctions.insert(addr);
+				}
+
+				if (logger)
+				{
+					logger->LogInfo("Function recognizer found %zu candidates (min_score=%.2f): "
+						"%zu high, %zu med, %zu low confidence",
+						result.candidates.size(), minScore,
+						result.highConfidenceCount, result.mediumConfidenceCount,
+						result.lowConfidenceCount);
+				}
+			});
+
+			// Skip legacy scans when unified recognizer is enabled
+			goto after_legacy_scans;
+		}
+
+		// =====================================================================
+		// LEGACY SCAN PATH (prologue, call targets, pointer targets, orphan)
+		// =====================================================================
+
 		if (!refreshViewForPhase())
 		{
 			finishTask();
@@ -800,7 +969,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			timePass("Function prologue scan", [&]() {
 				ScanForFunctionPrologues(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultArchitecture(), thumbArch, view->GetDefaultPlatform(),
-					logger, fwSettings.enableVerboseLogging, tuning, &seededFunctions, &plan);
+					logger, fwSettings.enableVerboseLogging, tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
 			});
 		}
 
@@ -832,7 +1001,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			timePass("Call target scan", [&]() {
 				ScanForCallTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, &seededFunctions, &plan);
+					tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
 			});
 		}
 
@@ -852,7 +1021,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			timePass("Pointer target scan", [&]() {
 				ScanForPointerTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, &addedFunctions, &plan);
+					tuning, fwSettings.codeDataBoundary, &addedFunctions, &plan);
 			});
 		}
 
@@ -872,7 +1041,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			timePass("Orphan code block scan", [&]() {
 				ScanForOrphanCodeBlocks(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, fwSettings.orphanMinValidInstr, fwSettings.orphanMinBodyInstr,
+					tuning, fwSettings.codeDataBoundary, fwSettings.orphanMinValidInstr, fwSettings.orphanMinBodyInstr,
 					fwSettings.orphanMinSpacingBytes, fwSettings.orphanMaxPerPage,
 					fwSettings.orphanRequirePrologue, &addedFunctions, &plan);
 			});
@@ -893,40 +1062,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			});
 		}
 
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enableInvalidFunctionCleanup)
-		{
-			if (logger)
-				logger->LogInfo("Cleanup invalid functions: enabled (max_size=%u zero_refs=%d pc_write=%d)",
-					fwSettings.cleanupMaxSizeBytes,
-					fwSettings.cleanupRequireZeroRefs ? 1 : 0,
-					fwSettings.cleanupRequirePcWriteStart ? 1 : 0);
-			std::set<uint64_t> protectedStarts;
-			auto addProtected = [&](uint64_t addr) {
-				protectedStarts.insert(addr);
-				protectedStarts.insert(addr & ~1ULL); // cover Thumb-bit addresses
-			};
-			for (uint64_t addr : seededFunctions)
-				addProtected(addr);
-			for (uint64_t addr : seededUserFunctions)
-				addProtected(addr);
-			timePass("Cleanup invalid functions", [&]() {
-				CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
-					fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
-					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, &plan);
-			});
-		}
-		else if (logger)
-		{
-			const bool rawView = view && view->GetSegments().empty();
-			const char* reason = rawView ? " (raw view)" : " (enable cleanup with BN_ARMV5_FIRMWARE_ENABLE_CLEANUP)";
-			logger->LogInfo("Cleanup invalid functions: disabled%s", reason);
-		}
+		// Cleanup is now performed after plan application (see below after_legacy_scans)
+		// This allows it to catch functions created by BN's core analysis too
+
+	after_legacy_scans:  // Jump target for unified recognizer path
 
 		if (logger)
 		{
@@ -947,6 +1086,57 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 		WaitForAnalysisIdle(instanceId, view, task, logger);
 		auto afterFunctions = SnapshotFunctionStarts(view);
+		
+		// Run cleanup AFTER applying the plan and waiting for analysis
+		// This ensures we remove functions that BN created with invalid instructions
+		if (fwSettings.enableInvalidFunctionCleanup && !ScanCancelled(view))
+		{
+			if (logger)
+				logger->LogInfo("Cleanup invalid functions: running post-analysis cleanup (max_size=%u zero_refs=%d pc_write=%d)",
+					fwSettings.cleanupMaxSizeBytes,
+					fwSettings.cleanupRequireZeroRefs ? 1 : 0,
+					fwSettings.cleanupRequirePcWriteStart ? 1 : 0);
+			
+			std::set<uint64_t> protectedStarts;
+			auto addProtected = [&](uint64_t addr) {
+				protectedStarts.insert(addr);
+				protectedStarts.insert(addr & ~1ULL);
+			};
+			for (uint64_t addr : seededFunctions)
+				addProtected(addr);
+			for (uint64_t addr : seededUserFunctions)
+				addProtected(addr);
+			
+			// Run cleanup directly (not via plan) since plan was already applied
+			size_t removed = CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+				imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
+				fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
+				fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, nullptr);
+			
+			if (logger)
+				logger->LogInfo("Cleanup invalid functions: removed %zu functions", removed);
+			
+			// Update function snapshot after cleanup
+			WaitForAnalysisIdle(instanceId, view, task, logger);
+			afterFunctions = SnapshotFunctionStarts(view);
+
+			// Run an additional cleanup pass to catch late-added functions.
+			// Core analysis can still add functions after the first cleanup.
+			for (int pass = 0; pass < 2; ++pass)
+			{
+				if (ScanCancelled(view))
+					break;
+				size_t removedPass = CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
+					fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
+					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, nullptr);
+				if (logger)
+					logger->LogInfo("Cleanup invalid functions: pass %d removed %zu functions", pass + 2, removedPass);
+				if (removedPass == 0)
+					break;
+				WaitForAnalysisIdle(instanceId, view, task, logger);
+			}
+		}
 		LogFunctionDiff(logger, beforeFunctions, afterFunctions, fwSettings.enableVerboseLogging);
 		StoreFirmwareFunctionSnapshot(instanceId, afterFunctions);
 
@@ -970,6 +1160,628 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					armv5::RTOSDetector::ApplyTaskConventions(view.GetPtr(), rtosResult.tasks);
 					armv5::RTOSDetector::AnnotateTCBs(view.GetPtr(), rtosResult.tasks, rtosResult.type);
 				}
+			}
+		}
+
+		// DISABLED: ARMv5 custom string detection creates false positives
+		// Core Binary Ninja string analysis works correctly for ARMv5
+		// Just like it does for ARMv7
+		/*
+		if (!ScanCancelled(view))
+		{
+			UpdateTaskText(task, instanceId, "ARMv5 firmware scans: string detection");
+			Armv5Analysis::StringDetector stringDetector(view.GetPtr());
+			auto detectedStrings = stringDetector.Detect(Armv5Analysis::StringDetectionSettings{});
+
+			// Define detected strings in the BinaryView
+			for (const auto& str : detectedStrings)
+			{
+				// Check if a data variable already exists at this address
+				DataVariable existingVar;
+				bool hasExistingVar = view->GetDataVariableAtAddress(str.address, existingVar);
+
+				if (!hasExistingVar)
+				{
+					// Create string type (null-terminated array of chars)
+					auto stringType = Type::ArrayType(Type::IntegerType(1, true), str.length + 1); // +1 for null terminator
+					view->DefineDataVariable(str.address, stringType);
+				}
+
+				// Create a symbol for the string based on its category (only if no symbol exists)
+				if (!view->GetSymbolByAddress(str.address))
+				{
+					std::string symbolName;
+					switch (str.category) {
+					case Armv5Analysis::StringCategory::ErrorMessage: symbolName = "str_err_"; break;
+					case Armv5Analysis::StringCategory::DebugMessage: symbolName = "str_dbg_"; break;
+					case Armv5Analysis::StringCategory::FilePath: symbolName = "str_path_"; break;
+					case Armv5Analysis::StringCategory::URL: symbolName = "str_url_"; break;
+					case Armv5Analysis::StringCategory::Version: symbolName = "str_ver_"; break;
+					case Armv5Analysis::StringCategory::FormatString: symbolName = "str_fmt_"; break;
+					case Armv5Analysis::StringCategory::Command: symbolName = "str_cmd_"; break;
+					case Armv5Analysis::StringCategory::Identifier: symbolName = "str_id_"; break;
+					case Armv5Analysis::StringCategory::Crypto: symbolName = "str_crypto_"; break;
+					default: symbolName = "str_"; break;
+					}
+					symbolName += std::to_string(str.address);
+					view->DefineAutoSymbol(new Symbol(DataSymbol, symbolName, str.address, LocalBinding));
+				}
+			}
+
+			if (logger) {
+				logger->LogInfo("String detection: found %zu strings (%zu new, %zu unreferenced, %zu in code)",
+					stringDetector.GetStats().totalFound, stringDetector.GetStats().newStrings,
+					stringDetector.GetStats().unreferenced, stringDetector.GetStats().inLiteralPools);
+			}
+		}
+		*/
+
+		// Analysis is not suppressed - functions are analyzed normally
+
+		// Post-analysis cleanup: DISABLED - causing crashes
+		// TODO: Investigate thread safety issues with PostAnalysisCleanup
+		/*
+		if (!ScanCancelled(view))
+		{
+			UpdateTaskText(task, instanceId, "ARMv5 firmware scans: post-analysis cleanup");
+			PostAnalysisCleanup(view, logger);
+		}
+		*/
+
+		// Ensure string references are properly typed as data variables
+		// Core string analysis creates string references but may not create typed data variables
+		if (!ScanCancelled(view))
+		{
+			auto strings = view->GetStrings();
+
+			// Also scan for null-terminated strings that Binary Ninja missed
+			std::vector<BNStringReference> additionalStrings;
+			const size_t scanChunkSize = 1024 * 1024; // 1MB chunks
+			uint64_t startAddr = view->GetStart();
+			uint64_t endAddr = view->GetEnd();
+
+			if (logger)
+			{
+				logger->LogInfo("Scanning address range 0x%llx - 0x%llx for additional strings", startAddr, endAddr);
+			}
+
+			for (uint64_t addr = startAddr; addr < endAddr; addr += scanChunkSize)
+			{
+				if (ScanCancelled(view))
+					break;
+
+				uint64_t chunkEnd = std::min(addr + scanChunkSize, endAddr);
+				DataBuffer buffer = view->ReadBuffer(addr, chunkEnd - addr);
+				if (buffer.GetLength() == 0)
+					continue;
+
+				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
+				size_t length = buffer.GetLength();
+
+				// Scan for null-terminated ASCII/UTF-8 strings
+				for (size_t i = 0; i < length; )
+				{
+					// Skip null bytes
+					if (data[i] == 0x00)
+					{
+						i++;
+						continue;
+					}
+
+					// Start at printable character or specific allowed non-printable
+					uint8_t firstByte = data[i];
+					bool validStart = (firstByte >= 0x20 && firstByte <= 0x7E) || // Printable ASCII
+					                 (firstByte == 0x1B) || // ESC for ANSI sequences
+					                 (firstByte == 0x0A) || // \n (LF)
+					                 (firstByte == 0x0D);   // \r (CR)
+
+					if (!validStart)
+					{
+						i++;
+						continue;
+					}
+
+					size_t start = i;
+
+					// Find null terminator
+					while (i < length && data[i] != 0x00)
+						i++;
+
+					if (i >= length)
+						break; // No null terminator found
+
+					size_t strLen = i - start;
+					i++; // Skip the null terminator
+
+					// Validate the string
+					if (strLen >= 2 && strLen <= 256) // Reasonable length limits
+					{
+						size_t printableCount = 0;
+						size_t alphaNumCount = 0;
+						bool hasConsecutiveNonPrintable = false;
+						size_t consecutiveNonPrintable = 0;
+
+						for (size_t j = 0; j < strLen; ++j)
+						{
+							uint8_t c = data[start + j];
+							bool isPrintable = (c >= 0x20 && c <= 0x7E);
+
+							// Count printable characters (space to ~)
+							if (isPrintable)
+							{
+								printableCount++;
+								consecutiveNonPrintable = 0; // Reset consecutive counter
+							}
+							else
+							{
+								consecutiveNonPrintable++;
+								if (consecutiveNonPrintable >= 2)
+									hasConsecutiveNonPrintable = true;
+							}
+
+							// Count alphanumeric characters
+							if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+								alphaNumCount++;
+						}
+
+						// Accept strings with good printable and alphanumeric ratios
+						double printableRatio = static_cast<double>(printableCount) / strLen;
+						double alphaNumRatio = static_cast<double>(alphaNumCount) / strLen;
+
+						// Special case: allow ANSI escape sequences (start with ESC, may have some non-printable)
+						bool isAnsiSequence = (strLen >= 3 && data[start] == 0x1B && data[start + 1] == 0x5B);
+
+						// Require high quality: most characters printable, some alphanumeric, no consecutive non-printable
+						if ((printableRatio >= 0.8 && alphaNumRatio >= 0.4 && !hasConsecutiveNonPrintable) ||
+							(isAnsiSequence && printableRatio >= 0.6))
+						{
+							// Check if this string is already detected by Binary Ninja
+							bool alreadyDetected = false;
+							for (const auto& existing : strings)
+							{
+								if (existing.start == addr + start && existing.length == strLen)
+								{
+									alreadyDetected = true;
+									break;
+								}
+							}
+
+							if (!alreadyDetected)
+							{
+								// Check if this looks like UTF-16 (alternating printable/null or null/printable)
+								bool looksLikeUtf16 = false;
+								if (strLen >= 4 && (strLen % 2) == 0) // Must be even length for UTF-16
+								{
+									bool pattern1 = true; // printable + null + printable + null + ...
+									bool pattern2 = true; // null + printable + null + printable + ...
+
+									for (size_t j = 0; j < strLen; j += 2)
+									{
+										uint8_t c1 = data[start + j];
+										uint8_t c2 = data[start + j + 1];
+
+										// Pattern 1: printable, null
+										if (!(c1 >= 0x20 && c1 <= 0x7E && c2 == 0x00))
+											pattern1 = false;
+
+										// Pattern 2: null, printable
+										if (!(c1 == 0x00 && c2 >= 0x20 && c2 <= 0x7E))
+											pattern2 = false;
+
+										if (!pattern1 && !pattern2)
+											break;
+									}
+
+									if (pattern1 || pattern2)
+									{
+										looksLikeUtf16 = true;
+									}
+								}
+
+								BNStringReference newStr;
+								newStr.start = addr + start;
+								newStr.length = strLen;
+								newStr.type = looksLikeUtf16 ? Utf16String : AsciiString;
+								additionalStrings.push_back(newStr);
+
+								if (logger)
+								{
+									logger->LogInfo("Found additional %s string at 0x%llx: length=%zu (printable=%.1f%%, alpha=%.1f%%)",
+										looksLikeUtf16 ? "UTF-16" : "ASCII", newStr.start, newStr.length, printableRatio * 100, alphaNumRatio * 100);
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Create individual string pointer variables for pointers that point to strings
+			std::set<uint64_t> stringAddresses;
+			for (const auto& str : strings)
+			{
+				stringAddresses.insert(str.start);
+			}
+			for (const auto& str : additionalStrings)
+			{
+				stringAddresses.insert(str.start);
+			}
+
+			// Scan for individual pointers that reference our strings
+			for (uint64_t addr = startAddr; addr < endAddr; addr += 4) // 4-byte aligned
+			{
+				if (ScanCancelled(view))
+					break;
+
+				DataBuffer entryBuffer = view->ReadBuffer(addr, 4);
+				if (entryBuffer.GetLength() < 4)
+					continue;
+
+				const uint8_t* entryData = static_cast<const uint8_t*>(entryBuffer.GetData());
+				uint64_t pointedAddr = entryData[0] | (entryData[1] << 8) | (entryData[2] << 16) | (entryData[3] << 24);
+
+				// Check if this points to a known string
+				if (stringAddresses.find(pointedAddr) != stringAddresses.end())
+				{
+					// This is a pointer to a string - create a char* variable
+					Ref<Type> stringPtrType = Type::PointerType(4, Type::IntegerType(1, true)); // char*
+
+					// Ensure the pointed-to string is properly typed first
+					DataVariable stringVar;
+					if (!view->GetDataVariableAtAddress(pointedAddr, stringVar))
+					{
+						// Find the string in our lists to get its type
+						bool found = false;
+						for (const auto& str : strings)
+						{
+							if (str.start == pointedAddr)
+							{
+								// Create appropriate array type for the string
+								Ref<Type> elementType;
+								size_t elementSize;
+								if (str.type == Utf16String)
+								{
+									elementType = Type::IntegerType(2, false); // uint16_t
+									elementSize = 2;
+								}
+								else
+								{
+									elementType = Type::IntegerType(1, true); // char
+									elementSize = 1;
+								}
+								size_t arrayLength = (str.length + elementSize - 1) / elementSize;
+								Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
+								view->DefineUserDataVariable(pointedAddr, stringType);
+								found = true;
+								break;
+							}
+						}
+						if (!found)
+						{
+							for (const auto& str : additionalStrings)
+							{
+								if (str.start == pointedAddr)
+								{
+									// Create appropriate array type for the string
+									Ref<Type> elementType;
+									size_t elementSize;
+									if (str.type == Utf16String)
+									{
+										elementType = Type::IntegerType(2, false); // uint16_t
+										elementSize = 2;
+									}
+									else
+									{
+										elementType = Type::IntegerType(1, true); // char
+										elementSize = 1;
+									}
+									size_t arrayLength = (str.length + elementSize - 1) / elementSize;
+									Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
+									view->DefineUserDataVariable(pointedAddr, stringType);
+									found = true;
+									break;
+								}
+							}
+						}
+					}
+
+					// Create the pointer variable if not already typed
+					DataVariable existingVar;
+					if (!view->GetDataVariableAtAddress(addr, existingVar))
+					{
+						view->DefineUserDataVariable(addr, stringPtrType);
+
+						if (logger)
+						{
+							logger->LogInfo("Created string pointer at 0x%llx -> 0x%llx", addr, pointedAddr);
+						}
+					}
+				}
+			}
+
+			// Add detected strings to the list
+			strings.insert(strings.end(), additionalStrings.begin(), additionalStrings.end());
+
+			size_t typed = 0;
+			size_t skipped = 0;
+
+			for (const auto& str : strings)
+			{
+				// Debug: log specific addresses we're interested in
+				if (str.start == 0x11280020 || str.start == 0x11280027 || str.start == 0x11280033 ||
+					str.start == 0x11280074 || str.start == 0x112800b3)
+				{
+					logger->LogInfo("Processing string at 0x%llx (length %zu)", str.start, str.length);
+				}
+
+				// Additional validation to filter out obviously invalid strings
+				if (str.length < 2)
+				{
+					skipped++;
+					continue; // Too short
+				}
+
+				// Read the actual string data to validate it (including potential null terminator)
+				DataBuffer buffer = view->ReadBuffer(str.start, str.length + 1);
+				if (buffer.GetLength() <= str.length)
+				{
+					skipped++;
+					continue; // Can't read the extra byte for null termination check
+				}
+
+				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
+				size_t printable = 0;
+				size_t alphaNum = 0;
+				size_t totalChars = 0;
+
+				// Count printable and alphanumeric characters
+				for (size_t i = 0; i < str.length; )
+				{
+					uint8_t c = data[i];
+
+					// Handle different encodings
+					if (str.type == Utf16String && i + 1 < str.length)
+					{
+						// UTF-16: check if it's a valid character (skip null bytes)
+						uint16_t wc = data[i] | (data[i + 1] << 8);
+						if (wc == 0) break; // Null terminator
+
+						// Count as printable if it's a reasonable Unicode character
+						if (wc >= 0x20 && wc < 0x7F)
+						{
+							printable++;
+							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
+								(wc >= '0' && wc <= '9'))
+							{
+								alphaNum++;
+							}
+						}
+						else if (wc >= 0x80 && wc <= 0xFFFD) // Extended Unicode range
+						{
+							printable++; // Accept extended characters
+						}
+						totalChars++;
+						i += 2;
+					}
+					else if (str.type == Utf32String && i + 3 < str.length)
+					{
+						// UTF-32: similar logic
+						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+						if (wc == 0) break;
+
+						if ((wc >= 0x20 && wc <= 0x7F) || (wc >= 0x80 && wc <= 0x10FFFF))
+						{
+							printable++;
+							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
+								(wc >= '0' && wc <= '9'))
+							{
+								alphaNum++;
+							}
+						}
+						totalChars++;
+						i += 4;
+					}
+					else
+					{
+						// ASCII/UTF-8
+						if (c == 0) break; // Null terminator
+						if (c >= 0x20 && c <= 0x7E)
+						{
+							printable++;
+							if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+								(c >= '0' && c <= '9'))
+							{
+								alphaNum++;
+							}
+						}
+						else if (c >= 0x80 && str.type == Utf8String)
+						{
+							printable++; // Accept UTF-8 multi-byte sequences
+						}
+						totalChars++;
+						i++;
+					}
+				}
+
+				if (totalChars == 0)
+				{
+					skipped++;
+					continue; // No valid characters
+				}
+
+				// Require at least 50% printable characters and 20% alphanumeric
+				double printableRatio = static_cast<double>(printable) / totalChars;
+				double alphaNumRatio = static_cast<double>(alphaNum) / totalChars;
+
+				if (printableRatio < 0.5 || alphaNumRatio < 0.2)
+				{
+					skipped++;
+					continue; // Not enough valid characters
+				}
+
+				// Require at least one alphanumeric sequence of 2+ characters
+				bool hasWord = false;
+				int consecutiveAlphaNum = 0;
+				for (size_t i = 0; i < str.length && !hasWord; )
+				{
+					uint8_t c = data[i];
+					if (str.type == Utf16String && i + 1 < str.length)
+					{
+						uint16_t wc = data[i] | (data[i + 1] << 8);
+						if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
+							(wc >= '0' && wc <= '9'))
+						{
+							consecutiveAlphaNum++;
+							if (consecutiveAlphaNum >= 2) hasWord = true;
+						}
+						else
+						{
+							consecutiveAlphaNum = 0;
+						}
+						i += 2;
+					}
+					else if (str.type == Utf32String && i + 3 < str.length)
+					{
+						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+						if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
+							(wc >= '0' && wc <= '9'))
+						{
+							consecutiveAlphaNum++;
+							if (consecutiveAlphaNum >= 2) hasWord = true;
+						}
+						else
+						{
+							consecutiveAlphaNum = 0;
+						}
+						i += 4;
+					}
+					else
+					{
+						if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+							(c >= '0' && c <= '9'))
+						{
+							consecutiveAlphaNum++;
+							if (consecutiveAlphaNum >= 2) hasWord = true;
+						}
+						else
+						{
+							consecutiveAlphaNum = 0;
+						}
+						i++;
+					}
+				}
+
+				if (!hasWord)
+				{
+					skipped++;
+					continue; // No word-like sequences
+				}
+
+				// Determine element size for null termination check
+				size_t elementSize = 1;
+				switch (str.type)
+				{
+				case AsciiString:
+				case Utf8String:
+					elementSize = 1;
+					break;
+				case Utf16String:
+					elementSize = 2;
+					break;
+				case Utf32String:
+					elementSize = 4;
+					break;
+				default:
+					elementSize = 1;
+					break;
+				}
+
+				// All strings that pass our validation must be null terminated
+				// If we're checking for printable characters, we expect proper string formatting
+
+				// Check for proper null termination (look 1 byte past the detected string length)
+				bool isNullTerminated = false;
+				size_t nullTerminatorSize = 1;
+				switch (str.type)
+				{
+				case AsciiString:
+				case Utf8String:
+					nullTerminatorSize = 1;
+					break;
+				case Utf16String:
+					nullTerminatorSize = 2;
+					break;
+				case Utf32String:
+					nullTerminatorSize = 4;
+					break;
+				default:
+					nullTerminatorSize = 1;
+					break;
+				}
+
+				if (buffer.GetLength() >= str.length + nullTerminatorSize)
+				{
+					switch (str.type)
+					{
+					case AsciiString:
+					case Utf8String:
+						isNullTerminated = (data[str.length] == 0x00);
+						break;
+					case Utf16String:
+						isNullTerminated = (data[str.length] == 0x00 && data[str.length + 1] == 0x00);
+						break;
+					case Utf32String:
+						isNullTerminated = (data[str.length] == 0x00 && data[str.length + 1] == 0x00 &&
+										   data[str.length + 2] == 0x00 && data[str.length + 3] == 0x00);
+						break;
+					default:
+						isNullTerminated = (data[str.length] == 0x00);
+						break;
+					}
+				}
+
+				if (!isNullTerminated)
+				{
+					skipped++;
+					continue; // Not properly null-terminated
+				}
+
+				// String passed validation - now type it
+				// Create a string array type with the correct encoding
+				Ref<Type> elementType;
+				switch (str.type)
+				{
+				case AsciiString:
+				case Utf8String:
+					elementType = Type::IntegerType(1, true);  // char (signed 8-bit)
+					break;
+				case Utf16String:
+					elementType = Type::IntegerType(2, false); // uint16_t (unsigned 16-bit)
+					break;
+				case Utf32String:
+					elementType = Type::IntegerType(4, false); // uint32_t (unsigned 32-bit)
+					break;
+				default:
+					elementType = Type::IntegerType(1, true);  // Default to char
+					break;
+				}
+
+				// Calculate array length (include null terminator)
+				size_t arrayLength = (str.length + elementSize - 1) / elementSize + 1;
+				Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
+
+				// Use DefineUserDataVariable to ensure our string typing takes precedence
+				// This will override any existing auto-detected types
+				view->DefineUserDataVariable(str.start, stringType);
+				typed++;
+			}
+
+			if (logger)
+			{
+				logger->LogInfo("String validation: %zu total strings detected", strings.size());
+				if (typed > 0)
+					logger->LogInfo("Typed %zu string data variables", typed);
+				if (skipped > 0)
+					logger->LogInfo("Skipped %zu invalid string candidates", skipped);
 			}
 		}
 
@@ -1013,6 +1825,248 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 	view = nullptr;
 }
 
+}
+
+// Re-enable analysis for important functions that have analysis suppressed
+void ReEnableAnalysisForImportantFunctions(const Ref<BinaryView>& view, const Ref<Logger>& logger)
+{
+	if (!view || !view->GetObject())
+		return;
+
+	// Get seeded functions from ARMv5 view
+	auto* fwView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
+	std::set<uint64_t> seededFunctions;
+	if (fwView)
+	{
+		auto seeded = fwView->GetSeededFunctions();
+		auto seededUser = fwView->GetSeededUserFunctions();
+		seededFunctions.insert(seeded.begin(), seeded.end());
+		seededFunctions.insert(seededUser.begin(), seededUser.end());
+
+		if (logger)
+		{
+			logger->LogInfo("Found %zu seeded functions, %zu seeded user functions",
+				seeded.size(), seededUser.size());
+		}
+	}
+	else
+	{
+		if (logger)
+			logger->LogError("Failed to cast view to Armv5FirmwareView for seeded functions");
+	}
+
+	size_t reenabledCount = 0;
+	size_t totalFunctions = 0;
+	size_t seededCount = 0;
+
+	// Re-enable analysis for important functions
+	auto funcList = view->GetAnalysisFunctionList();
+	totalFunctions = funcList.size();
+
+	for (auto& func : funcList)
+	{
+		if (!func)
+			continue;
+
+		uint64_t addr = func->GetStart();
+		bool shouldAnalyze = false;
+
+		// Only analyze seeded functions (created by ARMv5 plugin) for UI stability
+		// Complex functions stay disabled to prevent UI overload
+		if (seededFunctions.find(addr) != seededFunctions.end())
+		{
+			shouldAnalyze = true;
+			seededCount++;
+		}
+
+		if (shouldAnalyze && func->GetAnalysisSkipOverride() != BNFunctionAnalysisSkipOverride::NeverSkipFunctionAnalysis)
+		{
+			func->SetAnalysisSkipOverride(BNFunctionAnalysisSkipOverride::NeverSkipFunctionAnalysis);
+			reenabledCount++;
+
+			if (logger && reenabledCount <= 10)  // Log first 10 to avoid spam
+				logger->LogDebug("Re-enabled analysis for seeded function at 0x%llx", (unsigned long long)addr);
+		}
+	}
+
+	if (logger)
+		logger->LogInfo("Processed %zu total functions, found %zu seeded functions, re-enabled analysis for %zu",
+			totalFunctions, seededCount, reenabledCount);
+}
+
+// Re-enable analysis for functions that have analysis suppressed
+void ReEnableAnalysisForSuppressedFunctions(const Ref<BinaryView>& view, const Ref<Logger>& logger)
+{
+	if (!view || !view->GetObject())
+		return;
+
+	size_t reenabledCount = 0;
+
+	// Find all functions that have suppressed analysis and re-enable them
+	for (auto& func : view->GetAnalysisFunctionList())
+	{
+		if (!func)
+			continue;
+
+		uint64_t addr = func->GetStart();
+
+		// Check if analysis is suppressed for this function
+		if (func->GetAnalysisSkipOverride() != BNFunctionAnalysisSkipOverride::NeverSkipFunctionAnalysis)
+		{
+			func->SetAnalysisSkipOverride(BNFunctionAnalysisSkipOverride::NeverSkipFunctionAnalysis);
+			reenabledCount++;
+
+			if (logger)
+				logger->LogDebug("Re-enabled analysis for function at 0x%llx", (unsigned long long)addr);
+		}
+	}
+
+	if (logger && reenabledCount > 0)
+		logger->LogInfo("Re-enabled analysis for %zu suppressed functions", reenabledCount);
+}
+
+// Post-analysis cleanup to fix incomplete function analysis caused by
+// incorrectly marked __noreturn functions
+void PostAnalysisCleanup(const Ref<BinaryView>& view, const Ref<Logger>& logger)
+{
+	if (!view || !view->GetObject())
+		return;
+
+	// Wait for any pending analysis to complete
+	WaitForAnalysisIdle(0, view, nullptr, logger);
+
+	std::set<uint64_t> funcsNeedingReanalysis;
+
+	// Method 1: Find functions that call __noreturn functions but themselves have return paths
+	for (auto& func : view->GetAnalysisFunctionList())
+	{
+		if (!func)
+			continue;
+
+		bool hasNoreturnCall = false;
+		bool hasReturnPath = false;
+
+		// Check if function has any basic blocks
+		auto blocks = func->GetBasicBlocks();
+		if (blocks.empty())
+			continue;
+
+		// Check if function has a return path (any block can exit)
+		for (auto& block : blocks)
+		{
+			if (block->CanExit())
+			{
+				hasReturnPath = true;
+				break;
+			}
+		}
+
+		if (!hasReturnPath)
+			continue; // Function doesn't return anyway, skip
+
+		// Check for calls to functions marked as __noreturn
+		// Get the called addresses from this function
+		auto callSites = func->GetCallSites();
+		for (auto& callSite : callSites)
+		{
+			auto targetFuncs = view->GetAnalysisFunctionsForAddress(callSite.addr);
+			for (auto& targetFunc : targetFuncs)
+			{
+				if (targetFunc && !targetFunc->CanReturn().GetValue())
+				{
+					hasNoreturnCall = true;
+					break;
+				}
+			}
+			if (hasNoreturnCall)
+				break;
+		}
+
+		// If function calls __noreturn but has return path, it needs re-analysis
+		if (hasNoreturnCall && hasReturnPath)
+		{
+			funcsNeedingReanalysis.insert(func->GetStart());
+			if (logger)
+				logger->LogInfo("PostAnalysisCleanup: function 0x%llx calls __noreturn but has return path (%zu blocks) - needs re-analysis",
+					(unsigned long long)func->GetStart(), blocks.size());
+		}
+	}
+
+	// Method 2: Find functions with unreachable code after their analyzed end
+	for (auto& func : view->GetAnalysisFunctionList())
+	{
+		if (!func || func->GetBasicBlocks().empty())
+			continue;
+
+		uint64_t funcEnd = func->GetHighestAddress();
+		uint64_t funcStart = func->GetStart();
+
+		// Check if there's valid code after the function's analyzed end
+		// Look for instruction sequences that could be continuation of the function
+		const uint64_t checkDistance = 64; // Check up to 64 bytes after function end
+		uint64_t checkAddr = funcEnd;
+
+		for (uint64_t offset = 0; offset < checkDistance && checkAddr < view->GetEnd(); offset += 4, checkAddr += 4)
+		{
+			// Skip if this address is already part of another function
+			if (view->GetAnalysisFunctionsForAddress(checkAddr).size() > 0)
+				break;
+
+			// Check if this looks like valid ARM code
+			DataBuffer data = view->ReadBuffer(checkAddr, 4);
+			if (data.GetLength() < 4)
+				break;
+
+			uint32_t instr = 0;
+			memcpy(&instr, data.GetData(), 4);
+			if (view->GetDefaultEndianness() == BigEndian)
+				instr = Swap32(instr);
+
+			// Quick heuristic: check if it looks like a valid ARM instruction
+			// (not all zeros, not undefined, not obviously data)
+			if (instr == 0 || instr == 0xFFFFFFFF)
+				continue;
+
+			// Check if this could be reached from the function (basic connectivity check)
+			bool couldBeConnected = false;
+			for (auto& block : func->GetBasicBlocks())
+			{
+				if (block->CanExit() && block->GetEnd() <= checkAddr && checkAddr - block->GetEnd() <= 16)
+				{
+					couldBeConnected = true;
+					break;
+				}
+			}
+
+			if (couldBeConnected)
+			{
+				if (logger)
+					logger->LogInfo("PostAnalysisCleanup: found potentially unreachable code at 0x%llx after function 0x%llx (ends at 0x%llx)",
+						(unsigned long long)checkAddr, (unsigned long long)funcStart, (unsigned long long)funcEnd);
+				funcsNeedingReanalysis.insert(funcStart);
+				break;
+			}
+		}
+	}
+
+	// Force re-analysis of functions that may have incomplete analysis
+	for (uint64_t addr : funcsNeedingReanalysis)
+	{
+		auto funcs = view->GetAnalysisFunctionsForAddress(addr);
+		for (auto& func : funcs)
+		{
+			if (func)
+			{
+				func->Reanalyze(BNFunctionUpdateType::FullAutoFunctionUpdate);
+				if (logger)
+					logger->LogInfo("PostAnalysisCleanup: reanalyzing function at 0x%llx", (unsigned long long)addr);
+			}
+		}
+	}
+
+	// Wait for re-analysis to complete
+	if (!funcsNeedingReanalysis.empty())
+		WaitForAnalysisIdle(0, view, nullptr, logger);
 }
 
 void BinaryNinja::ScheduleArmv5FirmwareScanJob(Ref<BinaryView> view)

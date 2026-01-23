@@ -1019,7 +1019,6 @@ bool LiftLoadStore(Architecture *arch, LowLevelILFunction &il,
 
     if (isLoad)
     {
-
         ExprId value;
         if (signExtend)
         {
@@ -1034,7 +1033,65 @@ bool LiftLoadStore(Architecture *arch, LowLevelILFunction &il,
             value = il.Load(size, address);
         }
 
-        ConditionExecuteSetRegisterOrBranch(il, instr.cond, instr.operands[0].reg, value, 0);
+        /*
+         * Special case: LDR PC, [rx] preceded by MOV LR, PC is an indirect call.
+         * 
+         * The pattern:
+         *   mov lr, pc      ; Save return address (PC+8)
+         *   ldr pc, [rx]    ; Jump to [rx] - execution returns to next instr
+         *
+         * If we detect this, emit Call instead of Jump so analysis continues
+         * past the ldr pc instruction.
+         */
+        bool isIndirectCall = false;
+        if (instr.operands[0].reg == REG_PC && !thumb && addr >= 4)
+        {
+            Ref<Function> func = il.GetFunction();
+            if (func)
+            {
+                Ref<BinaryView> view = func->GetView();
+                if (view)
+                {
+                    DataBuffer prevData = view->ReadBuffer(addr - 4, 4);
+                    if (prevData.GetLength() == 4)
+                    {
+                        Instruction prevInstr{};
+                        uint32_t bigEndian = (arch->GetEndianness() == BigEndian) ? 1 : 0;
+                        if (armv5_decompose(*(uint32_t *)prevData.GetData(), &prevInstr,
+                                            (uint32_t)(addr - 4), bigEndian) == 0)
+                        {
+                            bool movLrPc =
+                                (prevInstr.operation == ARMV5_MOV) &&
+                                (prevInstr.operands[0].cls == REG) &&
+                                (prevInstr.operands[0].reg == REG_LR) &&
+                                (prevInstr.operands[1].cls == REG) &&
+                                (prevInstr.operands[1].reg == REG_PC);
+
+                            bool addLrPcImm =
+                                (prevInstr.operation == ARMV5_ADD) &&
+                                (prevInstr.operands[0].cls == REG) &&
+                                (prevInstr.operands[0].reg == REG_LR) &&
+                                (prevInstr.operands[1].cls == REG) &&
+                                (prevInstr.operands[1].reg == REG_PC) &&
+                                (prevInstr.operands[2].cls == IMM);
+
+                            if (movLrPc || addLrPcImm)
+                                isIndirectCall = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isIndirectCall)
+        {
+            /* Emit as indirect call - execution continues after */
+            ConditionExecute(il, instr.cond, il.Call(value));
+        }
+        else
+        {
+            ConditionExecuteSetRegisterOrBranch(il, instr.cond, instr.operands[0].reg, value, 0);
+        }
     }
     else
     {

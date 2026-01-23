@@ -11,6 +11,7 @@
 #include "settings/plugin_settings.h"
 
 #include <cstdint>
+#include <string>
 
 enum class FirmwareSettingsMode
 {
@@ -54,6 +55,11 @@ namespace FirmwareSettingNames
 	constexpr const char* kCleanupInvalidMaxSize = "cleanupInvalidMaxSize";
 	constexpr const char* kCleanupInvalidRequireZeroRefs = "cleanupInvalidRequireZeroRefs";
 	constexpr const char* kCleanupInvalidRequirePcWrite = "cleanupInvalidRequirePcWrite";
+	// Unified FunctionRecognizer settings
+	constexpr const char* kUseUnifiedRecognizer = "useUnifiedRecognizer";
+	constexpr const char* kRecognizerMinScore = "recognizerMinScore";
+	constexpr const char* kRecognizerPreset = "recognizerPreset";  // "default", "aggressive", "conservative"
+	constexpr const char* kCodeDataBoundary = "codeDataBoundary";  // 0 = auto-detect, else specific address
 }
 
 // Get the firmware settings component (registers if not already registered)
@@ -83,6 +89,11 @@ struct FirmwareSettings
 	bool orphanRequirePrologue;
 	uint32_t maxFunctionAdds;
 	FirmwareScanTuning tuning;
+	// Unified recognizer settings
+	bool useUnifiedRecognizer;       // Use FunctionRecognizer instead of legacy scans
+	uint32_t recognizerMinScorePct;  // Minimum confidence score percentage (0-100)
+	uint32_t recognizerPreset;       // 0=default, 1=aggressive, 2=conservative, 3=prologue, 4=calls
+	uint64_t codeDataBoundary;       // 0 = auto-detect code boundary, else specific address
 };
 
 FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode);
