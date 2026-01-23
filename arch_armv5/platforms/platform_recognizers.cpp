@@ -119,7 +119,7 @@ static int ParseArmAttributesCpuArch(BinaryView* view)
       return -1;
 
     /* Parse subsections */
-    while (pos + 4 < len)
+    while (pos + 4 <= len)  /* Need 4 bytes for length field */
     {
       /* Subsection length (always little-endian in attributes) */
       uint32_t subLen = data[pos] | (data[pos+1] << 8) | (data[pos+2] << 16) | (data[pos+3] << 24);
@@ -148,7 +148,7 @@ static int ParseArmAttributesCpuArch(BinaryView* view)
       }
 
       /* Parse sub-subsections within aeabi */
-      while (pos + 5 < subEnd)
+      while (pos + 5 <= subEnd)  /* Need at least 1 byte tag + 4 bytes size */
       {
         uint8_t tag = data[pos++];
 
@@ -271,7 +271,7 @@ static Ref<Platform> ElfArmv5PlatformRecognize(BinaryView* view, Metadata* metad
      * Also claim older architectures (pre-v4, v4, v4T) since ARMv5 is a superset.
      * ARMv6+ (values 6-14) should fall through to ARMv7.
      */
-    if (cpuArch <= 5)
+    if (cpuArch >= 0 && cpuArch <= 5)
     {
       const char* archNames[] = {"Pre-v4", "ARMv4", "ARMv4T", "ARMv5T", "ARMv5TE", "ARMv5TEJ"};
       LogInfo("ELF .ARM.attributes Tag_CPU_arch=%d (%s): using armv5 architecture",

@@ -407,6 +407,8 @@ static void ValidateFunctionDetection(BinaryView* view)
 	Ref<Logger> logger = GetCommandLogger();
 
 	// Prompt for IDC file
+	// Note: There's an inherent TOCTOU window between file selection and open.
+	// This is acceptable here since it's user-initiated and content is validated.
 	std::string idcPath;
 	if (!BinaryNinja::GetOpenFileNameInput(idcPath, "Select IDC file with known functions", "*.idc"))
 		return;
@@ -420,6 +422,18 @@ static void ValidateFunctionDetection(BinaryView* view)
 	{
 		if (logger)
 			logger->LogError("Failed to open IDC file: %s", idcPath.c_str());
+		return;
+	}
+
+	// Basic size limit to prevent DoS from maliciously large files
+	idcFile.seekg(0, std::ios::end);
+	auto fileSize = idcFile.tellg();
+	idcFile.seekg(0, std::ios::beg);
+	constexpr std::streamoff kMaxIdcFileSize = 100 * 1024 * 1024;  // 100 MB limit
+	if (fileSize < 0 || fileSize > kMaxIdcFileSize)
+	{
+		if (logger)
+			logger->LogError("IDC file too large or unreadable: %s", idcPath.c_str());
 		return;
 	}
 

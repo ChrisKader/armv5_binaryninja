@@ -44,14 +44,13 @@
 
 #include "binaryninjaapi.h"
 #include "firmware_scan_types.h"
-#include "armv5_disasm/armv5.h"
 #include "common/armv5_utils.h"
 
 #include <cstdint>
 #include <cstring>
 #include <set>
 #include <vector>
-#include <algorithm>
+// Note: <algorithm> moved to .cpp files that need it (firmware_scans.cpp, etc.)
 
 /*
  * NOTE: Swap32 and ReadU32At have been moved to common/armv5_utils.h

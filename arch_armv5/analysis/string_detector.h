@@ -15,7 +15,7 @@
 #include <vector>
 #include <string>
 #include <set>
-#include <regex>
+// Note: <regex> moved to string_detector.cpp to reduce header weight
 
 namespace Armv5Analysis
 {

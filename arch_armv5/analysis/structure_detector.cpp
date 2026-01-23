@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <cstring>
 
+// Safety check: ensure maxElements * 4 won't overflow size_t
+// Default maxElements is 1000, so 1000 * 4 = 4000 bytes (well within range)
+static_assert(1000ULL * 4 <= SIZE_MAX, "maxElements * 4 could overflow size_t");
+
 using namespace BinaryNinja;
 
 namespace

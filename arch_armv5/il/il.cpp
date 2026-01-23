@@ -1240,7 +1240,7 @@ bool LiftLoadStoreMultiple(Architecture *arch, LowLevelILFunction &il,
     bool writeback = false;
 
     int operandCount = GetOperandCount(instr);
-    for (int i = 0; i < operandCount; i++)
+    for (int i = 0; i < operandCount && i < MAX_OPERANDS; i++)
     {
         if (instr.operands[i].cls == REG_LIST)
         {
@@ -2619,7 +2619,7 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
                                                il.Const(4, regCount * regSize))));
 
         /* Store registers */
-        for (int i = 0; i < regCount && instr.operands[i].cls == REG; i++)
+        for (int i = 0; i < regCount && i < MAX_OPERANDS && instr.operands[i].cls == REG; i++)
         {
             Register vfpReg = instr.operands[i].reg;
             ExprId storeAddr = il.Add(4,
@@ -2644,7 +2644,7 @@ bool GetLowLevelILForArmInstruction(Architecture *arch, uint64_t addr,
         size_t regSize = get_register_size(firstVfpReg);
 
         /* Load registers */
-        for (int i = 0; i < regCount && instr.operands[i].cls == REG; i++)
+        for (int i = 0; i < regCount && i < MAX_OPERANDS && instr.operands[i].cls == REG; i++)
         {
             Register vfpReg = instr.operands[i].reg;
             ExprId loadAddr = il.Add(4,
