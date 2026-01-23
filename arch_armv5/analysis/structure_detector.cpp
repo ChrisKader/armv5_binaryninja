@@ -4,8 +4,20 @@
 
 #include "structure_detector.h"
 #include <algorithm>
+#include <cstring>
 
 using namespace BinaryNinja;
+
+namespace
+{
+// Safe unaligned read for uint32_t - avoids undefined behavior on strict alignment architectures
+inline uint32_t ReadU32Unaligned(const void* data)
+{
+	uint32_t value;
+	std::memcpy(&value, data, sizeof(value));
+	return value;
+}
+}
 
 namespace Armv5Analysis
 {
@@ -180,7 +192,7 @@ void StructureDetector::scanForVtables(const StructureDetectionSettings& setting
 				continue;
 			}
 			
-			uint32_t value = *reinterpret_cast<const uint32_t*>(buf.GetData());
+			uint32_t value = ReadU32Unaligned(buf.GetData());
 			
 			if (!isCodePointer(value))
 			{
@@ -201,7 +213,7 @@ void StructureDetector::scanForVtables(const StructureDetectionSettings& setting
 				if (buf.GetLength() < 4)
 					break;
 				
-				uint32_t ptr = *reinterpret_cast<const uint32_t*>(buf.GetData());
+				uint32_t ptr = ReadU32Unaligned(buf.GetData());
 				
 				if (!isCodePointer(ptr))
 					break;
@@ -306,7 +318,7 @@ void StructureDetector::scanForJumpTables(const StructureDetectionSettings& sett
 				continue;
 			}
 			
-			uint32_t value = *reinterpret_cast<const uint32_t*>(buf.GetData());
+			uint32_t value = ReadU32Unaligned(buf.GetData());
 			
 			// Check if it's a code pointer within this segment
 			if (value < seg->GetStart() || value >= seg->GetEnd())
@@ -328,7 +340,7 @@ void StructureDetector::scanForJumpTables(const StructureDetectionSettings& sett
 				if (buf.GetLength() < 4)
 					break;
 				
-				uint32_t ptr = *reinterpret_cast<const uint32_t*>(buf.GetData());
+				uint32_t ptr = ReadU32Unaligned(buf.GetData());
 				
 				// Must be within same segment and look like code
 				if (ptr < seg->GetStart() || ptr >= seg->GetEnd())
@@ -401,7 +413,7 @@ void StructureDetector::scanForFunctionTables(const StructureDetectionSettings& 
 				continue;
 			}
 			
-			uint32_t value = *reinterpret_cast<const uint32_t*>(buf.GetData());
+			uint32_t value = ReadU32Unaligned(buf.GetData());
 			
 			// Could be null (unused handler slot) or code pointer
 			if (value != 0 && !isCodePointer(value))
@@ -424,7 +436,7 @@ void StructureDetector::scanForFunctionTables(const StructureDetectionSettings& 
 				if (buf.GetLength() < 4)
 					break;
 				
-				uint32_t ptr = *reinterpret_cast<const uint32_t*>(buf.GetData());
+				uint32_t ptr = ReadU32Unaligned(buf.GetData());
 				
 				if (ptr == 0)
 				{
@@ -526,7 +538,7 @@ void StructureDetector::scanForPointerArrays(const StructureDetectionSettings& s
 				continue;
 			}
 			
-			uint32_t value = *reinterpret_cast<const uint32_t*>(buf.GetData());
+			uint32_t value = ReadU32Unaligned(buf.GetData());
 			
 			if (!isDataPointer(value))
 			{
@@ -548,7 +560,7 @@ void StructureDetector::scanForPointerArrays(const StructureDetectionSettings& s
 				if (buf.GetLength() < 4)
 					break;
 				
-				uint32_t ptr = *reinterpret_cast<const uint32_t*>(buf.GetData());
+				uint32_t ptr = ReadU32Unaligned(buf.GetData());
 				
 				if (!isDataPointer(ptr))
 					break;
@@ -648,7 +660,7 @@ void StructureDetector::scanForIntegerArrays(const StructureDetectionSettings& s
 				continue;
 			}
 			
-			uint32_t value = *reinterpret_cast<const uint32_t*>(buf.GetData());
+			uint32_t value = ReadU32Unaligned(buf.GetData());
 			
 			// Skip if it looks like a pointer
 			if (isValidPointer(value))
@@ -679,7 +691,7 @@ void StructureDetector::scanForIntegerArrays(const StructureDetectionSettings& s
 				if (buf.GetLength() < 4)
 					break;
 				
-				uint32_t v = *reinterpret_cast<const uint32_t*>(buf.GetData());
+				uint32_t v = ReadU32Unaligned(buf.GetData());
 				
 				// Skip pointers
 				if (isValidPointer(v))

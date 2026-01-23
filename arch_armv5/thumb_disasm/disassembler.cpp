@@ -115,28 +115,32 @@ int thumb_decompose(struct decomp_request *info, struct decomp_result *result)
 			result->format = &result->formats[0];
 		}
 		else {
-			printf("major error! no format in decomposition result\n");
+			fprintf(stderr, "ERROR: no format in decomposition result\n");
 			rc = STATUS_UNDEFINED;
 		}
 	}
 
 	#ifdef DEBUG_DISASM
+	/*
+	 * WARNING: Debug code - do not enable DEBUG_DISASM in release builds.
+	 * This outputs verbose debugging information to stderr.
+	 */
 	if(getenv("DEBUG_DISASM")) {
-		printf("decomp_result status:\n");
-		if(result->status & STATUS_OK) printf("  OK\n");
-		if(result->status & STATUS_NO_BIT_MATCH) printf("  NO_BIT_MATCH\n");
-		if(result->status & STATUS_ARCH_UNSUPPORTED) printf("  ARCH_UNSUPPORTED\n");
-		if(result->status & STATUS_UNDEFINED) printf("  UNDEFINED\n");
+		fprintf(stderr, "decomp_result status:\n");
+		if(result->status & STATUS_OK) fprintf(stderr, "  OK\n");
+		if(result->status & STATUS_NO_BIT_MATCH) fprintf(stderr, "  NO_BIT_MATCH\n");
+		if(result->status & STATUS_ARCH_UNSUPPORTED) fprintf(stderr, "  ARCH_UNSUPPORTED\n");
+		if(result->status & STATUS_UNDEFINED) fprintf(stderr, "  UNDEFINED\n");
 
-		printf("decomp_result flags:\n");
-		if(result->flags & FLAG_UNPREDICTABLE) printf("  UNPREDICTABLE\n");
-		if(result->flags & FLAG_NOTPERMITTED) printf("  NOTPERMITTED\n");
+		fprintf(stderr, "decomp_result flags:\n");
+		if(result->flags & FLAG_UNPREDICTABLE) fprintf(stderr, "  UNPREDICTABLE\n");
+		if(result->flags & FLAG_NOTPERMITTED) fprintf(stderr, "  NOTPERMITTED\n");
 
-		printf("address mode: %d\n", result->addrMode);
-		if(result->addrMode == ADDRMODE_OFFSET) printf("  OFFSET\n");
-		if(result->addrMode == ADDRMODE_PREINDEX) printf("  PREINDEX\n");
-		if(result->addrMode == ADDRMODE_POSTINDEX) printf("  POSTINDEX\n");
-		if(result->addrMode == ADDRMODE_UNSPECIFIED) printf("  UNSPECIFIED\n");
+		fprintf(stderr, "address mode: %d\n", result->addrMode);
+		if(result->addrMode == ADDRMODE_OFFSET) fprintf(stderr, "  OFFSET\n");
+		if(result->addrMode == ADDRMODE_PREINDEX) fprintf(stderr, "  PREINDEX\n");
+		if(result->addrMode == ADDRMODE_POSTINDEX) fprintf(stderr, "  POSTINDEX\n");
+		if(result->addrMode == ADDRMODE_UNSPECIFIED) fprintf(stderr, "  UNSPECIFIED\n");
 	}
 	#endif
 
@@ -167,7 +171,7 @@ const char* get_thumb_condition_name(uint32_t cond)
 	if (cond >= 0x10) {
 			#ifdef DEBUG_DISASM
 			if(getenv("DEBUG_DISASM")) {
-					cout << "ERROR: invalid condition code " << cond << endl;
+					fprintf(stderr, "ERROR: invalid condition code %u\n", cond);
 			}
 			#endif
 			return "";
@@ -197,7 +201,7 @@ bool thumb_has_writeback(struct decomp_result* result)
        	else {
 #ifdef DEBUG_DISASM
             if(getenv("DEBUG_DISASM")) {
-                printf("ERROR: don't know how to deal with {!} field\n");
+                fprintf(stderr, "ERROR: don't know how to deal with {!} field\n");
             }
 #endif
             return false;

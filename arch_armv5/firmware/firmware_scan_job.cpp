@@ -100,6 +100,7 @@
 #include <binaryninjacore.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <set>
 #include <thread>
@@ -110,9 +111,25 @@ using namespace std;
 /* Forward declaration for mutex defined in firmware_view.cpp */
 extern std::mutex FirmwareViewMutex;
 
+/*
+ * Track active scan threads for shutdown coordination.
+ * Allows waiting for all scans to complete before plugin unload.
+ */
+static std::atomic<int> g_activeScanCount{0};
+
 namespace
 {
 	static constexpr uint64_t kMaxBufferedLength = 64ULL * 1024 * 1024;
+
+/* RAII guard for tracking active scan threads */
+class ScanThreadGuard
+{
+public:
+	ScanThreadGuard() { g_activeScanCount.fetch_add(1, std::memory_order_relaxed); }
+	~ScanThreadGuard() { g_activeScanCount.fetch_sub(1, std::memory_order_relaxed); }
+	ScanThreadGuard(const ScanThreadGuard&) = delete;
+	ScanThreadGuard& operator=(const ScanThreadGuard&) = delete;
+};
 
 static void UpdateTaskText(const Ref<BackgroundTask>& task, uint64_t instanceId, const char* text)
 {
@@ -190,26 +207,37 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 	const auto start = chrono::steady_clock::now();
 	constexpr auto kSleep = chrono::milliseconds(100);
 	constexpr auto kLogInterval = chrono::seconds(5);
-		auto nextLog = start + kLogInterval;
+	constexpr auto kMaxWait = chrono::minutes(30);  // Maximum wait timeout
+	auto nextLog = start + kLogInterval;
 	UpdateTaskText(task, instanceId, "ARMv5 firmware scans: waiting for analysis to idle");
-		while (true)
+	while (true)
+	{
+		if (ShouldCancel(instanceId, view, task))
+			return false;
+
+		// Check for maximum wait timeout
+		auto elapsed = chrono::steady_clock::now() - start;
+		if (elapsed > kMaxWait)
 		{
-			if (ShouldCancel(instanceId, view, task))
-				return false;
-			BNAnalysisState state = view->GetAnalysisInfo().state;
-			if (state == IdleState || state == HoldState)
-				break;
-			auto now = chrono::steady_clock::now();
-			if (logger && now >= nextLog)
-			{
-				logger->LogInfo("Firmware workflow scan: waiting for analysis to idle");
-				nextLog = now + kLogInterval;
-			}
-			this_thread::sleep_for(kSleep);
+			if (logger)
+				logger->LogWarn("Firmware workflow scan: timed out waiting for analysis to idle after 30 minutes");
+			return false;
 		}
-	UpdateTaskText(task, instanceId, "ARMv5 firmware scans: running");
-		return true;
+
+		BNAnalysisState state = view->GetAnalysisInfo().state;
+		if (state == IdleState || state == HoldState)
+			break;
+		auto now = chrono::steady_clock::now();
+		if (logger && now >= nextLog)
+		{
+			logger->LogInfo("Firmware workflow scan: waiting for analysis to idle");
+			nextLog = now + kLogInterval;
+		}
+		this_thread::sleep_for(kSleep);
 	}
+	UpdateTaskText(task, instanceId, "ARMv5 firmware scans: running");
+	return true;
+}
 
 	// Simple cancellation check for synchronous workflow execution
 	bool ScanCancelled(const Ref<BinaryView>& view)
@@ -677,6 +705,9 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 	void RunFirmwareScanJob(Ref<BinaryView> view, Ref<BackgroundTask> task, uint64_t instanceId)
 	{
+		// Track this thread for shutdown coordination
+		ScanThreadGuard threadGuard;
+
 		// Ensure task is finished before thread exits, even during shutdown
 		// BackgroundTasks MUST be finished or cancelled, otherwise they persist
 		auto ensureTaskFinished = [&task]() {
@@ -1866,4 +1897,23 @@ void BinaryNinja::CancelArmv5FirmwareScanJob(uint64_t viewId, bool allowRelease)
 {
 	SetFirmwareViewScanCancelled(viewId, true);
 	(void)allowRelease;
+}
+
+int BinaryNinja::GetActiveArmv5ScanCount()
+{
+	return g_activeScanCount.load(std::memory_order_relaxed);
+}
+
+bool BinaryNinja::WaitForArmv5ScansToComplete(uint32_t timeoutMs)
+{
+	auto start = std::chrono::steady_clock::now();
+	auto timeout = std::chrono::milliseconds(timeoutMs);
+
+	while (g_activeScanCount.load(std::memory_order_relaxed) > 0)
+	{
+		if (std::chrono::steady_clock::now() - start > timeout)
+			return false;  // Timed out
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	return true;  // All scans completed
 }

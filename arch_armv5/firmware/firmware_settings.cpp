@@ -493,7 +493,4 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 		"Address where code ends and data begins. 0 = auto-detect based on prologue locations. "
 		"Set to a specific address to manually define the boundary for binaries where automatic detection fails.");
 
-	fw->RegisterNumber(settings, kRecognizerPreset, 0, 0, 4,
-		"Recognizer preset",
-		"Preset configuration: 0=default, 1=aggressive, 2=conservative, 3=prologue-only, 4=call-targets-only.");
 }

@@ -155,6 +155,13 @@ std::shared_ptr<SettingsComponent> GetComponent(const std::string& name)
 
 void InitPluginSettings()
 {
+	// Guard against double registration (can happen if both core and UI plugins
+	// are loaded and both compile this source file)
+	static bool s_initialized = false;
+	if (s_initialized)
+		return;
+	s_initialized = true;
+
 	// Force singleton initialization to parse env vars early
 	(void)PluginConfig::Get();
 
@@ -184,42 +191,61 @@ void RegisterAnalysisSettings()
 	// Settings are prefixed with "analysis.armv5." for our plugin
 
 	// Calling convention detection
-	settings->RegisterSetting("analysis.armv5.autoDetectCallingConvention",
-		R"({
-			"title": "ARMv5: Auto-Detect Calling Conventions",
-			"type": "boolean",
-			"default": true,
-			"description": "Automatically detect and apply calling conventions based on function patterns. Detects IRQ handlers, task entry functions, and leaf functions."
-		})");
+	if (!settings->Contains("analysis.armv5.autoDetectCallingConvention"))
+	{
+		settings->RegisterSetting("analysis.armv5.autoDetectCallingConvention",
+			R"({
+				"title": "ARMv5: Auto-Detect Calling Conventions",
+				"type": "boolean",
+				"default": true,
+				"description": "Automatically detect and apply calling conventions based on function patterns. Detects IRQ handlers, task entry functions, and leaf functions."
+			})");
+	}
 
 	// Signature recovery
-	settings->RegisterSetting("analysis.armv5.recoverSignatures",
-		R"({
-			"title": "ARMv5: Recover Function Signatures",
-			"type": "boolean",
-			"default": true,
-			"description": "Automatically recover function signatures by analyzing register usage patterns. Infers parameter count and types from r0-r3 reads."
-		})");
+	if (!settings->Contains("analysis.armv5.recoverSignatures"))
+	{
+		settings->RegisterSetting("analysis.armv5.recoverSignatures",
+			R"({
+				"title": "ARMv5: Recover Function Signatures",
+				"type": "boolean",
+				"default": true,
+				"description": "Automatically recover function signatures by analyzing register usage patterns. Infers parameter count and types from r0-r3 reads."
+			})");
+	}
 
 	// RTOS detection
-	settings->RegisterSetting("analysis.armv5.detectRTOS",
-		R"({
-			"title": "ARMv5: Detect RTOS",
-			"type": "boolean",
-			"default": true,
-			"description": "Detect common RTOS (FreeRTOS, ThreadX, Nucleus PLUS, Nucleus SE, uC/OS-II) and apply appropriate type definitions."
-		})");
+	if (!settings->Contains("analysis.armv5.detectRTOS"))
+	{
+		settings->RegisterSetting("analysis.armv5.detectRTOS",
+			R"({
+				"title": "ARMv5: Detect RTOS",
+				"type": "boolean",
+				"default": true,
+				"description": "Detect common RTOS (FreeRTOS, ThreadX, Nucleus PLUS, Nucleus SE, uC/OS-II) and apply appropriate type definitions."
+			})");
+	}
 
 	// Minimum confidence threshold
-	settings->RegisterSetting("analysis.armv5.minConfidence",
-		R"({
-			"title": "ARMv5: Minimum Analysis Confidence",
-			"type": "number",
-			"default": 128,
-			"minValue": 0,
-			"maxValue": 255,
-			"description": "Minimum confidence level (0-255) required to apply detected calling conventions or signatures. Higher values are more conservative."
-		})");
+	if (!settings->Contains("analysis.armv5.minConfidence"))
+	{
+		settings->RegisterSetting("analysis.armv5.minConfidence",
+			R"({
+				"title": "ARMv5: Minimum Analysis Confidence",
+				"type": "number",
+				"default": 128,
+				"minValue": 0,
+				"maxValue": 255,
+				"description": "Minimum confidence level (0-255) required to apply detected calling conventions or signatures. Higher values are more conservative."
+			})");
+	}
+}
+
+// Helper to register a setting only if not already registered
+static void RegisterSettingIfNew(const Ref<Settings>& settings, const char* key, const char* json)
+{
+	if (!settings->Contains(key))
+		settings->RegisterSetting(key, json);
 }
 
 /*
@@ -239,29 +265,30 @@ void RegisterGlobalFirmwareSettings()
 
 	// Register the armv5 group (Binary Ninja groups are simple identifiers without dots)
 	// The settings use "armv5.firmware.*" keys but the group is just "armv5"
+	// Note: RegisterGroup is idempotent in Binary Ninja, so no need to check
 	settings->RegisterGroup("armv5", "ARMv5 Firmware Analysis");
 
 	// --- Scan Toggles ---
 
-	settings->RegisterSetting("armv5.firmware.scanPrologues",
+	RegisterSettingIfNew(settings, "armv5.firmware.scanPrologues",
 		"{\"title\": \"Scan for Function Prologues\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Discover additional function entry points by scanning for common prologue patterns (PUSH, STMFD, etc.).\"}");
 
-	settings->RegisterSetting("armv5.firmware.scanCallTargets",
+	RegisterSettingIfNew(settings, "armv5.firmware.scanCallTargets",
 		"{\"title\": \"Scan for Call Targets\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Discover additional function entry points from direct call and indirect branch targets.\"}");
 
-	settings->RegisterSetting("armv5.firmware.scanPointerTargets",
+	RegisterSettingIfNew(settings, "armv5.firmware.scanPointerTargets",
 		"{\"title\": \"Scan for Pointer Targets\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Discover function entry points referenced by data pointers.\"}");
 
-	settings->RegisterSetting("armv5.firmware.scanOrphanCode",
+	RegisterSettingIfNew(settings, "armv5.firmware.scanOrphanCode",
 		"{\"title\": \"Scan for Orphan Code Blocks\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
@@ -269,7 +296,7 @@ void RegisterGlobalFirmwareSettings()
 
 	// --- Orphan Scan Tuning ---
 
-	settings->RegisterSetting("armv5.firmware.orphanMinValidInstr",
+	RegisterSettingIfNew(settings, "armv5.firmware.orphanMinValidInstr",
 		"{\"title\": \"Orphan Scan: Min Valid Instructions\", "
 		"\"type\": \"number\", "
 		"\"default\": 6, "
@@ -277,7 +304,7 @@ void RegisterGlobalFirmwareSettings()
 		"\"maxValue\": 16, "
 		"\"description\": \"Minimum consecutive valid ARM instructions required for an orphan code candidate.\"}");
 
-	settings->RegisterSetting("armv5.firmware.orphanMinBodyInstr",
+	RegisterSettingIfNew(settings, "armv5.firmware.orphanMinBodyInstr",
 		"{\"title\": \"Orphan Scan: Min Body Instructions\", "
 		"\"type\": \"number\", "
 		"\"default\": 2, "
@@ -285,7 +312,7 @@ void RegisterGlobalFirmwareSettings()
 		"\"maxValue\": 16, "
 		"\"description\": \"Minimum valid instructions after the candidate prologue when validating orphan code.\"}");
 
-	settings->RegisterSetting("armv5.firmware.orphanMinSpacingBytes",
+	RegisterSettingIfNew(settings, "armv5.firmware.orphanMinSpacingBytes",
 		"{\"title\": \"Orphan Scan: Min Spacing (bytes)\", "
 		"\"type\": \"number\", "
 		"\"default\": 128, "
@@ -293,7 +320,7 @@ void RegisterGlobalFirmwareSettings()
 		"\"maxValue\": 4096, "
 		"\"description\": \"Minimum spacing between orphan functions added during the post-analysis scan.\"}");
 
-	settings->RegisterSetting("armv5.firmware.orphanMaxPerPage",
+	RegisterSettingIfNew(settings, "armv5.firmware.orphanMaxPerPage",
 		"{\"title\": \"Orphan Scan: Max Per 4KB Page\", "
 		"\"type\": \"number\", "
 		"\"default\": 6, "
@@ -301,7 +328,7 @@ void RegisterGlobalFirmwareSettings()
 		"\"maxValue\": 64, "
 		"\"description\": \"Maximum orphan functions to add per 4KB page (0 disables the cap).\"}");
 
-	settings->RegisterSetting("armv5.firmware.orphanRequirePrologue",
+	RegisterSettingIfNew(settings, "armv5.firmware.orphanRequirePrologue",
 		"{\"title\": \"Orphan Scan: Require Prologue\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
@@ -309,7 +336,7 @@ void RegisterGlobalFirmwareSettings()
 
 	// --- Limits ---
 
-	settings->RegisterSetting("armv5.firmware.maxFunctionAdds",
+	RegisterSettingIfNew(settings, "armv5.firmware.maxFunctionAdds",
 		"{\"title\": \"Max Function Additions Per Scan\", "
 		"\"type\": \"number\", "
 		"\"default\": 2000, "
@@ -319,13 +346,13 @@ void RegisterGlobalFirmwareSettings()
 
 	// --- Cleanup ---
 
-	settings->RegisterSetting("armv5.firmware.cleanupInvalidFunctions",
+	RegisterSettingIfNew(settings, "armv5.firmware.cleanupInvalidFunctions",
 		"{\"title\": \"Cleanup Invalid Functions\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Remove tiny auto-discovered functions that fail ARMv5 validation checks after analysis.\"}");
 
-	settings->RegisterSetting("armv5.firmware.cleanupMaxSize",
+	RegisterSettingIfNew(settings, "armv5.firmware.cleanupMaxSize",
 		"{\"title\": \"Cleanup: Max Function Size (bytes)\", "
 		"\"type\": \"number\", "
 		"\"default\": 8, "
@@ -335,37 +362,37 @@ void RegisterGlobalFirmwareSettings()
 
 	// --- Advanced ---
 
-	settings->RegisterSetting("armv5.firmware.typeLiteralPools",
+	RegisterSettingIfNew(settings, "armv5.firmware.typeLiteralPools",
 		"{\"title\": \"Type Literal Pool Entries\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Define literal pool entries as data to avoid disassembling them as code.\"}");
 
-	settings->RegisterSetting("armv5.firmware.clearAutoDataOnCodeRefs",
+	RegisterSettingIfNew(settings, "armv5.firmware.clearAutoDataOnCodeRefs",
 		"{\"title\": \"Clear Auto Data on Code References\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Undefine auto-discovered data at code-referenced addresses when nearby bytes decode as valid instructions.\"}");
 
-	settings->RegisterSetting("armv5.firmware.disablePointerSweep",
+	RegisterSettingIfNew(settings, "armv5.firmware.disablePointerSweep",
 		"{\"title\": \"Disable Core Pointer Sweep\", "
 		"\"type\": \"boolean\", "
 		"\"default\": false, "
 		"\"description\": \"Disable Binary Ninja's core pointer sweep to reduce false positives in raw firmware blobs.\"}");
 
-	settings->RegisterSetting("armv5.firmware.disableLinearSweep",
+	RegisterSettingIfNew(settings, "armv5.firmware.disableLinearSweep",
 		"{\"title\": \"Disable Core Linear Sweep\", "
 		"\"type\": \"boolean\", "
 		"\"default\": false, "
 		"\"description\": \"Disable Binary Ninja's core linear sweep so firmware scans drive function discovery.\"}");
 
-	settings->RegisterSetting("armv5.firmware.verboseLogging",
+	RegisterSettingIfNew(settings, "armv5.firmware.verboseLogging",
 		"{\"title\": \"Verbose Firmware Analysis Logging\", "
 		"\"type\": \"boolean\", "
 		"\"default\": true, "
 		"\"description\": \"Emit per-pass summary logs for firmware analysis heuristics without enabling global debug logging.\"}");
 
-	settings->RegisterSetting("armv5.firmware.skipFirmwareScans",
+	RegisterSettingIfNew(settings, "armv5.firmware.skipFirmwareScans",
 		"{\"title\": \"Skip Firmware Scans\", "
 		"\"type\": \"boolean\", "
 		"\"default\": false, "

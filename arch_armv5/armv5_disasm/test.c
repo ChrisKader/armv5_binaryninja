@@ -45,8 +45,16 @@ int test_file(const char *filename)
 	fseek(f, 0, SEEK_SET);
 
 	uint8_t *data = malloc(size);
-	fread(data, 1, size, f);
+	if (!data) {
+		fprintf(stderr, "Failed to allocate %ld bytes\n", size);
+		fclose(f);
+		return 1;
+	}
+	size_t bytes_read = fread(data, 1, size, f);
 	fclose(f);
+	if (bytes_read != (size_t)size) {
+		fprintf(stderr, "Warning: only read %zu of %ld bytes\n", bytes_read, size);
+	}
 
 	for (long off = 0; off + 4 <= size; off += 4) {
 		uint32_t insword = *(uint32_t *)(data + off);

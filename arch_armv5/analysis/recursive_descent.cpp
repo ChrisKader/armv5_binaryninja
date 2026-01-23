@@ -434,6 +434,13 @@ bool RecursiveDescentAnalyzer::isExecutable(uint64_t address) const
 
 bool RecursiveDescentAnalyzer::isInsideKnownFunction(uint64_t address) const
 {
+	// TODO: Performance optimization - this is O(n) for each call.
+	// For large binaries with many functions, consider using an interval tree
+	// data structure for O(log n) range queries. This would require:
+	// 1. Building the interval tree once from m_results and BN functions
+	// 2. Invalidating/updating when new functions are discovered
+	// See: https://en.wikipedia.org/wiki/Interval_tree
+
 	// Check against results
 	for (const auto& [entryAddr, func] : m_results)
 	{

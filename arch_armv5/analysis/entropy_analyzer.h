@@ -80,6 +80,7 @@ public:
 	static const char* RegionTypeToString(EntropyRegionType type);
 
 private:
+	void calculateMetrics(const uint8_t* data, size_t len, double& entropy, double& uniformity);
 	double calculateBlockEntropy(const uint8_t* data, size_t len);
 	double calculateUniformity(const uint8_t* data, size_t len);
 	EntropyRegionType classifyRegion(double entropy, double uniformity, uint64_t addr);

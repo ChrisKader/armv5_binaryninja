@@ -11,6 +11,22 @@ using namespace BinaryNinja;
 namespace Armv5Analysis
 {
 
+// Entropy classification thresholds
+namespace EntropyThresholds
+{
+	constexpr double kZeroPadding = 0.5;          // Below this = zero padding
+	constexpr double kSparseData = 2.0;           // Below this = sparse data
+	constexpr double kTextLow = 2.0;              // Text/strings lower bound
+	constexpr double kTextHigh = 4.5;             // Text/strings upper bound
+	constexpr double kCodeLow = 4.0;              // Code lower bound
+	constexpr double kCodeHigh = 6.5;             // Code upper bound
+	constexpr double kCompressed = 7.0;           // Above this = compressed
+	constexpr double kRandomData = 7.5;           // Above this with uniformity = random
+	constexpr double kEncrypted = 7.8;            // Above this with high uniformity = encrypted
+	constexpr double kRandomUniformity = 0.8;     // Uniformity threshold for random
+	constexpr double kEncryptedUniformity = 0.9;  // Uniformity threshold for encrypted
+}
+
 EntropyAnalyzer::EntropyAnalyzer(BinaryView* view) : m_view(view) {}
 
 const char* EntropyAnalyzer::RegionTypeToString(EntropyRegionType type)
@@ -29,66 +45,68 @@ const char* EntropyAnalyzer::RegionTypeToString(EntropyRegionType type)
 	}
 }
 
-double EntropyAnalyzer::calculateBlockEntropy(const uint8_t* data, size_t len)
+void EntropyAnalyzer::calculateMetrics(const uint8_t* data, size_t len, double& entropy, double& uniformity)
 {
-	if (len == 0) return 0.0;
-	
-	// Count byte frequencies
+	entropy = 0.0;
+	uniformity = 0.0;
+
+	if (len == 0) return;
+
+	// Count byte frequencies (single pass)
 	size_t freq[256] = {0};
 	for (size_t i = 0; i < len; i++)
 		freq[data[i]]++;
-	
-	// Calculate Shannon entropy
-	double entropy = 0.0;
+
+	// Calculate Shannon entropy and uniformity in a single loop
+	double expectedFreq = static_cast<double>(len) / 256.0;
+	double variance = 0.0;
+
 	for (int i = 0; i < 256; i++)
 	{
+		// Entropy calculation
 		if (freq[i] > 0)
 		{
 			double p = static_cast<double>(freq[i]) / len;
 			entropy -= p * log2(p);
 		}
+
+		// Variance for uniformity
+		double diff = freq[i] - expectedFreq;
+		variance += diff * diff;
 	}
-	
+
+	// Uniformity: how close to uniform random distribution
+	// High uniformity = random/encrypted data
+	// Low uniformity = structured data
+	double maxVariance = len * len / 256.0;  // Maximum possible variance
+	uniformity = 1.0 - (variance / maxVariance);
+}
+
+double EntropyAnalyzer::calculateBlockEntropy(const uint8_t* data, size_t len)
+{
+	double entropy, uniformity;
+	calculateMetrics(data, len, entropy, uniformity);
 	return entropy;  // Range: 0.0 - 8.0 bits per byte
 }
 
 double EntropyAnalyzer::calculateUniformity(const uint8_t* data, size_t len)
 {
-	if (len == 0) return 0.0;
-	
-	// Count byte frequencies
-	size_t freq[256] = {0};
-	for (size_t i = 0; i < len; i++)
-		freq[data[i]]++;
-	
-	// Count unique values and check distribution
-	size_t uniqueCount = 0;
-	double expectedFreq = static_cast<double>(len) / 256.0;
-	double variance = 0.0;
-	
-	for (int i = 0; i < 256; i++)
-	{
-		if (freq[i] > 0) uniqueCount++;
-		double diff = freq[i] - expectedFreq;
-		variance += diff * diff;
-	}
-	
-	// Uniformity: how close to uniform random distribution
-	// High uniformity = random/encrypted data
-	// Low uniformity = structured data
-	double maxVariance = len * len / 256.0;  // Maximum possible variance
-	return 1.0 - (variance / maxVariance);
+	double entropy, uniformity;
+	calculateMetrics(data, len, entropy, uniformity);
+	return uniformity;
 }
 
 EntropyRegionType EntropyAnalyzer::classifyRegion(double entropy, double uniformity, uint64_t addr)
 {
+	using namespace EntropyThresholds;
+
 	// Very low entropy = padding or sparse
-	if (entropy < 0.5)
+	if (entropy < kZeroPadding)
 		return EntropyRegionType::ZeroPadding;
-	
-	if (entropy < 2.0)
+
+	if (entropy < kSparseData)
 		return EntropyRegionType::SparseData;
-	
+
 	// Check if address is in executable section
 	bool isExecutable = false;
 	for (const auto& seg : m_view->GetSegments())
@@ -99,30 +117,30 @@ EntropyRegionType EntropyAnalyzer::classifyRegion(double entropy, double uniform
 			break;
 		}
 	}
-	
+
 	// Very high entropy with high uniformity = encrypted/random
-	if (entropy >= 7.8 && uniformity > 0.9)
+	if (entropy >= kEncrypted && uniformity > kEncryptedUniformity)
 		return EntropyRegionType::EncryptedData;
-	
-	if (entropy >= 7.5 && uniformity > 0.8)
+
+	if (entropy >= kRandomData && uniformity > kRandomUniformity)
 		return EntropyRegionType::RandomData;
-	
+
 	// High entropy with moderate uniformity = compressed
-	if (entropy >= 7.0)
+	if (entropy >= kCompressed)
 		return EntropyRegionType::CompressedData;
-	
+
 	// Medium entropy
-	if (entropy >= 4.0 && entropy < 6.5)
+	if (entropy >= kCodeLow && entropy < kCodeHigh)
 	{
 		if (isExecutable)
 			return EntropyRegionType::Code;
 		return EntropyRegionType::StructuredData;
 	}
-	
+
 	// Low-medium entropy = likely text/strings
-	if (entropy >= 2.0 && entropy < 4.5)
+	if (entropy >= kTextLow && entropy < kTextHigh)
 		return EntropyRegionType::Text;
-	
+
 	return EntropyRegionType::Unknown;
 }
 
@@ -208,8 +226,8 @@ std::vector<EntropyRegion> EntropyAnalyzer::Analyze(const EntropyAnalysisSetting
 			if (buf.GetLength() < settings.blockSize) continue;
 			
 			const uint8_t* data = static_cast<const uint8_t*>(buf.GetData());
-			double entropy = calculateBlockEntropy(data, settings.blockSize);
-			double uniformity = calculateUniformity(data, settings.blockSize);
+			double entropy, uniformity;
+			calculateMetrics(data, settings.blockSize, entropy, uniformity);
 			
 			m_stats.totalBlocks++;
 			totalEntropy += entropy;

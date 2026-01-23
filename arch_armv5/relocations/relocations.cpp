@@ -314,9 +314,10 @@ static bool IsELFDataRelocation(ElfArmRelocationType reloc)
 			{R_ARM_RABS32, true},
 			{R_ARM_RPC24, false},
 			{R_ARM_RBASE, true}};
-	if (!isDataMap.count(reloc))
+	auto it = isDataMap.find(reloc);
+	if (it == isDataMap.end())
 		return false;
-	return isDataMap.at(reloc);
+	return it->second;
 }
 
 /*

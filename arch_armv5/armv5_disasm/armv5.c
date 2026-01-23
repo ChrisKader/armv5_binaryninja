@@ -9,6 +9,20 @@
 #include "armv5.h"
 #include <stdio.h>
 
+/*
+ * Safe pointer advance after snprintf.
+ * snprintf returns the number of characters that *would* have been written if the buffer
+ * was large enough. If truncation occurs, this can return a value > remaining space,
+ * which would cause pointer arithmetic to go past the buffer end.
+ * This helper clamps the advance to the actual remaining space.
+ */
+static inline size_t safe_advance(int snprintf_result, size_t remaining)
+{
+    if (snprintf_result < 0) return 0;
+    size_t written = (size_t)snprintf_result;
+    return (written < remaining) ? written : (remaining > 0 ? remaining - 1 : 0);
+}
+
 #ifdef __cplusplus
 using namespace armv5;
 #endif
@@ -297,8 +311,9 @@ const char *get_register_name(enum Register reg)
 
     // BN temporary/SSA register IDs come through here.
     // Use a small rotating buffer so it's safe even with multiple calls per line.
-    static char buf[8][16];
-    static int idx = 0;
+    // Thread-local storage ensures thread safety in multi-threaded analysis.
+    static __thread char buf[8][16];
+    static __thread int idx = 0;
     idx = (idx + 1) & 7;
 
     snprintf(buf[idx], sizeof(buf[idx]), "tmp_%u", (unsigned)reg);
@@ -2384,6 +2399,9 @@ const char* get_data_type(DataType dt)
         ".32",   /* DT_32 */
         ".64",   /* DT_64 */
     };
+    /* Compile-time check: dataTypes array must match DataType enum */
+    _Static_assert(sizeof(dataTypes) / sizeof(dataTypes[0]) == DT_END,
+        "dataTypes array size does not match DT_END - update array when adding DataType values");
     if (dt < DT_END) return dataTypes[dt];
     return "";
 }
@@ -2422,8 +2440,10 @@ uint32_t armv5_disassemble(
     for (uint32_t i = 0; i < MAX_OPERANDS && instruction->operands[i].cls != NONE && start < end; i++)
     {
         InstructionOperand* op = &instruction->operands[i];
-        if (i != 0)
-            start += snprintf(start, end - start, ", ");
+        if (i != 0) {
+            start += safe_advance(snprintf(start, end - start, ", "), end - start);
+            if (start >= end) break;
+        }
 
         switch (op->cls)
         {

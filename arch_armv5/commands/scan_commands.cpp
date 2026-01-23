@@ -48,6 +48,17 @@ namespace
 {
 
 /**
+ * Safely convert uint64_t to uint32_t with clamping.
+ * Prevents undefined behavior from truncation of large values.
+ */
+static uint32_t SafeU64ToU32(uint64_t value)
+{
+	if (value > UINT32_MAX)
+		return UINT32_MAX;
+	return static_cast<uint32_t>(value);
+}
+
+/**
  * Resolve the correct platform (ARM or Thumb) for an address.
  * 
  * Only detects Thumb when bit 0 is explicitly set. For pure ARM binaries,
@@ -138,25 +149,25 @@ FirmwareSettings LoadMergedSettings(BinaryView* view)
 
 		// Orphan tuning
 		if (globalSettings->Contains("armv5.firmware.orphanMinValidInstr"))
-			settings.orphanMinValidInstr = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinValidInstr"));
+			settings.orphanMinValidInstr = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinValidInstr"));
 		if (globalSettings->Contains("armv5.firmware.orphanMinBodyInstr"))
-			settings.orphanMinBodyInstr = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinBodyInstr"));
+			settings.orphanMinBodyInstr = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinBodyInstr"));
 		if (globalSettings->Contains("armv5.firmware.orphanMinSpacingBytes"))
-			settings.orphanMinSpacingBytes = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinSpacingBytes"));
+			settings.orphanMinSpacingBytes = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.orphanMinSpacingBytes"));
 		if (globalSettings->Contains("armv5.firmware.orphanMaxPerPage"))
-			settings.orphanMaxPerPage = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.orphanMaxPerPage"));
+			settings.orphanMaxPerPage = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.orphanMaxPerPage"));
 		if (globalSettings->Contains("armv5.firmware.orphanRequirePrologue"))
 			settings.orphanRequirePrologue = globalSettings->Get<bool>("armv5.firmware.orphanRequirePrologue");
 
 		// Limits
 		if (globalSettings->Contains("armv5.firmware.maxFunctionAdds"))
-			settings.maxFunctionAdds = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.maxFunctionAdds"));
+			settings.maxFunctionAdds = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.maxFunctionAdds"));
 
 		// Cleanup
 		if (globalSettings->Contains("armv5.firmware.cleanupInvalidFunctions"))
 			settings.enableInvalidFunctionCleanup = globalSettings->Get<bool>("armv5.firmware.cleanupInvalidFunctions");
 		if (globalSettings->Contains("armv5.firmware.cleanupMaxSize"))
-			settings.cleanupMaxSizeBytes = static_cast<uint32_t>(globalSettings->Get<uint64_t>("armv5.firmware.cleanupMaxSize"));
+			settings.cleanupMaxSizeBytes = SafeU64ToU32(globalSettings->Get<uint64_t>("armv5.firmware.cleanupMaxSize"));
 
 		// Advanced
 		if (globalSettings->Contains("armv5.firmware.typeLiteralPools"))

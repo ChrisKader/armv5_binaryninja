@@ -699,71 +699,82 @@ void LinearSweepAnalyzer::groupBlocks()
 	m_stats.groupsFormed = m_groups.size();
 }
 
-void LinearSweepAnalyzer::propagateGroup(LinearBlock* block, int groupId)
+void LinearSweepAnalyzer::propagateGroup(LinearBlock* startBlock, int groupId)
 {
-	if (block->groupId >= 0)
-		return;  // Already assigned
+	// Use iterative approach with explicit stack to avoid stack overflow on large CFGs
+	std::vector<LinearBlock*> workStack;
+	workStack.push_back(startBlock);
 
-	block->groupId = groupId;
-
-	// Propagate through intraprocedural edges
-
-	// Follow conditional branches (definitely intraprocedural)
-	if (block->endsWithConditionalBranch)
+	while (!workStack.empty())
 	{
-		for (uint64_t succ : block->successors)
+		LinearBlock* block = workStack.back();
+		workStack.pop_back();
+
+		if (block->groupId >= 0)
+			continue;  // Already assigned
+
+		block->groupId = groupId;
+
+		// Propagate through intraprocedural edges
+
+		// Follow conditional branches (definitely intraprocedural)
+		if (block->endsWithConditionalBranch)
 		{
-			auto it = m_blocks.find(succ);
-			if (it != m_blocks.end())
+			for (uint64_t succ : block->successors)
 			{
-				propagateGroup(it->second.get(), groupId);
+				auto it = m_blocks.find(succ);
+				if (it != m_blocks.end() && it->second->groupId < 0)
+				{
+					workStack.push_back(it->second.get());
+				}
 			}
 		}
-	}
 
-	// Follow fall-through (definitely intraprocedural)
-	if (block->hasFallthrough)
-	{
-		for (uint64_t succ : block->successors)
+		// Follow fall-through (definitely intraprocedural)
+		if (block->hasFallthrough)
 		{
-			auto it = m_blocks.find(succ);
-			if (it != m_blocks.end())
+			for (uint64_t succ : block->successors)
 			{
-				propagateGroup(it->second.get(), groupId);
+				auto it = m_blocks.find(succ);
+				if (it != m_blocks.end() && it->second->groupId < 0)
+				{
+					workStack.push_back(it->second.get());
+				}
 			}
 		}
-	}
 
-	// Unconditional branches: check if likely tail call
-	if (block->endsWithUnconditionalBranch && !block->successors.empty())
-	{
-		uint64_t target = block->successors[0];
-		int64_t distance = static_cast<int64_t>(target) - static_cast<int64_t>(block->start);
-
-		// If branch is within threshold, treat as intraprocedural
-		if (!m_settings.treatUnconditionalBranchAsInterprocedural ||
-		    std::abs(distance) <= m_settings.tailCallDistanceThreshold)
+		// Unconditional branches: check if likely tail call
+		if (block->endsWithUnconditionalBranch && !block->successors.empty())
 		{
-			auto it = m_blocks.find(target);
+			uint64_t target = block->successors[0];
+			int64_t distance = static_cast<int64_t>(target) - static_cast<int64_t>(block->start);
+
+			// If branch is within threshold, treat as intraprocedural
+			if (!m_settings.treatUnconditionalBranchAsInterprocedural ||
+			    std::abs(distance) <= m_settings.tailCallDistanceThreshold)
+			{
+				auto it = m_blocks.find(target);
+				if (it != m_blocks.end() && it->second->groupId < 0)
+				{
+					workStack.push_back(it->second.get());
+				}
+			}
+			// Otherwise, treat as tail call (interprocedural) - don't propagate
+		}
+
+		// Also propagate to predecessors that flow to us
+		for (uint64_t pred : block->predecessors)
+		{
+			auto it = m_blocks.find(pred);
 			if (it != m_blocks.end())
 			{
-				propagateGroup(it->second.get(), groupId);
-			}
-		}
-		// Otherwise, treat as tail call (interprocedural) - don't propagate
-	}
-
-	// Also propagate to predecessors that flow to us
-	for (uint64_t pred : block->predecessors)
-	{
-		auto it = m_blocks.find(pred);
-		if (it != m_blocks.end())
-		{
-			LinearBlock* predBlock = it->second.get();
-			// Only propagate if predecessor flows to us via intraprocedural edge
-			if (predBlock->endsWithConditionalBranch || predBlock->hasFallthrough)
-			{
-				propagateGroup(predBlock, groupId);
+				LinearBlock* predBlock = it->second.get();
+				// Only propagate if predecessor flows to us via intraprocedural edge
+				if (predBlock->groupId < 0 &&
+				    (predBlock->endsWithConditionalBranch || predBlock->hasFallthrough))
+				{
+					workStack.push_back(predBlock);
+				}
 			}
 		}
 	}
