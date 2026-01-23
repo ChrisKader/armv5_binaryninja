@@ -50,7 +50,6 @@
 
 using namespace BinaryNinja;
 using namespace armv5;
-using namespace std;
 
 #if defined(_MSC_VER)
 #define snprintf _snprintf
@@ -1170,7 +1169,7 @@ public:
     };
     const char *s = (instr.setsFlags && allowsSuffixS(instr.operation)) ? "s" : "";
 
-    string mnemonic = string(opname) + cond + s;
+    std::string mnemonic = std::string(opname) + cond + s;
     result.emplace_back(InstructionToken, mnemonic);
 
     if (operandCount > 0)
@@ -1470,7 +1469,7 @@ public:
     return GetLowLevelILForArmInstruction(this, addr, il, instr, 4);
   }
 
-  virtual string GetIntrinsicName(uint32_t intrinsic) override
+  virtual std::string GetIntrinsicName(uint32_t intrinsic) override
   {
     switch (intrinsic)
     {
@@ -1545,9 +1544,9 @@ public:
     }
   }
 
-  virtual vector<uint32_t> GetAllIntrinsics() override
+  virtual std::vector<uint32_t> GetAllIntrinsics() override
   {
-    return vector<uint32_t>{
+    return std::vector<uint32_t>{
         ARMV5_INTRIN_CLZ,
         ARMV5_INTRIN_QADD,
         ARMV5_INTRIN_QSUB,
@@ -1587,7 +1586,7 @@ public:
     };
   }
 
-  virtual vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override
+  virtual std::vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override
   {
     switch (intrinsic)
     {
@@ -1671,11 +1670,11 @@ public:
                                                    PointerReferenceType)),
       };
     default:
-      return vector<NameAndType>();
+      return std::vector<NameAndType>();
     }
   }
 
-  virtual vector<Confidence<Ref<Type>>> GetIntrinsicOutputs(uint32_t intrinsic) override
+  virtual std::vector<Confidence<Ref<Type>>> GetIntrinsicOutputs(uint32_t intrinsic) override
   {
     switch (intrinsic)
     {
@@ -1709,7 +1708,7 @@ public:
       /* Returns two 32-bit values (64-bit result split) */
       return {Type::IntegerType(4, false), Type::IntegerType(4, false)};
     default:
-      return vector<Confidence<Ref<Type>>>();
+      return std::vector<Confidence<Ref<Type>>>();
     }
   }
 
@@ -1869,7 +1868,7 @@ public:
    * the IndirectBranches provided in the analysis context.
    */
   bool DetectSwitchTable(BinaryView *view, uint64_t jumpAddr,
-                         vector<pair<Ref<Architecture>, uint64_t>> &targets)
+                         std::vector<std::pair<Ref<Architecture>, uint64_t>> &targets)
   {
     /* Read the jump instruction */
     DataBuffer data = view->ReadBuffer(jumpAddr, 4);
@@ -1982,7 +1981,7 @@ public:
   }
 
   bool DetectLdrPcJumpTable(BinaryView *view, uint64_t jumpAddr,
-                            vector<pair<Ref<Architecture>, uint64_t>> &targets)
+                            std::vector<std::pair<Ref<Architecture>, uint64_t>> &targets)
   {
     DataBuffer data = view->ReadBuffer(jumpAddr, 4);
     if (data.GetLength() < 4)
@@ -2035,7 +2034,7 @@ public:
   }
 
   bool DetectLdrPcLiteralTarget(BinaryView *view, uint64_t jumpAddr,
-                                vector<pair<Ref<Architecture>, uint64_t>> &targets)
+                                std::vector<std::pair<Ref<Architecture>, uint64_t>> &targets)
   {
     DataBuffer data = view->ReadBuffer(jumpAddr, 4);
     if (data.GetLength() < 4)
@@ -2220,9 +2219,9 @@ public:
   virtual void AnalyzeBasicBlocks(Function *function, BasicBlockAnalysisContext &context) override
   {
     auto data = function->GetView();
-    queue<ArchAndAddr> blocksToProcess;
-    map<ArchAndAddr, Ref<BasicBlock>> instrBlocks;
-    set<ArchAndAddr> seenBlocks;
+    std::queue<ArchAndAddr> blocksToProcess;
+    std::map<ArchAndAddr, Ref<BasicBlock>> instrBlocks;
+    std::set<ArchAndAddr> seenBlocks;
 
     bool guidedAnalysisMode = context.GetGuidedAnalysisMode();
     bool triggerGuidedOnInvalidInstruction = context.GetTriggerGuidedOnInvalidInstruction();
@@ -2252,17 +2251,17 @@ public:
       if (data->GetSymbolByAddress(addr))
         return;
       size_t width = data->GetAddressSize() * 2;
-      string name = fmt::format("loc_{:0{}X}", addr, width);
+      std::string name = fmt::format("loc_{:0{}X}", addr, width);
       data->DefineAutoSymbol(new Symbol(LocalLabelSymbol, name, addr, LocalBinding));
     };
 
     bool hasInvalidInstructions = false;
-    set<ArchAndAddr> guidedSourceBlockTargets;
+    std::set<ArchAndAddr> guidedSourceBlockTargets;
     auto guidedSourceBlocks = function->GetGuidedSourceBlocks();
-    set<ArchAndAddr> guidedSourceBlocksSet;
+    std::set<ArchAndAddr> guidedSourceBlocksSet;
     for (const auto &block : guidedSourceBlocks)
       guidedSourceBlocksSet.insert(block);
-    set<uint64_t> loggedUnresolvedIndirect;
+    std::set<uint64_t> loggedUnresolvedIndirect;
 
     BNStringReference strRef;
     auto targetExceedsByteLimit = [](const BNStringReference &strRef)
@@ -2331,7 +2330,7 @@ public:
       if ((location.address == function->GetStart()) && IsPaddingStart(data, location.address))
       {
         // Avoid creating functions on alignment padding between real function bodies.
-        string text = fmt::format("Padding/alignment at {:#x}", location.address);
+        std::string text = fmt::format("Padding/alignment at {:#x}", location.address);
         function->CreateAutoAddressTag(location.arch, location.address, "Padding", text, true);
         context.Finalize();
         return;
@@ -2340,7 +2339,7 @@ public:
       Ref<Function> nextFunc;
       bool hasNextFunc = GetNextFunctionAfterAddress(data, funcPlatform, location.address, nextFunc);
       uint64_t nextFuncAddr = (hasNextFunc && nextFunc) ? nextFunc->GetStart() : 0;
-      set<Ref<Function>> calledFunctions;
+      std::set<Ref<Function>> calledFunctions;
 
       uint8_t delaySlotCount = 0;
       bool delayInstructionEndsBlock = false;
@@ -2444,7 +2443,7 @@ public:
         size_t maxLen = data->Read(opcode, location.address, location.arch->GetMaxInstructionLength());
         if (maxLen == 0)
         {
-          string text = fmt::format("Could not read instruction at {:#x}", location.address);
+          std::string text = fmt::format("Could not read instruction at {:#x}", location.address);
           function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
           if (location.arch->GetInstructionAlignment() == 0)
             location.address++;
@@ -2458,7 +2457,7 @@ public:
         info.delaySlots = delaySlotCount;
         if (!location.arch->GetInstructionInfo(opcode, location.address, maxLen, info))
         {
-          string text = fmt::format("Could not get instruction info at {:#x}", location.address);
+          std::string text = fmt::format("Could not get instruction info at {:#x}", location.address);
           function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
           if (location.arch->GetInstructionAlignment() == 0)
             location.address++;
@@ -2470,7 +2469,7 @@ public:
 
         if ((info.length == 0) || (info.length > maxLen))
         {
-          string text = fmt::format("Instruction of invalid length at {:#x}", location.address);
+          std::string text = fmt::format("Instruction of invalid length at {:#x}", location.address);
           function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
           if (location.arch->GetInstructionAlignment() == 0)
             location.address++;
@@ -2486,7 +2485,7 @@ public:
             ((!data->IsOffsetCodeSemantics(instrEnd) && data->IsOffsetCodeSemantics(location.address)) ||
              (!data->IsOffsetBackedByFile(instrEnd) && data->IsOffsetBackedByFile(location.address))))
         {
-          string text = fmt::format("Instruction at {:#x} straddles a non-code section", location.address);
+          std::string text = fmt::format("Instruction at {:#x} straddles a non-code section", location.address);
           function->CreateAutoAddressTag(location.arch, location.address, "Invalid Instruction", text, true);
           if (location.arch->GetInstructionAlignment() == 0)
             location.address++;
@@ -2498,7 +2497,7 @@ public:
 
         bool endsBlock = false;
         ArchAndAddr target;
-        map<ArchAndAddr, set<ArchAndAddr>>::const_iterator indirectBranchIter, endIter;
+        std::map<ArchAndAddr, std::set<ArchAndAddr>>::const_iterator indirectBranchIter, endIter;
         if (!delaySlotCount)
         {
           instrBlocks[location] = block;
@@ -2600,7 +2599,7 @@ public:
                 }
               }
 
-              set<ArchAndAddr> resolvedTargets;
+              std::set<ArchAndAddr> resolvedTargets;
               indirectBranchIter = indirectBranches.find(location);
               endIter = indirectBranches.end();
               if (indirectBranchIter != endIter)
@@ -2610,7 +2609,7 @@ public:
               }
               else if (info.branchType[i] == IndirectBranch || info.branchType[i] == UnresolvedBranch)
               {
-                vector<pair<Ref<Architecture>, uint64_t>> jumpTableTargets;
+                std::vector<std::pair<Ref<Architecture>, uint64_t>> jumpTableTargets;
                 DetectSwitchTable(data, location.address, jumpTableTargets);
                 DetectLdrPcJumpTable(data, location.address, jumpTableTargets);
                 DetectLdrPcLiteralTarget(data, location.address, jumpTableTargets);
@@ -2833,7 +2832,7 @@ public:
                 if (!fastPath && !data->IsOffsetCodeSemantics(target.address) &&
                     data->IsOffsetCodeSemantics(location.address))
                 {
-                  string message = fmt::format("Non-code call target {:#x}", target.address);
+                  std::string message = fmt::format("Non-code call target {:#x}", target.address);
                   function->CreateAutoAddressTag(target.arch, location.address, "Non-code Branch", message, true);
                   break;
                 }
@@ -2985,7 +2984,7 @@ public:
 
       if (guidedAnalysisMode || hasInvalidInstructions || guidedSourceBlocksSet.size())
       {
-        queue<ArchAndAddr> guidedBlocksToProcess;
+        std::queue<ArchAndAddr> guidedBlocksToProcess;
         while (!blocksToProcess.empty())
         {
           auto i = blocksToProcess.front();

@@ -78,7 +78,6 @@
 #include <vector>
 #include <cstring>
 
-using namespace std;
 using namespace BinaryNinja;
 using namespace armv5;
 

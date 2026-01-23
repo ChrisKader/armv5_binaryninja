@@ -16,7 +16,6 @@
 
 using namespace BinaryNinja;
 using namespace armv5;
-using namespace std;
 
 #if defined(_MSC_VER)
 #define snprintf _snprintf
@@ -80,7 +79,7 @@ size_t ArmCommonArchitecture::GetAddressSize() const
   return 4;
 }
 
-string ArmCommonArchitecture::GetFlagName(uint32_t flag)
+std::string ArmCommonArchitecture::GetFlagName(uint32_t flag)
 {
   char result[32];
   switch (flag)
@@ -101,7 +100,7 @@ string ArmCommonArchitecture::GetFlagName(uint32_t flag)
   }
 }
 
-string ArmCommonArchitecture::GetFlagWriteTypeName(uint32_t flags)
+std::string ArmCommonArchitecture::GetFlagWriteTypeName(uint32_t flags)
 {
   switch (flags)
   {
@@ -137,51 +136,51 @@ BNFlagRole ArmCommonArchitecture::GetFlagRole(uint32_t flag, uint32_t)
   }
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetFlagsWrittenByFlagWriteType(uint32_t flags)
+std::vector<uint32_t> ArmCommonArchitecture::GetFlagsWrittenByFlagWriteType(uint32_t flags)
 {
   switch (flags)
   {
   case IL_FLAGWRITE_ALL:
   case IL_FLAGWRITE_NZCV:
-    return vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z, IL_FLAG_C, IL_FLAG_V};
+    return std::vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z, IL_FLAG_C, IL_FLAG_V};
   case IL_FLAGWRITE_NZ:
-    return vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z};
+    return std::vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z};
   case IL_FLAGWRITE_CNZ:
-    return vector<uint32_t>{IL_FLAG_C, IL_FLAG_N, IL_FLAG_Z};
+    return std::vector<uint32_t>{IL_FLAG_C, IL_FLAG_N, IL_FLAG_Z};
   case IL_FLAGWRITE_NZC:
-    return vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z, IL_FLAG_C};
+    return std::vector<uint32_t>{IL_FLAG_N, IL_FLAG_Z, IL_FLAG_C};
   default:
-    return vector<uint32_t>{};
+    return std::vector<uint32_t>{};
   }
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetFlagsRequiredForFlagCondition(BNLowLevelILFlagCondition cond, uint32_t)
+std::vector<uint32_t> ArmCommonArchitecture::GetFlagsRequiredForFlagCondition(BNLowLevelILFlagCondition cond, uint32_t)
 {
   switch (cond)
   {
   case LLFC_E:
   case LLFC_NE:
-    return vector<uint32_t>{IL_FLAG_Z};
+    return std::vector<uint32_t>{IL_FLAG_Z};
   case LLFC_SLT:
   case LLFC_SGE:
-    return vector<uint32_t>{IL_FLAG_N, IL_FLAG_V};
+    return std::vector<uint32_t>{IL_FLAG_N, IL_FLAG_V};
   case LLFC_ULT:
   case LLFC_UGE:
-    return vector<uint32_t>{IL_FLAG_C};
+    return std::vector<uint32_t>{IL_FLAG_C};
   case LLFC_SLE:
   case LLFC_SGT:
-    return vector<uint32_t>{IL_FLAG_Z, IL_FLAG_N, IL_FLAG_V};
+    return std::vector<uint32_t>{IL_FLAG_Z, IL_FLAG_N, IL_FLAG_V};
   case LLFC_ULE:
   case LLFC_UGT:
-    return vector<uint32_t>{IL_FLAG_C, IL_FLAG_Z};
+    return std::vector<uint32_t>{IL_FLAG_C, IL_FLAG_Z};
   case LLFC_NEG:
   case LLFC_POS:
-    return vector<uint32_t>{IL_FLAG_N};
+    return std::vector<uint32_t>{IL_FLAG_N};
   case LLFC_O:
   case LLFC_NO:
-    return vector<uint32_t>{IL_FLAG_V};
+    return std::vector<uint32_t>{IL_FLAG_V};
   default:
-    return vector<uint32_t>{};
+    return std::vector<uint32_t>{};
   }
 }
 
@@ -239,7 +238,7 @@ size_t ArmCommonArchitecture::GetFlagWriteLowLevelIL(BNLowLevelILOperation op, s
   return GetDefaultFlagWriteLowLevelIL(op, size, role, operands, operandCount, il);
 }
 
-string ArmCommonArchitecture::GetRegisterName(uint32_t reg)
+std::string ArmCommonArchitecture::GetRegisterName(uint32_t reg)
 {
   if (reg >= REG_R0 && reg < REG_INVALID)
   {
@@ -250,9 +249,9 @@ string ArmCommonArchitecture::GetRegisterName(uint32_t reg)
   return "unknown";
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetFullWidthRegisters()
+std::vector<uint32_t> ArmCommonArchitecture::GetFullWidthRegisters()
 {
-  return vector<uint32_t>{
+  return std::vector<uint32_t>{
       REG_R0,
       REG_R1,
       REG_R2,
@@ -288,9 +287,9 @@ vector<uint32_t> ArmCommonArchitecture::GetFullWidthRegisters()
   };
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetAllRegisters()
+std::vector<uint32_t> ArmCommonArchitecture::GetAllRegisters()
 {
-  return vector<uint32_t>{
+  return std::vector<uint32_t>{
       REG_R0,
       REG_R1,
       REG_R2,
@@ -363,15 +362,15 @@ vector<uint32_t> ArmCommonArchitecture::GetAllRegisters()
   };
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetAllFlags()
+std::vector<uint32_t> ArmCommonArchitecture::GetAllFlags()
 {
-  return vector<uint32_t>{
+  return std::vector<uint32_t>{
       IL_FLAG_N, IL_FLAG_Z, IL_FLAG_C, IL_FLAG_V, IL_FLAG_Q};
 }
 
-vector<uint32_t> ArmCommonArchitecture::GetAllFlagWriteTypes()
+std::vector<uint32_t> ArmCommonArchitecture::GetAllFlagWriteTypes()
 {
-  return vector<uint32_t>{
+  return std::vector<uint32_t>{
       IL_FLAGWRITE_ALL,
       IL_FLAGWRITE_NZ,
       IL_FLAGWRITE_CNZ,
@@ -469,7 +468,7 @@ bool ArmCommonArchitecture::CanAssemble()
   return true;
 }
 
-bool ArmCommonArchitecture::Assemble(const string &code, uint64_t addr, DataBuffer &result, string &errors)
+bool ArmCommonArchitecture::Assemble(const std::string &code, uint64_t addr, DataBuffer &result, std::string &errors)
 {
   (void)addr;
 
@@ -478,7 +477,7 @@ bool ArmCommonArchitecture::Assemble(const string &code, uint64_t addr, DataBuff
 
   int assembleResult;
 
-  string triple = GetAssemblerTriple();
+  std::string triple = GetAssemblerTriple();
   LogDebug("%s() retrieves and uses triple %s\n", __func__, triple.c_str());
 
   BNLlvmServicesInit();

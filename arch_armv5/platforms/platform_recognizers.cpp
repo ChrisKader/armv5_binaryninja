@@ -9,7 +9,6 @@
 #include "platforms/platform_recognizers.h"
 
 using namespace BinaryNinja;
-using namespace std;
 
 /*
  * Parse ARM .ARM.attributes to get Tag_CPU_arch for an ELF binary.

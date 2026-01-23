@@ -71,7 +71,6 @@
 #include <exception>
 
 using namespace BinaryNinja;
-using namespace std;
 
 /**
  * Workflow activity callback for ARMv5 firmware analysis.

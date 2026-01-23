@@ -80,7 +80,6 @@
 
 using namespace BinaryNinja;
 using namespace armv5;
-using namespace std;
 
 #if defined(_MSC_VER)
 #define snprintf _snprintf
@@ -364,7 +363,7 @@ public:
 	/* populate the vector result with InstructionTextToken
 
 	*/
-	virtual bool GetInstructionText(const uint8_t* data, uint64_t addr, size_t& len, vector<InstructionTextToken>& result) override
+	virtual bool GetInstructionText(const uint8_t* data, uint64_t addr, size_t& len, std::vector<InstructionTextToken>& result) override
 	{
 		decomp_request request;
 		decomp_result decomp;
@@ -388,7 +387,7 @@ public:
 
 		char padding[9];
 		memset(padding, 0x20, sizeof(padding));
-		string operation = get_thumb_operation_name(&decomp);
+		std::string operation = get_thumb_operation_name(&decomp);
 		size_t operationLen = operation.size();
 		if (operationLen < 8)
 		{
@@ -1295,8 +1294,8 @@ public:
 						switch (sysm >> 3) {
 							case 0: /* xPSR access */
 							{
-								string reg_name = "";
-								string reg_bits = "";
+								std::string reg_name = "";
+								std::string reg_bits = "";
 								if (xPSR)
 									switch (sysm & 7) {
 									case 5: // '101' == IPSR
@@ -1475,7 +1474,7 @@ public:
 		return true;
 	}
 
-	virtual string GetIntrinsicName(uint32_t intrinsic) override
+	virtual std::string GetIntrinsicName(uint32_t intrinsic) override
 	{
 		switch (intrinsic)
 		{
@@ -1515,9 +1514,9 @@ public:
 		}
 	}
 
-	virtual vector<uint32_t> GetAllIntrinsics() override
+	virtual std::vector<uint32_t> GetAllIntrinsics() override
 	{
-		return vector<uint32_t> {
+		return std::vector<uint32_t> {
 			// ARMv5 intrinsics only
 			ARMV5_INTRIN_COPROC_GETONEWORD,
 			ARMV5_INTRIN_COPROC_GETTWOWORDS,
@@ -1537,7 +1536,7 @@ public:
 		};
 	}
 
-	virtual vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override
+	virtual std::vector<NameAndType> GetIntrinsicInputs(uint32_t intrinsic) override
 	{
 		switch (intrinsic)
 		{
@@ -1586,11 +1585,11 @@ public:
 		case ARMV5_INTRIN_DBG:
 			return {NameAndType(Type::IntegerType(1, false))};
 		default:
-			return vector<NameAndType>();
+			return std::vector<NameAndType>();
 		}
 	}
 
-	virtual vector<Confidence<Ref<Type>>> GetIntrinsicOutputs(uint32_t intrinsic) override
+	virtual std::vector<Confidence<Ref<Type>>> GetIntrinsicOutputs(uint32_t intrinsic) override
 	{
 		switch (intrinsic)
 		{
@@ -1604,7 +1603,7 @@ public:
 			// return {Type::IntegerType(4, false)};
 			return {};
 		default:
-			return vector<Confidence<Ref<Type>>>();
+			return std::vector<Confidence<Ref<Type>>>();
 		}
 	}
 
@@ -1772,7 +1771,7 @@ public:
 
 	virtual std::vector<uint32_t> GetSystemRegisters() override
 	{
-		return vector<uint32_t>{
+		return std::vector<uint32_t>{
 			// ARMv5 system registers
 			REGS_CPSR,
 			REGS_CPSR_C,

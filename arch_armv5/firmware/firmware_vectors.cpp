@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <vector>
 
-using namespace std;
 using namespace BinaryNinja;
 
 static inline bool IsLdrPcLiteral(uint32_t instr)
@@ -172,7 +171,7 @@ uint64_t DetectImageBaseFromVectorTable(BinaryView *data)
 	const uint32_t *words = (const uint32_t *)buf.GetData();
 
 	// Collect handler VAs resolved via LDR pc literal vectors.
-	vector<uint32_t> handlerVAs;
+	std::vector<uint32_t> handlerVAs;
 	handlerVAs.reserve(8);
 
 	for (int i = 0; i < 8; i++)
@@ -209,7 +208,7 @@ uint64_t DetectImageBaseFromVectorTable(BinaryView *data)
 		int score;
 	};
 
-	vector<Candidate> cands;
+	std::vector<Candidate> cands;
 	cands.reserve(handlerVAs.size() * (sizeof(alignments) / sizeof(alignments[0])));
 
 	auto addCand = [&](uint64_t base)

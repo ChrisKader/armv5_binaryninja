@@ -88,7 +88,6 @@
 
 using namespace BinaryNinja;
 using namespace armv5;
-using namespace std;
 
 /*
  * AAPCS (ARM EABI) Calling Convention - Modern default
@@ -105,19 +104,19 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
+    return std::vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override
@@ -144,19 +143,19 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
+    return std::vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override
@@ -181,19 +180,19 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3};
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
+    return std::vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override
@@ -226,23 +225,23 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{};  // No arguments
+    return std::vector<uint32_t>{};  // No arguments
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
     // Conservative: treat all GPRs as caller-saved
-    return vector<uint32_t>{
+    return std::vector<uint32_t>{
       REG_R0, REG_R1, REG_R2, REG_R3, REG_R4, REG_R5, REG_R6, REG_R7,
       REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_LR
     };
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{};  // None - all clobbered
+    return std::vector<uint32_t>{};  // None - all clobbered
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override
@@ -282,19 +281,19 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1};  // argc, argv or task params
+    return std::vector<uint32_t>{REG_R0, REG_R1};  // argc, argv or task params
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
+    return std::vector<uint32_t>{REG_R0, REG_R1, REG_R2, REG_R3, REG_R12, REG_LR};
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
+    return std::vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R9, REG_R10, REG_R11};
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override
@@ -324,19 +323,19 @@ public:
   {
   }
 
-  virtual vector<uint32_t> GetIntegerArgumentRegisters() override
+  virtual std::vector<uint32_t> GetIntegerArgumentRegisters() override
   {
-    return vector<uint32_t>{REG_R7, REG_R0, REG_R1, REG_R2, REG_R3, REG_R4, REG_R5, REG_R6};
+    return std::vector<uint32_t>{REG_R7, REG_R0, REG_R1, REG_R2, REG_R3, REG_R4, REG_R5, REG_R6};
   }
 
-  virtual vector<uint32_t> GetCallerSavedRegisters() override
+  virtual std::vector<uint32_t> GetCallerSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R0};
+    return std::vector<uint32_t>{REG_R0};
   }
 
-  virtual vector<uint32_t> GetCalleeSavedRegisters() override
+  virtual std::vector<uint32_t> GetCalleeSavedRegisters() override
   {
-    return vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R10, REG_R11};
+    return std::vector<uint32_t>{REG_R4, REG_R5, REG_R6, REG_R7, REG_R8, REG_R10, REG_R11};
   }
 
   virtual uint32_t GetIntegerReturnValueRegister() override

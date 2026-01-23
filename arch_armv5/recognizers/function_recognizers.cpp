@@ -38,7 +38,6 @@
 
 using namespace BinaryNinja;
 using namespace armv5;
-using namespace std;
 
 /*
  * Function Recognizer for ARM thunks and tail-call stubs

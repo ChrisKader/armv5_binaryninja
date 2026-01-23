@@ -15,7 +15,6 @@
 #include <unordered_set>
 #include <vector>
 
-using namespace std;
 using namespace BinaryNinja;
 
 // Memory region structure for MMU analysis
@@ -2854,7 +2853,7 @@ void AnalyzeMMUConfiguration(const Ref<BinaryView>& view, BinaryReader& reader, 
 		// Debug summary: arrays found
 		logger->LogInfo("MMU: %zu config array candidate(s) accepted for format scoring", configArrays.size());
 
-		vector<MemRegion> regions;
+		std::vector<MemRegion> regions;
 		MemRegion currentRegion = {0, 0, 0, false, false, false, false, false, nullptr};
 
 		for (const auto& arr : configArrays)

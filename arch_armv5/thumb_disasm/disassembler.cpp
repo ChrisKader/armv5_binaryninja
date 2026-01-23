@@ -10,8 +10,6 @@
 #include "armv5_disasm/armv5.h"
 using namespace armv5;
 
-using namespace std;
-
 /* helper prototypes */
 int get_reg_name(int reg_idx, char *reg_name);
 
@@ -272,7 +270,7 @@ std::string get_thumb_operation_name(struct decomp_result* result)
 		else {
 #ifdef DEBUG_DISASM
 			if(getenv("DEBUG_DISASM")) {
-				cout << "ERROR: can't populate <effect> field" << endl;
+				std::cerr << "ERROR: can't populate <effect> field" << std::endl;
 			}
 #endif
 			while(0);
@@ -291,7 +289,7 @@ std::string get_thumb_operation_name(struct decomp_result* result)
 		}
 #ifdef DEBUG_DISASM
 		else
-			cout << "ERROR: invalid condition code index" << value << endl;
+			std::cerr << "ERROR: invalid condition code index" << value << std::endl;
 #endif
 	}
 

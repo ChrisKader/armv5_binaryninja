@@ -106,7 +106,6 @@
 #include <thread>
 
 using namespace BinaryNinja;
-using namespace std;
 
 /* Forward declaration for mutex defined in firmware_view.cpp */
 extern std::mutex FirmwareViewMutex;
@@ -204,10 +203,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 {
 	if (!view || !view->GetObject())
 		return false;
-	const auto start = chrono::steady_clock::now();
-	constexpr auto kSleep = chrono::milliseconds(100);
-	constexpr auto kLogInterval = chrono::seconds(5);
-	constexpr auto kMaxWait = chrono::minutes(30);  // Maximum wait timeout
+	const auto start = std::chrono::steady_clock::now();
+	constexpr auto kSleep = std::chrono::milliseconds(100);
+	constexpr auto kLogInterval = std::chrono::seconds(5);
+	constexpr auto kMaxWait = std::chrono::minutes(30);  // Maximum wait timeout
 	auto nextLog = start + kLogInterval;
 	UpdateTaskText(task, instanceId, "ARMv5 firmware scans: waiting for analysis to idle");
 	while (true)
@@ -216,7 +215,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			return false;
 
 		// Check for maximum wait timeout
-		auto elapsed = chrono::steady_clock::now() - start;
+		auto elapsed = std::chrono::steady_clock::now() - start;
 		if (elapsed > kMaxWait)
 		{
 			if (logger)
@@ -227,13 +226,13 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		BNAnalysisState state = view->GetAnalysisInfo().state;
 		if (state == IdleState || state == HoldState)
 			break;
-		auto now = chrono::steady_clock::now();
+		auto now = std::chrono::steady_clock::now();
 		if (logger && now >= nextLog)
 		{
 			logger->LogInfo("Firmware workflow scan: waiting for analysis to idle");
 			nextLog = now + kLogInterval;
 		}
-		this_thread::sleep_for(kSleep);
+		std::this_thread::sleep_for(kSleep);
 	}
 	UpdateTaskText(task, instanceId, "ARMv5 firmware scans: running");
 	return true;
@@ -253,15 +252,15 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		return false;
 	}
 
-	void DedupAddresses(vector<uint64_t>& addrs)
+	void DedupAddresses(std::vector<uint64_t>& addrs)
 	{
-		sort(addrs.begin(), addrs.end());
-		addrs.erase(unique(addrs.begin(), addrs.end()), addrs.end());
+		std::sort(addrs.begin(), addrs.end());
+		addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
 	}
 
-	unordered_set<uint64_t> SnapshotFunctionStarts(const Ref<BinaryView>& view)
+	std::unordered_set<uint64_t> SnapshotFunctionStarts(const Ref<BinaryView>& view)
 	{
-		unordered_set<uint64_t> starts;
+		std::unordered_set<uint64_t> starts;
 		if (!view || !view->GetObject())
 			return starts;
 		auto funcs = view->GetAnalysisFunctionList();
@@ -276,14 +275,14 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 	}
 
 	void LogFunctionDiff(const Ref<Logger>& logger,
-		const unordered_set<uint64_t>& before,
-		const unordered_set<uint64_t>& after,
+		const std::unordered_set<uint64_t>& before,
+		const std::unordered_set<uint64_t>& after,
 		bool logLists)
 	{
 		if (!logger)
 			return;
-		vector<uint64_t> added;
-		vector<uint64_t> removed;
+		std::vector<uint64_t> added;
+		std::vector<uint64_t> removed;
 		added.reserve(after.size());
 		removed.reserve(before.size());
 		for (uint64_t addr : after)
@@ -296,13 +295,13 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			if (after.find(addr) == after.end())
 				removed.push_back(addr);
 		}
-		sort(added.begin(), added.end());
-		sort(removed.begin(), removed.end());
+		std::sort(added.begin(), added.end());
+		std::sort(removed.begin(), removed.end());
 		logger->LogInfo("Firmware scan: function diff added=%zu removed=%zu", added.size(), removed.size());
 		const size_t kMaxLog = 50;
 		if (logLists && !added.empty())
 		{
-			string line = "Firmware scan: added functions:";
+			std::string line = "Firmware scan: added functions:";
 			for (size_t i = 0; i < added.size() && i < kMaxLog; ++i)
 				line += fmt::format(" 0x{:x}", added[i]);
 			if (added.size() > kMaxLog)
@@ -311,7 +310,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		}
 		if (logLists && !removed.empty())
 		{
-			string line = "Firmware scan: removed functions:";
+			std::string line = "Firmware scan: removed functions:";
 			for (size_t i = 0; i < removed.size() && i < kMaxLog; ++i)
 				line += fmt::format(" 0x{:x}", removed[i]);
 			if (removed.size() > kMaxLog)
@@ -501,7 +500,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			view->SetFunctionAnalysisUpdateDisabled(prevDisabled);
 		};
 
-		vector<uint64_t> userAddrs = plan.addUserFunctions;
+		std::vector<uint64_t> userAddrs = plan.addUserFunctions;
 		DedupAddresses(userAddrs);
 
 		const size_t batchSize = 256;
@@ -513,7 +512,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(userAddrs.size(), i + batchSize);
+			size_t end = std::min(userAddrs.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 			{
 				uint64_t addr = userAddrs[j];
@@ -550,12 +549,12 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
 
-		vector<uint64_t> addrs = plan.addFunctions;
+		std::vector<uint64_t> addrs = plan.addFunctions;
 		DedupAddresses(addrs);
 		if (!userAddrs.empty() && !addrs.empty())
 		{
 			// Avoid adding the same function twice (user + analysis).
-			vector<uint64_t> filtered;
+			std::vector<uint64_t> filtered;
 			filtered.reserve(addrs.size());
 			size_t i = 0;
 			size_t j = 0;
@@ -590,7 +589,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(addrs.size(), i + batchSize);
+			size_t end = std::min(addrs.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 			{
 				uint64_t addr = addrs[j];
@@ -625,7 +624,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(plan.defineData.size(), i + batchSize);
+			size_t end = std::min(plan.defineData.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 			{
 				const auto& def = plan.defineData[j];
@@ -648,7 +647,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(plan.undefineData.size(), i + batchSize);
+			size_t end = std::min(plan.undefineData.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 				view->UndefineDataVariable(plan.undefineData[j], false);
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -662,7 +661,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(plan.defineSymbols.size(), i + batchSize);
+			size_t end = std::min(plan.defineSymbols.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 				view->DefineAutoSymbol(plan.defineSymbols[j]);
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -676,7 +675,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = min(plan.removeFunctions.size(), i + batchSize);
+			size_t end = std::min(plan.removeFunctions.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 			{
 				uint64_t addr = plan.removeFunctions[j];
@@ -842,10 +841,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				fn();
 				return;
 			}
-			auto start = chrono::steady_clock::now();
+			auto start = std::chrono::steady_clock::now();
 			fn();
-			double seconds = chrono::duration_cast<chrono::duration<double>>(
-				chrono::steady_clock::now() - start).count();
+			double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::steady_clock::now() - start).count();
 			if (logger)
 				logger->LogInfo("Firmware workflow timing: %s took %.3f s", label, seconds);
 		};
@@ -1115,7 +1114,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		}
 
 		bool applied = false;
-		unordered_set<uint64_t> beforeFunctions = SnapshotFunctionStarts(view);
+		std::unordered_set<uint64_t> beforeFunctions = SnapshotFunctionStarts(view);
 		if (!refreshViewForPhase())
 		{
 			finishTask();

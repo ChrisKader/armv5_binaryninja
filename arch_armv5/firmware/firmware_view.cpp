@@ -105,7 +105,6 @@
 #include <unordered_set>
 #include <vector>
 
-using namespace std;
 using namespace BinaryNinja;
 using namespace armv5;
 
@@ -514,8 +513,8 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 	}
 	if (!removed.empty() && logger)
 	{
-		sort(removed.begin(), removed.end());
-		string line = "Firmware finalization: functions removed after scans:";
+		std::sort(removed.begin(), removed.end());
+		std::string line = "Firmware finalization: functions removed after scans:";
 		const size_t kMaxLog = 50;
 		for (size_t i = 0; i < removed.size() && i < kMaxLog; ++i)
 			line += fmt::format(" 0x{:x}", removed[i]);
@@ -766,7 +765,7 @@ bool Armv5FirmwareView::Init()
 	if (settings && settings->Contains(Armv5Settings::kPlatform))
 	{
 		Ref<Platform> platformOverride =
-				Platform::GetByName(settings->Get<string>(Armv5Settings::kPlatform, this));
+				Platform::GetByName(settings->Get<std::string>(Armv5Settings::kPlatform, this));
 		if (platformOverride)
 		{
 			m_plat = platformOverride;
@@ -1003,7 +1002,7 @@ bool Armv5FirmwareView::Init()
 					Ref<Type> ptrType = Type::PointerType(m_arch, Type::VoidType());
 					m_seededDataDefines.push_back({ptrAddr, ptrType, true});
 
-					string ptrName = string(handlerNames[i]) + "_ptr";
+					std::string ptrName = std::string(handlerNames[i]) + "_ptr";
 					m_seededSymbols.push_back(new Symbol(DataSymbol, ptrName, ptrAddr, GlobalBinding));
 				}
 			}
@@ -1492,7 +1491,7 @@ Ref<Settings> Armv5FirmwareViewType::GetLoadSettingsForData(BinaryView *data)
 	RegisterFirmwareSettings(settings);
 
 	// Allow overriding image base and platform
-	vector<string> overrides = {Armv5Settings::kImageBase, Armv5Settings::kPlatform};
+	std::vector<std::string> overrides = {Armv5Settings::kImageBase, Armv5Settings::kPlatform};
 	for (const auto &overrideKey : overrides)
 	{
 		if (settings->Contains(overrideKey))

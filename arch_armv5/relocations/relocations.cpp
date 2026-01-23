@@ -10,11 +10,10 @@
 #include <vector>
 
 using namespace BinaryNinja;
-using namespace std;
 
 static const char* GetRelocationString(ElfArmRelocationType rel)
 {
-	static map<ElfArmRelocationType, const char*> relocTable =
+	static std::map<ElfArmRelocationType, const char*> relocTable =
 		{
 			{R_ARM_NONE, "R_ARM_NONE"},
 			{R_ARM_PC24, "R_ARM_PC24"},
@@ -168,7 +167,7 @@ static const char* GetRelocationString(ElfArmRelocationType rel)
 
 static bool IsELFDataRelocation(ElfArmRelocationType reloc)
 {
-	static map<ElfArmRelocationType, bool> isDataMap =
+	static std::map<ElfArmRelocationType, bool> isDataMap =
 		{
 			{R_ARM_NONE, false},
 			{R_ARM_PC24, false},
@@ -551,11 +550,11 @@ public:
 	}
 
 	virtual bool GetRelocationInfo(Ref<BinaryView> view, Ref<Architecture> arch,
-		vector<BNRelocationInfo>& result) override
+		std::vector<BNRelocationInfo>& result) override
 	{
 		(void)view;
 		(void)arch;
-		set<uint64_t> relocTypes;
+		std::set<uint64_t> relocTypes;
 		for (auto& reloc : result)
 		{
 			reloc.type = StandardRelocationType;
