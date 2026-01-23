@@ -37,6 +37,9 @@
 #include <QtWidgets/QHeaderView>
 #include <QtWidgets/QStyle>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QMenu>
+#include <QtWidgets/QStyledItemDelegate>
+#include <QtWidgets/QSplitter>
 #include <QtGui/QAction>
 #include <QtGui/QClipboard>
 #include <QtGui/QShortcut>
@@ -44,6 +47,8 @@
 #include <QtGui/QMouseEvent>
 #include <QtCore/QAbstractItemModel>
 #include <QtCore/QSortFilterProxyModel>
+#include <QtCore/QSettings>
+#include <QtCore/QTimer>
 #include <QtGui/QKeySequence>
 
 #include <vector>
@@ -196,15 +201,17 @@ public:
 	// Sorting
 	void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override;
 
+	// Public accessors for helpers (ContextMenuHelper, KeyboardShortcutMixin)
+	virtual bool isItemSelected(int row) const = 0;
+	virtual void setItemSelected(int row, bool selected) = 0;
+	virtual uint64_t itemAddress(int row) const = 0;
+	virtual int itemCount() const = 0;
+
 protected:
 	// Override these in subclasses
 	virtual QVariant itemData(int row, int column, int role) const = 0;
 	virtual QVariant detailData(int parentRow, int detailRow, int column, int role) const;
 	virtual int detailRowCount(int parentRow) const { return 0; }
-	virtual bool isItemSelected(int row) const = 0;
-	virtual void setItemSelected(int row, bool selected) = 0;
-	virtual uint64_t itemAddress(int row) const = 0;
-	virtual int itemCount() const = 0;
 
 	QStringList m_headers;
 	std::vector<int> m_columnWidths;
@@ -252,16 +259,26 @@ public:
 
 	void setStatus(const QString& status);
 	void setProgress(int percent);  // -1 to hide
+	void setPhase(int current, int total, const QString& phaseName);
 	void setSummary(const QString& summary);
 	void setSummary(int total, int selected);
 	void setSummary(const QString& label1, int count1, const QString& label2, int count2);
+
+	void setCancelVisible(bool visible);
+	void setRunning(bool running);
+
+Q_SIGNALS:
+	void cancelClicked();
 
 private:
 	void setupUI();
 
 	QLabel* m_statusLabel;
+	QLabel* m_phaseLabel;
 	QProgressBar* m_progress;
+	QToolButton* m_cancelButton;
 	QLabel* m_summaryLabel;
+	bool m_running = false;
 };
 
 // ============================================================================
@@ -457,6 +474,82 @@ private:
 };
 
 // ============================================================================
+// HighlightingItemDelegate - Highlight search matches in tree cells
+// ============================================================================
+
+class HighlightingItemDelegate : public QStyledItemDelegate
+{
+	Q_OBJECT
+
+public:
+	explicit HighlightingItemDelegate(QObject* parent = nullptr);
+
+	void setSearchTerm(const QString& term);
+	QString searchTerm() const { return m_searchTerm; }
+
+	void paint(QPainter* painter, const QStyleOptionViewItem& option,
+		const QModelIndex& index) const override;
+
+private:
+	QString m_searchTerm;
+	QColor m_highlightColor;
+};
+
+// ============================================================================
+// ColumnSettings - Persist column widths and sort order
+// ============================================================================
+
+class ColumnSettings
+{
+public:
+	static ColumnSettings& instance();
+
+	void saveColumnWidths(const QString& widgetId, const QHeaderView* header);
+	void restoreColumnWidths(const QString& widgetId, QHeaderView* header);
+	void saveSortColumn(const QString& widgetId, int column, Qt::SortOrder order);
+	std::pair<int, Qt::SortOrder> loadSortColumn(const QString& widgetId);
+
+private:
+	ColumnSettings() = default;
+	QSettings m_settings{"Armv5Plugin", "ColumnSettings"};
+};
+
+// ============================================================================
+// ContextMenuHelper - Build context menus for tree views
+// ============================================================================
+
+class ContextMenuHelper : public QObject
+{
+	Q_OBJECT
+
+public:
+	explicit ContextMenuHelper(QTreeView* treeView, TreeResultsModel* model,
+		QWidget* parent = nullptr);
+
+	void setNavigationCallback(std::function<void(uint64_t)> callback);
+	void setCreateFunctionCallback(std::function<void(uint64_t, bool)> callback);
+	void setApplyCallback(std::function<void()> callback);
+
+Q_SIGNALS:
+	void navigateRequested(uint64_t address);
+	void createFunctionRequested(uint64_t address, bool isThumb);
+	void applyRequested();
+
+private Q_SLOTS:
+	void showContextMenu(const QPoint& pos);
+
+private:
+	void copyAddresses();
+	void copyRowData();
+
+	QTreeView* m_treeView;
+	TreeResultsModel* m_model;
+	std::function<void(uint64_t)> m_navigateCallback;
+	std::function<void(uint64_t, bool)> m_createFunctionCallback;
+	std::function<void()> m_applyCallback;
+};
+
+// ============================================================================
 // KeyboardShortcutMixin - Add standard shortcuts to any widget
 // ============================================================================
 
@@ -466,10 +559,18 @@ public:
 	void setupStandardShortcuts(QWidget* widget, TreeResultsModel* model,
 		std::function<void()> copyCallback = nullptr);
 
+	// Extended shortcuts for tree navigation
+	void setupTreeShortcuts(QWidget* widget, QTreeView* treeView, TreeResultsModel* model,
+		std::function<void(uint64_t)> navigateCallback = nullptr);
+
 private:
 	QShortcut* m_selectAllShortcut = nullptr;
 	QShortcut* m_invertShortcut = nullptr;
 	QShortcut* m_copyShortcut = nullptr;
+	QShortcut* m_enterShortcut = nullptr;
+	QShortcut* m_spaceShortcut = nullptr;
+	QShortcut* m_escapeShortcut = nullptr;
+	QShortcut* m_findShortcut = nullptr;
 };
 
 // ============================================================================

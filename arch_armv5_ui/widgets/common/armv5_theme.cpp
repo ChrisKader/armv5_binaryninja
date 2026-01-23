@@ -15,8 +15,23 @@ Theme& Theme::instance()
 }
 
 Theme::Theme()
+	: QObject(nullptr)
 {
 	loadDefaultColors();
+}
+
+QColor Theme::bnColor(BNThemeColor bnColor)
+{
+	return getThemeColor(bnColor);
+}
+
+void Theme::refreshFromBinaryNinja()
+{
+	if (m_currentTheme == ThemeType::Default)
+	{
+		loadDefaultColors();
+		emit themeChanged();
+	}
 }
 
 void Theme::setTheme(ThemeType newTheme)

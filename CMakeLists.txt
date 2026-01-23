@@ -50,6 +50,8 @@ file(GLOB ARCH_ARMV5_SOURCES CONFIGURE_DEPENDS
     ${ARCH_ARMV5_DIR}/arch/*.h
     ${ARCH_ARMV5_DIR}/analysis/*.cpp
     ${ARCH_ARMV5_DIR}/analysis/*.h
+    ${ARCH_ARMV5_DIR}/analysis/cfg/*.cpp
+    ${ARCH_ARMV5_DIR}/analysis/cfg/*.h
     ${ARCH_ARMV5_DIR}/commands/*.cpp
     ${ARCH_ARMV5_DIR}/commands/*.h
     ${ARCH_ARMV5_DIR}/common/*.h
@@ -204,6 +206,8 @@ if(BUILD_UI_PLUGIN)
                 ${ARCH_ARMV5_DIR}/analysis/region_detector.h
                 ${ARCH_ARMV5_DIR}/analysis/function_detector.cpp
                 ${ARCH_ARMV5_DIR}/analysis/function_detector.h
+                ${ARCH_ARMV5_DIR}/analysis/function_recognizer.cpp
+                ${ARCH_ARMV5_DIR}/analysis/function_recognizer.h
                 ${ARCH_ARMV5_DIR}/analysis/string_detector.cpp
                 ${ARCH_ARMV5_DIR}/analysis/string_detector.h
                 ${ARCH_ARMV5_DIR}/analysis/structure_detector.cpp
@@ -211,8 +215,22 @@ if(BUILD_UI_PLUGIN)
                 ${ARCH_ARMV5_DIR}/analysis/crypto_detector.cpp
                 ${ARCH_ARMV5_DIR}/analysis/crypto_detector.h
                 ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.cpp
-                ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.h)
-            
+                ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.h
+                ${ARCH_ARMV5_DIR}/analysis/prologue_patterns.cpp
+                ${ARCH_ARMV5_DIR}/analysis/prologue_patterns.h
+                ${ARCH_ARMV5_DIR}/analysis/recursive_descent.cpp
+                ${ARCH_ARMV5_DIR}/analysis/recursive_descent.h
+                ${ARCH_ARMV5_DIR}/analysis/switch_resolver.cpp
+                ${ARCH_ARMV5_DIR}/analysis/switch_resolver.h
+                ${ARCH_ARMV5_DIR}/analysis/linear_sweep.cpp
+                ${ARCH_ARMV5_DIR}/analysis/linear_sweep.h
+                ${ARCH_ARMV5_DIR}/analysis/cfg/control_flow_graph.cpp
+                ${ARCH_ARMV5_DIR}/analysis/cfg/control_flow_graph.h
+                ${ARCH_ARMV5_DIR}/analysis/cfg/dominator_tree.cpp
+                ${ARCH_ARMV5_DIR}/analysis/cfg/dominator_tree.h
+                ${ARCH_ARMV5_DIR}/analysis/cfg/call_graph.cpp
+                ${ARCH_ARMV5_DIR}/analysis/cfg/call_graph.h)
+
             add_library(arch_armv5_ui SHARED ${UI_SOURCES} ${SHARED_ANALYSIS_SOURCES})
             
             # Include directories: use Homebrew Qt headers for compilation
@@ -234,6 +252,7 @@ if(BUILD_UI_PLUGIN)
             
             # Link against Binary Ninja's bundled Qt (on macOS) or system Qt (elsewhere)
             target_link_libraries(arch_armv5_ui
+                arch_armv5
                 binaryninjaapi
                 ${BN_UI_LIB}
                 ${BN_QT_CORE}

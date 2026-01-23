@@ -34,13 +34,49 @@
 #include "firmware/firmware_scan_job.h"
 #include "analysis/rtos_detector.h"
 #include "settings/plugin_settings.h"
+#include "common/armv5_utils.h"
 
 #include <thread>
+#include <fstream>
+#include <regex>
+#include <set>
 
 using namespace BinaryNinja;
+using namespace armv5;
 
 namespace
 {
+
+/**
+ * Resolve the correct platform (ARM or Thumb) for an address.
+ * 
+ * Only detects Thumb when bit 0 is explicitly set. For pure ARM binaries,
+ * addresses that are 2-byte aligned but not 4-byte aligned are invalid.
+ */
+static Ref<Platform> ResolvePlatformForAddress(
+	const Ref<BinaryView>& view,
+	uint64_t addr)
+{
+	Ref<Platform> basePlat = view->GetDefaultPlatform();
+	if (!basePlat)
+		return basePlat;
+
+	Ref<Architecture> baseArch = view->GetDefaultArchitecture();
+	if (!baseArch)
+		return basePlat;
+
+	// Only detect Thumb if bit 0 is explicitly set
+	uint64_t tempAddr = addr;
+	Ref<Architecture> targetArch = baseArch->GetAssociatedArchitectureByAddress(tempAddr);
+	if (targetArch && targetArch != baseArch)
+	{
+		Ref<Platform> related = basePlat->GetRelatedPlatform(targetArch);
+		if (related)
+			return related;
+	}
+
+	return basePlat;
+}
 
 /*
  * Check if a view is valid for ARMv5 commands.
@@ -238,7 +274,253 @@ static void RunRTOSDetection(BinaryView* view)
 	ShowNotification("RTOS detected: " + rtosName + " (" + std::to_string(result.tasks.size()) + " tasks)");
 }
 
+/*
+ * Command: Debug RTOS Detection
+ *
+ * Shows detailed information about what the RTOS detector finds.
+ */
+static void DebugRTOSDetection(BinaryView* view)
+{
+	if (!view)
+		return;
+
+	Ref<Logger> logger = GetCommandLogger();
+	if (logger)
+		logger->LogInfo("=== RTOS Detection Debug ===");
+
+	// Search for Nucleus PLUS specific strings
+	auto strings = view->GetStrings();
+	size_t nucleusStringCount = 0;
+	std::vector<std::string> nucleusPatterns = {
+		"nucleus", "nu_", "tcd_", "tmd_", "qud_",
+		"mentor", "accelerated"
+	};
+
+	if (logger)
+		logger->LogInfo("Searching %zu strings for RTOS patterns...", strings.size());
+
+	for (const auto& strRef : strings)
+	{
+		if (strRef.length > 256)
+			continue;  // Skip very long strings
+
+		DataBuffer buf = view->ReadBuffer(strRef.start, strRef.length);
+		if (buf.GetLength() == 0)
+			continue;
+
+		std::string str(reinterpret_cast<const char*>(buf.GetData()), buf.GetLength());
+
+		// Convert to lowercase for matching
+		std::string lowerStr = str;
+		std::transform(lowerStr.begin(), lowerStr.end(), lowerStr.begin(), ::tolower);
+
+		for (const auto& pattern : nucleusPatterns)
+		{
+			if (lowerStr.find(pattern) != std::string::npos)
+			{
+				nucleusStringCount++;
+				if (logger)
+					logger->LogInfo("  Found RTOS-related string at 0x%llx: \"%s\"",
+						(unsigned long long)strRef.start, str.c_str());
+				break;
+			}
+		}
+	}
+
+	// Check for symbols
+	auto allSymbols = view->GetSymbols();
+	size_t nucleusSymbolCount = 0;
+	std::vector<std::string> symbolPatterns = {
+		"NU_", "TCD_", "TMD_", "QUD_", "EVD_", "SMD_"
+	};
+
+	if (logger)
+		logger->LogInfo("Searching %zu symbols for RTOS patterns...", allSymbols.size());
+
+	for (const auto& sym : allSymbols)
+	{
+		std::string name = sym->GetShortName();
+		for (const auto& pattern : symbolPatterns)
+		{
+			if (name.find(pattern) != std::string::npos)
+			{
+				nucleusSymbolCount++;
+				if (logger)
+					logger->LogInfo("  Found RTOS-related symbol at 0x%llx: \"%s\"",
+						(unsigned long long)sym->GetAddress(), name.c_str());
+				break;
+			}
+		}
+	}
+
+	if (logger)
+	{
+		logger->LogInfo("=== Summary ===");
+		logger->LogInfo("  Nucleus-related strings: %zu", nucleusStringCount);
+		logger->LogInfo("  Nucleus-related symbols: %zu", nucleusSymbolCount);
+		logger->LogInfo("================");
+	}
+
+	// Run actual detection
+	auto result = armv5::RTOSDetector::DetectRTOS(view);
+	if (logger)
+	{
+		logger->LogInfo("Detection result: %s (confidence: %u)",
+			armv5::RTOSTypeToString(result.type), result.confidence);
+		if (!result.reason.empty())
+			logger->LogInfo("Reason: %s", result.reason.c_str());
+	}
+}
+
 static bool RunRTOSDetectionIsValid(BinaryView* view)
+{
+	return IsArmv5View(view);
+}
+
+static bool DebugRTOSDetectionIsValid(BinaryView* view)
+{
+	return IsArmv5View(view);
+}
+
+/*
+ * Command: Validate Function Detection
+ *
+ * Loads an IDC file with known function addresses and compares against
+ * our detected functions to measure precision and recall.
+ */
+static void ValidateFunctionDetection(BinaryView* view)
+{
+	if (!view)
+		return;
+
+	Ref<Logger> logger = GetCommandLogger();
+
+	// Prompt for IDC file
+	std::string idcPath;
+	if (!BinaryNinja::GetOpenFileNameInput(idcPath, "Select IDC file with known functions", "*.idc"))
+		return;
+	if (idcPath.empty())
+		return;
+
+	// Parse IDC file for MakeName entries
+	std::map<uint64_t, std::string> knownFunctions;
+	std::ifstream idcFile(idcPath);
+	if (!idcFile.is_open())
+	{
+		if (logger)
+			logger->LogError("Failed to open IDC file: %s", idcPath.c_str());
+		return;
+	}
+
+	std::string line;
+	std::regex makeNameRegex(R"(MakeName\s*\(\s*0[xX]([0-9A-Fa-f]+)\s*,\s*\"([^\"]+)\"\s*\))");
+	while (std::getline(idcFile, line))
+	{
+		std::smatch match;
+		if (std::regex_search(line, match, makeNameRegex))
+		{
+			uint64_t addr = std::stoull(match[1].str(), nullptr, 16);
+			std::string name = match[2].str();
+			knownFunctions[addr] = name;
+		}
+	}
+	idcFile.close();
+
+	if (logger)
+		logger->LogInfo("Loaded %zu known functions from IDC file", knownFunctions.size());
+
+	// Get our detected functions
+	auto detectedFuncs = view->GetAnalysisFunctionList();
+	std::set<uint64_t> detectedAddrs;
+	for (const auto& func : detectedFuncs)
+	{
+		if (func)
+			detectedAddrs.insert(func->GetStart());
+	}
+
+	if (logger)
+		logger->LogInfo("We detected %zu functions total", detectedAddrs.size());
+
+	// Calculate metrics
+	size_t truePositives = 0;   // Known functions we found
+	size_t falseNegatives = 0;  // Known functions we missed
+	size_t falsePositives = 0;  // Functions we found that aren't in the known list
+
+	std::vector<std::pair<uint64_t, std::string>> missed;
+	std::vector<uint64_t> extraFunctions;
+
+	for (const auto& [addr, name] : knownFunctions)
+	{
+		if (detectedAddrs.find(addr) != detectedAddrs.end())
+		{
+			truePositives++;
+		}
+		else
+		{
+			falseNegatives++;
+			missed.push_back({addr, name});
+		}
+	}
+
+	// Count functions we found that aren't in the known list
+	// (not necessarily false positives - the IDC list may be incomplete)
+	for (uint64_t addr : detectedAddrs)
+	{
+		if (knownFunctions.find(addr) == knownFunctions.end())
+		{
+			falsePositives++;
+			if (extraFunctions.size() < 50)  // Limit output
+				extraFunctions.push_back(addr);
+		}
+	}
+
+	// Calculate precision and recall
+	double precision = (truePositives + falsePositives > 0)
+		? (double)truePositives / (truePositives + falsePositives) : 0.0;
+	double recall = (truePositives + falseNegatives > 0)
+		? (double)truePositives / (truePositives + falseNegatives) : 0.0;
+	double f1 = (precision + recall > 0)
+		? 2.0 * (precision * recall) / (precision + recall) : 0.0;
+
+	if (logger)
+	{
+		logger->LogInfo("=== Function Detection Validation ===");
+		logger->LogInfo("Known functions (ground truth): %zu", knownFunctions.size());
+		logger->LogInfo("Detected functions: %zu", detectedAddrs.size());
+		logger->LogInfo("");
+		logger->LogInfo("True positives (found known): %zu", truePositives);
+		logger->LogInfo("False negatives (missed known): %zu", falseNegatives);
+		logger->LogInfo("Extra functions (not in ground truth): %zu", falsePositives);
+		logger->LogInfo("");
+		logger->LogInfo("Recall (coverage of known): %.2f%% (%zu/%zu)",
+			recall * 100.0, truePositives, knownFunctions.size());
+		logger->LogInfo("Precision (vs ground truth): %.2f%%", precision * 100.0);
+		logger->LogInfo("F1 Score: %.2f%%", f1 * 100.0);
+		logger->LogInfo("");
+
+		// Show some missed functions
+		if (!missed.empty())
+		{
+			logger->LogInfo("First %zu missed functions:", std::min(missed.size(), (size_t)20));
+			for (size_t i = 0; i < std::min(missed.size(), (size_t)20); i++)
+			{
+				logger->LogInfo("  0x%llx: %s",
+					(unsigned long long)missed[i].first, missed[i].second.c_str());
+			}
+		}
+
+		logger->LogInfo("=====================================");
+	}
+
+	// Show a summary notification
+	char summary[256];
+	snprintf(summary, sizeof(summary),
+		"Recall: %.1f%% (%zu/%zu known)\nExtra: %zu functions",
+		recall * 100.0, truePositives, knownFunctions.size(), falsePositives);
+	ShowNotification(summary);
+}
+
+static bool ValidateFunctionDetectionIsValid(BinaryView* view)
 {
 	return IsArmv5View(view);
 }
@@ -295,15 +577,27 @@ static void RunPrologueScan(BinaryView* view)
 
 			size_t found = ScanForFunctionPrologues(viewRef, data, dataLen, viewRef->GetDefaultEndianness(),
 				imageBase, length, armArch, thumbArch, viewRef->GetDefaultPlatform(), logger,
-				settings.enableVerboseLogging, tuning, &seededFunctions, &plan);
+				settings.enableVerboseLogging, tuning, settings.codeDataBoundary, &seededFunctions, &plan);
 
-			// Apply results
+			// Apply results with proper platform resolution and alignment validation
 			if (!plan.addFunctions.empty() || !plan.addUserFunctions.empty())
 			{
 				for (uint64_t addr : plan.addFunctions)
-					viewRef->AddFunctionForAnalysis(viewRef->GetDefaultPlatform(), addr);
+				{
+					Ref<Platform> plat = ResolvePlatformForAddress(viewRef, addr);
+					uint64_t cleanAddr = addr & ~1ULL;
+					if (!IsValidFunctionStart(viewRef, plat, cleanAddr))
+						continue;
+					viewRef->AddFunctionForAnalysis(plat, cleanAddr);
+				}
 				for (uint64_t addr : plan.addUserFunctions)
-					viewRef->CreateUserFunction(viewRef->GetDefaultPlatform(), addr);
+				{
+					Ref<Platform> plat = ResolvePlatformForAddress(viewRef, addr);
+					uint64_t cleanAddr = addr & ~1ULL;
+					if (!IsValidFunctionStart(viewRef, plat, cleanAddr))
+						continue;
+					viewRef->CreateUserFunction(plat, cleanAddr);
+				}
 			}
 
 			if (logger)
@@ -363,11 +657,17 @@ static void RunCallTargetScan(BinaryView* view)
 
 			size_t found = ScanForCallTargets(viewRef, data, dataLen, viewRef->GetDefaultEndianness(),
 				imageBase, length, viewRef->GetDefaultPlatform(), logger,
-				settings.enableVerboseLogging, tuning, &seededFunctions, &plan);
+				settings.enableVerboseLogging, tuning, settings.codeDataBoundary, &seededFunctions, &plan);
 
-			// Apply results
+			// Apply results with proper platform resolution and alignment validation
 			for (uint64_t addr : plan.addFunctions)
-				viewRef->AddFunctionForAnalysis(viewRef->GetDefaultPlatform(), addr);
+			{
+				Ref<Platform> plat = ResolvePlatformForAddress(viewRef, addr);
+				uint64_t cleanAddr = addr & ~1ULL;
+				if (!IsValidFunctionStart(viewRef, plat, cleanAddr))
+					continue;
+				viewRef->AddFunctionForAnalysis(plat, cleanAddr);
+			}
 
 			if (logger)
 				logger->LogInfo("Call target scan complete: found %zu candidates", found);
@@ -425,11 +725,17 @@ static void RunPointerTargetScan(BinaryView* view)
 
 			size_t found = ScanForPointerTargets(viewRef, data, dataLen, viewRef->GetDefaultEndianness(),
 				imageBase, length, viewRef->GetDefaultPlatform(), logger,
-				settings.enableVerboseLogging, tuning, &addedFunctions, &plan);
+				settings.enableVerboseLogging, tuning, settings.codeDataBoundary, &addedFunctions, &plan);
 
-			// Apply results
+			// Apply results with proper platform resolution and alignment validation
 			for (uint64_t addr : plan.addFunctions)
-				viewRef->AddFunctionForAnalysis(viewRef->GetDefaultPlatform(), addr);
+			{
+				Ref<Platform> plat = ResolvePlatformForAddress(viewRef, addr);
+				uint64_t cleanAddr = addr & ~1ULL;
+				if (!IsValidFunctionStart(viewRef, plat, cleanAddr))
+					continue;
+				viewRef->AddFunctionForAnalysis(plat, cleanAddr);
+			}
 
 			if (logger)
 				logger->LogInfo("Pointer target scan complete: found %zu pointer tables", found);
@@ -487,14 +793,20 @@ static void RunOrphanCodeScan(BinaryView* view)
 
 			size_t found = ScanForOrphanCodeBlocks(viewRef, data, dataLen, viewRef->GetDefaultEndianness(),
 				imageBase, length, viewRef->GetDefaultPlatform(), logger,
-				settings.enableVerboseLogging, tuning,
+				settings.enableVerboseLogging, tuning, settings.codeDataBoundary,
 				settings.orphanMinValidInstr, settings.orphanMinBodyInstr,
 				settings.orphanMinSpacingBytes, settings.orphanMaxPerPage,
 				settings.orphanRequirePrologue, &addedFunctions, &plan);
 
-			// Apply results
+			// Apply results with proper platform resolution and alignment validation
 			for (uint64_t addr : plan.addFunctions)
-				viewRef->AddFunctionForAnalysis(viewRef->GetDefaultPlatform(), addr);
+			{
+				Ref<Platform> plat = ResolvePlatformForAddress(viewRef, addr);
+				uint64_t cleanAddr = addr & ~1ULL;
+				if (!IsValidFunctionStart(viewRef, plat, cleanAddr))
+					continue;
+				viewRef->AddFunctionForAnalysis(plat, cleanAddr);
+			}
 
 			if (logger)
 				logger->LogInfo("Orphan code scan complete: found %zu orphan blocks", found);
@@ -548,7 +860,21 @@ static void RunCleanupPass(BinaryView* view)
 
 			FirmwareScanPlan plan;
 			FirmwareScanTuning tuning = settings.tuning;
+			
+			// Build protected starts from firmware view's seeded functions
 			std::set<uint64_t> protectedStarts;
+			auto* fwView = dynamic_cast<Armv5FirmwareView*>(viewRef.GetPtr());
+			if (fwView)
+			{
+				auto addProtected = [&](uint64_t addr) {
+					protectedStarts.insert(addr);
+					protectedStarts.insert(addr & ~1ULL);
+				};
+				for (uint64_t addr : fwView->GetSeededFunctions())
+					addProtected(addr);
+				for (uint64_t addr : fwView->GetSeededUserFunctions())
+					addProtected(addr);
+			}
 
 			size_t removed = CleanupInvalidFunctions(viewRef, data, dataLen, viewRef->GetDefaultEndianness(),
 				imageBase, length, logger, settings.enableVerboseLogging, tuning,
@@ -633,6 +959,19 @@ void RegisterScanCommands()
 		"Detect RTOS and apply type definitions",
 		RunRTOSDetection,
 		RunRTOSDetectionIsValid);
+
+	PluginCommand::Register(
+		"ARMv5\\Debug RTOS Detection",
+		"Show detailed debug info for RTOS detection (check Log window)",
+		DebugRTOSDetection,
+		DebugRTOSDetectionIsValid);
+
+	// Validation
+	PluginCommand::Register(
+		"ARMv5\\Validate Function Detection",
+		"Compare detected functions against an IDC file with known functions",
+		ValidateFunctionDetection,
+		ValidateFunctionDetectionIsValid);
 }
 
 }  // namespace Armv5Commands

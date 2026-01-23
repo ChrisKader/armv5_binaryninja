@@ -159,6 +159,46 @@ static inline void PlanDefineSymbol(FirmwareScanPlan* plan, const Ref<Symbol>& s
 		plan->defineSymbols.push_back(symbol);
 }
 
+/**
+ * Resolve the correct platform (ARM or Thumb) for an address.
+ *
+ * ARM uses bit 0 to indicate Thumb mode in branch targets. This function
+ * checks if the address has bit 0 set and returns the appropriate platform.
+ *
+ * Note: We only detect Thumb when bit 0 is explicitly set. For pure ARM
+ * binaries, addresses that are 2-byte aligned but not 4-byte aligned are
+ * simply invalid and should be rejected by IsValidFunctionStart.
+ *
+ * @param view The binary view
+ * @param basePlat The default platform (usually ARM)
+ * @param addr The address to check (may have Thumb bit set)
+ * @return The resolved platform (ARM or Thumb)
+ */
+static Ref<Platform> ResolvePlatformForAddress(
+	const Ref<BinaryView>& view,
+	const Ref<Platform>& basePlat,
+	uint64_t addr)
+{
+	if (!view || !basePlat)
+		return basePlat;
+
+	Ref<Architecture> baseArch = view->GetDefaultArchitecture();
+	if (!baseArch)
+		return basePlat;
+
+	// Only detect Thumb if bit 0 is explicitly set
+	uint64_t tempAddr = addr;
+	Ref<Architecture> targetArch = baseArch->GetAssociatedArchitectureByAddress(tempAddr);
+	if (targetArch && targetArch != baseArch)
+	{
+		Ref<Platform> related = basePlat->GetRelatedPlatform(targetArch);
+		if (related)
+			return related;
+	}
+
+	return basePlat;
+}
+
 /*
  * NOTE: IsValidFunctionStart is now in common/armv5_utils.h
  * Use armv5::IsValidFunctionStart(view, platform, addr, logger, label) instead.
@@ -484,10 +524,12 @@ static bool ValidateFirmwareFunctionCandidate(const Ref<BinaryView>& view, const
 }
 
 static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* data, uint64_t dataLen,
-	BNEndianness endian, uint64_t imageBase, const Ref<Function>& func)
+	BNEndianness endian, uint64_t imageBase, const Ref<Function>& func, uint64_t* invalidAddr = nullptr)
 {
 	if (!view || !view->GetObject() || !func)
 		return false;
+	if (invalidAddr)
+		*invalidAddr = 0;
 	Ref<Architecture> arch = func->GetArchitecture();
 	if (!arch)
 		arch = view->GetDefaultArchitecture();
@@ -499,18 +541,137 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 	const uint64_t end = (highest >= start) ? (highest + arch->GetDefaultIntegerSize()) : start;
 	if (end <= start)
 		return false;
+	
+	// Quick checks for data-as-code patterns
+	const uint64_t startOffset = start - imageBase;
+	if (startOffset + 32 <= dataLen)
+	{
+		int eqCount = 0;
+		int lowCondCount = 0;  // Conditions 0-3 (EQ, NE, CS, CC) - common in data with low bytes
+		int branchOrCallCount = 0;
+		int dataPatternScore = 0;
+		
+		for (int i = 0; i < 8; i++)
+		{
+			if (startOffset + (i + 1) * 4 > dataLen)
+				break;
+				
+			uint32_t word = 0;
+			memcpy(&word, data + startOffset + i * 4, sizeof(word));
+			if (endian == BigEndian)
+				word = Swap32(word);
+			
+			// Skip zeros/FFs
+			if (word == 0 || word == 0xFFFFFFFF)
+				continue;
+			
+			uint32_t cond = (word >> 28) & 0xF;
+			if (cond == 0x0)
+				eqCount++;
+			if (cond <= 0x3)
+				lowCondCount++;
+			
+			// Check for branches/calls (real code usually has these)
+			uint32_t opcode = (word >> 24) & 0xFF;
+			// B, BL have opcode 0xEA-0xEB (unconditional) or 0x?A-0x?B
+			if ((opcode & 0x0F) == 0x0A || (opcode & 0x0F) == 0x0B)
+				branchOrCallCount++;
+			// BX/BLX register
+			if ((word & 0x0FFFFFF0) == 0x012FFF10 || (word & 0x0FFFFFF0) == 0x012FFF30)
+				branchOrCallCount++;
+			
+			// Data patterns: unusual shift amounts, weird register combinations
+			// All operands r0 with unusual shifts is suspicious
+			uint32_t rn = (word >> 16) & 0xF;
+			uint32_t rd = (word >> 12) & 0xF;
+			uint32_t rm = word & 0xF;
+			if (rn == 0 && rd == 0 && rm == 0 && (word & 0x0E000000) == 0x00000000)
+				dataPatternScore++;  // Data processing with all r0 - suspicious
+		}
+		
+		// If 3+ of first 8 instructions have EQ condition -> data
+		if (eqCount >= 3)
+			return false;
+		
+		// If 5+ have low conditions (0-3) -> likely data
+		if (lowCondCount >= 5)
+			return false;
+		
+		// If no branches/calls in first 8 AND high data pattern score -> data
+		if (branchOrCallCount == 0 && dataPatternScore >= 4)
+			return false;
+	}
+
+	// Strict validation: all instructions in basic blocks must decode.
+	// This ensures we do not keep functions that contain invalid instructions.
+	const size_t align = arch->GetInstructionAlignment();
+	const size_t maxLen = arch->GetMaxInstructionLength();
+	uint64_t maxBlockEnd = start;
+	for (const auto& block : func->GetBasicBlocks())
+	{
+		uint64_t cur = block->GetStart();
+		const uint64_t blockEnd = block->GetEnd();
+		if (blockEnd > maxBlockEnd)
+			maxBlockEnd = blockEnd;
+		while (cur < blockEnd)
+		{
+			if (ScanShouldAbort(view))
+				return false;
+			if (cur < imageBase)
+				return false;
+			uint64_t offset = cur - imageBase;
+			if (offset + align > dataLen)
+				return false;
+			size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
+			InstructionInfo info;
+			if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
+			{
+				if (invalidAddr)
+					*invalidAddr = cur;
+				return false;
+			}
+			cur += info.length;
+		}
+	}
+
+	// If the function's highest address extends past the last basic block,
+	// validate the tail bytes as well (functions should not include invalid data).
+	const uint64_t funcEnd = (highest >= start) ? (highest + arch->GetDefaultIntegerSize()) : start;
+	if (funcEnd > maxBlockEnd)
+	{
+		uint64_t cur = maxBlockEnd;
+		while (cur < funcEnd)
+		{
+			if (ScanShouldAbort(view))
+				return false;
+			if (cur < imageBase)
+				return false;
+			uint64_t offset = cur - imageBase;
+			if (offset + align > dataLen)
+				return false;
+			size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
+			InstructionInfo info;
+			if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
+			{
+				if (invalidAddr)
+					*invalidAddr = cur;
+				return false;
+			}
+			cur += info.length;
+		}
+	}
 
 	const uint64_t maxBytes = 0x800;
 	uint64_t sizeBytes = end - start;
 	if (sizeBytes > maxBytes)
 		sizeBytes = maxBytes;
 
-	const size_t align = arch->GetInstructionAlignment();
-	const size_t maxLen = arch->GetMaxInstructionLength();
 	uint64_t cur = start;
 	uint64_t processed = 0;
 	size_t valid = 0;
 	size_t invalid = 0;
+	size_t eqConditionCount = 0;  // Count instructions with EQ condition (0x0)
+	size_t totalArmInstructions = 0;
 
 	while (processed + align <= sizeBytes)
 	{
@@ -533,6 +694,13 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 				processed += align;
 				continue;
 			}
+			
+			// Check for suspicious "data-as-code" patterns
+			// Condition code 0x0 (EQ) means zeros in high nibble - common for data
+			uint32_t cond = (word >> 28) & 0xF;
+			if (cond == 0x0)
+				eqConditionCount++;
+			totalArmInstructions++;
 		}
 
 		size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
@@ -553,6 +721,16 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 	const size_t total = valid + invalid;
 	if (total == 0)
 		return false;
+	
+	// If most instructions have EQ condition (condition code 0), this is likely data
+	// Real code rarely has more than 20% EQ-condition instructions
+	if (totalArmInstructions >= 4)
+	{
+		double eqRatio = static_cast<double>(eqConditionCount) / static_cast<double>(totalArmInstructions);
+		if (eqRatio >= 0.6)  // 60%+ EQ condition = almost certainly data
+			return false;
+	}
+	
 	const double ratio = static_cast<double>(valid) / static_cast<double>(total);
 	return (valid >= 2) && (ratio >= 0.6);
 }
@@ -670,7 +848,8 @@ static bool LooksLikeReturnThunk(const uint8_t* data, uint64_t dataLen, BNEndian
 size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Architecture> armArch, Ref<Architecture> thumbArch, Ref<Platform> plat, Ref<Logger> logger,
-	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
+	bool verboseLog, const FirmwareScanTuning& tuning, uint64_t codeDataBoundary,
+	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t prologuesFound = 0;
 	size_t totalWords = 0;
@@ -707,7 +886,8 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
 				continue;
-			if (!IsValidFunctionStart(view, plat, addr, log, "Prologue scan"))
+			Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, addr);
+			if (!IsValidFunctionStart(view, targetPlat, addr, log, "Prologue scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -719,10 +899,25 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 				addedCount++;
 				continue;
 			}
-			if (view->AddFunctionForAnalysis(plat, addr, true))
+			// HARD BOUNDARY: Don't create functions in known data regions
+			uint64_t cleanAddr = addr & ~1ULL;  // Clear Thumb bit for actual address
+			uint64_t dataBoundary = codeDataBoundary;
+			if (dataBoundary == 0)
+			{
+				// Auto-detect: skip addresses that are very high in the binary
+				dataBoundary = imageBase + (length / 2);
+			}
+			if (cleanAddr >= dataBoundary)
+			{
+				if (log)  // Always log, not just verbose
+					log->LogInfo("SKIPPING function at 0x%llx - in data region (>= 0x%llx)",
+						(unsigned long long)cleanAddr, (unsigned long long)dataBoundary);
+				continue;
+			}
+			if (view->AddFunctionForAnalysis(targetPlat, cleanAddr, true))
 			{
 				if (seededFunctions)
-					seededFunctions->insert(addr);
+					seededFunctions->insert(cleanAddr);
 				addedCount++;
 			}
 		}
@@ -1034,7 +1229,7 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
-	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
+	uint64_t codeDataBoundary, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t targetsFound = 0;
 	uint64_t scanLen = (dataLen < length) ? dataLen : length;
@@ -1080,7 +1275,8 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
 				continue;
-			if (!IsValidFunctionStart(view, plat, addr, log, "Pointer scan"))
+			Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, addr);
+			if (!IsValidFunctionStart(view, targetPlat, addr, log, "Pointer scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -1092,10 +1288,11 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 				addedCount++;
 				continue;
 			}
-			if (view->AddFunctionForAnalysis(plat, addr, true))
+			uint64_t cleanAddr = addr & ~1ULL;  // Clear Thumb bit
+			if (view->AddFunctionForAnalysis(targetPlat, cleanAddr, true))
 			{
 				if (seededFunctions)
-					seededFunctions->insert(addr);
+					seededFunctions->insert(cleanAddr);
 				addedCount++;
 			}
 		}
@@ -1106,10 +1303,12 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	auto addFunction = [&](uint64_t funcAddr, const char* source, bool requireBoundary) {
 		if (ScanShouldAbort(view))
 			return;
-		// For ARM mode, addresses must be 4-byte aligned.
-		// Strip any Thumb bit and reject misaligned addresses.
-		uint64_t alignedAddr = funcAddr & ~3ULL;
-		if (funcAddr & 3)
+		// Resolve platform based on address (ARM vs Thumb)
+		Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, funcAddr);
+		Ref<Architecture> targetArch = targetPlat->GetArchitecture();
+		size_t alignment = targetArch ? targetArch->GetInstructionAlignment() : 4;
+		uint64_t alignedAddr = funcAddr & ~(alignment - 1);
+		if (funcAddr != alignedAddr && !(funcAddr & 1))  // Allow Thumb bit, reject other misalignment
 		{
 			skipMisaligned++;
 			return;
@@ -1444,7 +1643,7 @@ size_t ScanForCallTargets(const Ref<BinaryView>& view, const uint8_t* data,
 size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
-	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
+	uint64_t codeDataBoundary, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t targetsFound = 0;
 	std::set<uint64_t> addedAddrs;
@@ -1492,7 +1691,8 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
 				continue;
-			if (!IsValidFunctionStart(view, plat, addr, log, "Orphan scan"))
+			Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, addr);
+			if (!IsValidFunctionStart(view, targetPlat, addr, log, "Orphan scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -1504,10 +1704,11 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 				addedCount++;
 				continue;
 			}
-			if (view->AddFunctionForAnalysis(plat, addr, true))
+			uint64_t cleanAddr = addr & ~1ULL;  // Clear Thumb bit
+			if (view->AddFunctionForAnalysis(targetPlat, cleanAddr, true))
 			{
 				if (seededFunctions)
-					seededFunctions->insert(addr);
+					seededFunctions->insert(cleanAddr);
 				addedCount++;
 			}
 		}
@@ -1520,12 +1721,17 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 	auto addFunction = [&](uint64_t funcAddr) {
 		if (ScanShouldAbort(view))
 			return;
-		uint64_t alignedAddr = funcAddr & ~3ULL;
-		if (funcAddr & 3)
+		// Resolve platform and check alignment based on architecture
+		Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, funcAddr);
+		Ref<Architecture> targetArch = targetPlat->GetArchitecture();
+		size_t alignment = targetArch ? targetArch->GetInstructionAlignment() : 4;
+		uint64_t alignedAddr = funcAddr & ~(alignment - 1);
+		if (funcAddr != alignedAddr && !(funcAddr & 1))  // Allow Thumb bit
 		{
 			skipMisaligned++;
 			return;
 		}
+		alignedAddr = funcAddr & ~1ULL;  // Clear Thumb bit for bounds check
 		if (alignedAddr < imageBase || alignedAddr >= imageEnd)
 		{
 			skipOutOfBounds++;
@@ -1905,9 +2111,8 @@ size_t ScanForPointerTargets(const Ref<BinaryView>& view, const uint8_t* data,
 size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	Ref<Platform> plat, Ref<Logger> logger, bool verboseLog, const FirmwareScanTuning& tuning,
-	uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes, uint32_t maxPerPage,
-	bool requirePrologue,
-	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
+	uint64_t codeDataBoundary, uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes,
+	uint32_t maxPerPage, bool requirePrologue, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan)
 {
 	size_t orphansFound = 0;
 	size_t blocksScanned = 0;
@@ -1942,7 +2147,8 @@ size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 				break;
 			if (!EnsureAddressInsideView(view, log, "AddFunction", addr))
 				continue;
-			if (!IsValidFunctionStart(view, plat, addr, log, "Orphan scan"))
+			Ref<Platform> targetPlat = ResolvePlatformForAddress(view, plat, addr);
+			if (!IsValidFunctionStart(view, targetPlat, addr, log, "Orphan scan"))
 				continue;
 			if (!actionPolicy.allowAddFunction)
 				continue;
@@ -1954,10 +2160,11 @@ size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 				addedCount++;
 				continue;
 			}
-			if (view->AddFunctionForAnalysis(plat, addr, true))
+			uint64_t cleanAddr = addr & ~1ULL;  // Clear Thumb bit
+			if (view->AddFunctionForAnalysis(targetPlat, cleanAddr, true))
 			{
 				if (seededFunctions)
-					seededFunctions->insert(addr);
+					seededFunctions->insert(cleanAddr);
 				addedCount++;
 			}
 		}
@@ -1990,6 +2197,33 @@ size_t ScanForOrphanCodeBlocks(const Ref<BinaryView>& view, const uint8_t* data,
 		}
 		// SUB sp, sp, #imm (stack allocation)
 		if ((instr & 0xFFFFF000) == 0xE24DD000)
+			return true;
+		// STR lr, [sp, #-4]! (pre-indexed store of LR)
+		// Encoding: E52DE004
+		if ((instr & 0x0FFFFFFF) == 0x052DE004)
+			return true;
+		// STR lr, [sp, #-imm]! (pre-indexed store of LR with any offset)
+		// Encoding: E52DEimm where imm is 12-bit offset
+		if ((instr & 0x0FFF0000) == 0x052D0000 && ((instr >> 12) & 0xF) == REG_LR)
+			return true;
+		// MOV ip, sp (ARMCC frame pointer setup, often followed by STMFD)
+		// Encoding: E1A0C00D
+		if ((instr & 0x0FFFFFFF) == 0x01A0C00D)
+			return true;
+		// MOV r11, sp (frame pointer setup)
+		// Encoding: E1A0B00D
+		if ((instr & 0x0FFFFFFF) == 0x01A0B00D)
+			return true;
+		// LDR rX, [pc, #imm] - common startup/initialization pattern
+		// This loads constants from literal pool, often first instruction of startup code.
+		// Encoding: E59FXnnn where X is any register (including r0-r3)
+		// bits 27:20 = 0x59 (LDR immediate, pre-indexed, up, no writeback)
+		// bits 19:16 = 0xF (Rn = PC)
+		if ((instr & 0x0FFF0000) == 0x059F0000)
+			return true;
+		// B/BL - sometimes functions start with an unconditional branch (e.g., exception vectors)
+		// Encoding: EAxxxxxx (B) or EBxxxxxx (BL)
+		if ((instr & 0x0F000000) == 0x0A000000 || (instr & 0x0F000000) == 0x0B000000)
 			return true;
 		return false;
 	};
@@ -2223,7 +2457,10 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 	const auto& actionPolicy = Armv5Settings::GetFirmwareActionPolicy();
 	Ref<Platform> defaultPlat = view->GetDefaultPlatform();
 	FirmwareScanTuning cleanupTuning = tuning;
-	cleanupTuning.minValidInstr = 1;
+	// Require at least 2 valid instructions for cleanup validation.
+	// A single valid instruction isn't enough evidence to keep a function
+	// that failed the body validation check.
+	cleanupTuning.minValidInstr = 2;
 	cleanupTuning.minBodyInstr = 0;
 
 	std::vector<uint64_t> toRemove;
@@ -2233,12 +2470,15 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		if (ScanShouldAbort(view))
 			break;
 		scanned++;
-		if (!func || !func->WasAutomaticallyDiscovered())
+		if (!func)
 		{
 			skipUser++;
 			continue;
 		}
 
+		// Only skip functions with user-defined symbols (user explicitly named them)
+		// Don't skip based on WasAutomaticallyDiscovered() - our plugin creates "user" 
+		// functions via CreateUserFunction but we still want to clean up invalid ones
 		Ref<Symbol> sym = func->GetSymbol();
 		if (sym && !sym->IsAutoDefined())
 		{
@@ -2246,16 +2486,26 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			continue;
 		}
 
-		if (func->GetBasicBlocks().empty())
+		uint64_t start = func->GetStart();
+
+		// Check if function has basic blocks
+		bool hasBlocks = !func->GetBasicBlocks().empty();
+		if (!hasBlocks)
 		{
-			skipNoBlocks++;
+			// Function has no basic blocks - this happens when analysis fails
+			// due to invalid instructions. Remove these functions.
+			if (verboseLog && logger)
+				logger->LogInfo("Cleanup: removing function at 0x%llx - no basic blocks (invalid instructions)",
+					(unsigned long long)start);
+			toRemove.push_back(start);
+			removed++;
 			continue;
 		}
-
-		uint64_t start = func->GetStart();
 		if (start < imageBase || start >= imageBase + length)
 			continue;
-		if (start == entryPoint || protectedStarts.find(start) != protectedStarts.end())
+		const bool isEntryPoint = (start == entryPoint);
+		const bool isProtected = (protectedStarts.find(start) != protectedStarts.end());
+		if (isEntryPoint)
 		{
 			skipProtected++;
 			continue;
@@ -2268,12 +2518,6 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		if (maxSizeBytes > 0 && sizeBytes > maxSizeBytes)
 		{
 			skipTooLarge++;
-			continue;
-		}
-
-		if (requireZeroRefs && !view->GetCodeReferences(start).empty())
-		{
-			skipHasRefs++;
 			continue;
 		}
 
@@ -2301,21 +2545,117 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			continue;
 		}
 
-		if (ValidateFunctionBody(view, data, dataLen, endian, imageBase, func))
+		// Check for functions that are too small to be real
+		// Count how many instructions were actually decoded
+		size_t decodedInstructions = 0;
+		uint64_t currentAddr = start;
+		const uint64_t maxCheck = start + 32;  // Check up to 32 bytes (8 instructions)
+
+		while (currentAddr < maxCheck && currentAddr < imageBase + length)
 		{
+			if (offset + (currentAddr - start) + 4 > dataLen)
+				break;
+
+			uint32_t instr = 0;
+			memcpy(&instr, data + offset + (currentAddr - start), sizeof(instr));
+			if (endian == BigEndian)
+				instr = Swap32(instr);
+
+			armv5::Instruction decoded;
+			memset(&decoded, 0, sizeof(decoded));
+			if (armv5::armv5_decompose(instr, &decoded, (uint32_t)currentAddr, (uint32_t)(endian == BigEndian)) == 0)
+			{
+				decodedInstructions++;
+				currentAddr += 4;  // ARM instructions are 4 bytes
+			}
+			else
+			{
+				break;  // Stop at first invalid instruction
+			}
+		}
+
+		// Functions with fewer than 2 successfully decoded instructions are suspicious (except vector handlers)
+		if (decodedInstructions < 2 && start >= imageBase + 0x100)  // Skip vector table area
+		{
+			if (logger)  // Always log for debugging
+				logger->LogInfo("Cleanup: REMOVING tiny function at 0x%llx - only %zu decoded instructions",
+					(unsigned long long)start, decodedInstructions);
+			toRemove.push_back(start);
+			removed++;
+			continue;
+		}
+
+		/*
+		 * Check if the function body has truly invalid instructions.
+		 * If ValidateFunctionBody returns false, the function has too many
+		 * invalid instructions to be real code.
+		 */
+		uint64_t invalidAddr = 0;
+		bool bodyValid = ValidateFunctionBody(view, data, dataLen, endian, imageBase, func, &invalidAddr);
+		
+		// Additional check: if function has no return and looks like data, it's invalid
+		// Functions marked as "infinite loop" often are data being misinterpreted
+		if (bodyValid)
+		{
+			// Check if function has any return blocks
+			bool hasReturn = false;
+			for (const auto& block : func->GetBasicBlocks())
+			{
+				if (block->CanExit())
+					hasReturn = true;
+			}
+			
+			// If no return, check for additional data indicators
+			if (!hasReturn && offset + 16 <= dataLen)
+			{
+				// Check if first 4 instructions have same opcode pattern (common in data tables)
+				int sameOpcodeCount = 0;
+				uint32_t prevOpcode = 0;
+				for (int i = 0; i < 4; i++)
+				{
+					uint32_t word = 0;
+					memcpy(&word, data + offset + i * 4, sizeof(word));
+					if (endian == BigEndian)
+						word = Swap32(word);
+					if (word == 0 || word == 0xFFFFFFFF)
+						continue;
+					// Extract major opcode (bits 27:20)
+					uint32_t opcode = (word >> 20) & 0xFF;
+					if (i > 0 && opcode == prevOpcode)
+						sameOpcodeCount++;
+					prevOpcode = opcode;
+				}
+				// 3+ consecutive same opcode = likely data table
+				if (sameOpcodeCount >= 2)
+					bodyValid = false;
+			}
+		}
+		
+		if (bodyValid)
+		{
+			if (isProtected)
+			{
+				skipProtected++;
+				continue;
+			}
 			skipBodyValid++;
 			continue;
 		}
 
-		candidates++;
-		if (ValidateFirmwareFunctionCandidate(view, data, dataLen, endian, imageBase, length,
-			start, cleanupTuning, false, true))
+		// Body validation failed: remove unconditionally.
+		// If a function contains any invalid instruction, it is not code.
+		if (invalidAddr != 0)
 		{
-			skipValid++;
-			continue;
+			DataVariable existing;
+			if (!view->GetDataVariableAtAddress(invalidAddr, existing))
+			{
+				Ref<Type> invalidType = Type::IntegerType(4, false);
+				if (EnsureAddressInsideView(view, logger, "DefineDataVariable", invalidAddr))
+					view->DefineDataVariable(invalidAddr, invalidType);
+			}
 		}
-
 		toRemove.push_back(start);
+		removed++;
 	}
 
 	for (uint64_t start : toRemove)
@@ -2359,9 +2699,9 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			logger->LogInfo(
 				"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
 				"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu "
-				"skip_body_valid=%zu skip_no_blocks=%zu",
+				"skip_body_valid=%zu removed_no_blocks=%zu removed_invalid=%zu",
 				skipUser, skipProtected, skipTooLarge, skipHasRefs,
-				skipNonPcWrite, skipValid, skipNoData, skipBodyValid, skipNoBlocks);
+				skipNonPcWrite, skipValid, skipNoData, skipBodyValid, skipNoBlocks, removed);
 	}
 
 	return removed;
@@ -2530,6 +2870,21 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx)
 			continue;
 		if (ctx.view->GetCodeReferences(addr).empty())
 			continue;
+
+		// Don't clear data variables that look like strings
+		// Strings are arrays of 1-byte integers (chars) that are auto-discovered
+		Ref<Type> varType = dataVar.type.GetValue();
+		if (varType && varType->GetClass() == ArrayTypeClass)
+		{
+			Ref<Type> elementType = varType->GetChildType().GetValue();
+			if (elementType && elementType->GetClass() == IntegerTypeClass &&
+				elementType->GetWidth() == 1)
+			{
+				// This looks like a string (char array) - don't clear it
+				continue;
+			}
+		}
+
 		withCodeRefs++;
 
 		uint64_t offset = addr - ctx.imageBase;

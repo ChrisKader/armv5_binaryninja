@@ -290,9 +290,11 @@ QWidget* RegionDetectorWidget::createSettingsWidget()
 	
 	m_presetCombo = new QComboBox(m_settingsPanel);
 	m_presetCombo->addItem("Default");
+	m_presetCombo->addItem("Firmware Safe (Recommended)");
 	m_presetCombo->addItem("Aggressive (More Regions)");
 	m_presetCombo->addItem("Conservative (Fewer False Positives)");
 	m_presetCombo->addItem("Custom");
+	m_presetCombo->setCurrentIndex(1);  // Default to Firmware Safe for ARM firmware
 	m_presetCombo->setMaximumWidth(200);
 	presetRow->addWidget(m_presetCombo);
 	presetRow->addStretch();
@@ -569,7 +571,7 @@ void RegionDetectorWidget::onFiltersChanged()
 
 void RegionDetectorWidget::onPresetChanged(int index)
 {
-	if (index < 3)  // Not custom
+	if (index < 4)  // Not custom
 		applyPreset(index);
 }
 
@@ -636,7 +638,19 @@ void RegionDetectorWidget::applyPreset(int index)
 		m_windowSize->setValue(256);
 		m_windowStep->setValue(64);
 		break;
-	case 1:  // Aggressive
+	case 1:  // Firmware Safe (Recommended)
+		// Only detect major sections, skip embedded literal pools
+		m_codeEntropyMin->setValue(4.0);
+		m_codeEntropyMax->setValue(7.5);
+		m_compressedEntropyMin->setValue(7.8);
+		m_minCodeDensity->setValue(0.75);
+		m_minRegionSize->setValue(16384);   // 16KB minimum for any region
+		m_minCodeRegion->setValue(32768);   // 32KB minimum for code sections
+		m_paddingThreshold->setValue(128);  // Larger padding detection (flash=0xFF)
+		m_windowSize->setValue(16384);      // 16KB window for major regions
+		m_windowStep->setValue(4096);
+		break;
+	case 2:  // Aggressive
 		m_codeEntropyMin->setValue(4.0);
 		m_codeEntropyMax->setValue(7.5);
 		m_compressedEntropyMin->setValue(7.8);
@@ -647,7 +661,7 @@ void RegionDetectorWidget::applyPreset(int index)
 		m_windowSize->setValue(128);
 		m_windowStep->setValue(32);
 		break;
-	case 2:  // Conservative
+	case 3:  // Conservative
 		m_codeEntropyMin->setValue(5.0);
 		m_codeEntropyMax->setValue(6.5);
 		m_compressedEntropyMin->setValue(7.5);
@@ -688,6 +702,23 @@ void RegionDetectorWidget::scanRegions()
 	settings.detectLiteralPools = m_detectLiteralPools->isChecked();
 	settings.detectMMIOPatterns = m_detectMMIO->isChecked();
 	settings.mergeAdjacentRegions = m_mergeRegions->isChecked();
+
+	// Enable function-aware filtering for Firmware Safe preset
+	// (index 1 in the combo box)
+	if (m_presetCombo && m_presetCombo->currentIndex() == 1)
+	{
+		settings.useFunctionAwareness = true;
+		settings.literalPoolMaxSize = 4096;      // Skip data up to 4KB (literal pools)
+		settings.minMajorDataSection = 16384;    // 16KB minimum for data sections
+		settings.minMajorCodeSection = 32768;    // 32KB minimum for code sections
+		settings.minDataRegion = 16384;          // Also set minDataRegion
+		settings.skipEmbeddedData = true;
+		settings.embeddedDataMaxGap = 4096;      // 4KB gap tolerance
+		settings.mergeGapThreshold = 65536;      // 64KB - aggressively merge same-type
+
+		// Disable string detection - it misclassifies pointer tables as strings
+		settings.minStringDensity = 0.9;         // Very high threshold to avoid false positives
+	}
 
 	// Run detection
 	Armv5Analysis::RegionDetector detector(m_data);

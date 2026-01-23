@@ -120,6 +120,14 @@ struct RegionDetectionSettings
 	uint32_t windowStep = 64;         // Step between windows
 	bool mergeAdjacentRegions = true; // Merge same-type adjacent regions
 	uint32_t mergeGapThreshold = 64;  // Max gap to merge
+
+	// Function-aware filtering (for firmware mode)
+	bool useFunctionAwareness = false;  // Check existing functions before creating data sections
+	uint64_t literalPoolMaxSize = 1024; // Max size for embedded literal pools (skip as sections)
+	uint64_t minMajorDataSection = 4096; // Minimum size for a "real" data section
+	uint64_t minMajorCodeSection = 8192; // Minimum size for a "real" code section
+	bool skipEmbeddedData = false;       // Skip small data regions surrounded by code
+	uint32_t embeddedDataMaxGap = 256;   // Max distance from code to consider "embedded"
 };
 
 /**
@@ -170,6 +178,17 @@ public:
 	 */
 	static RegionDetectionSettings ConservativeSettings();
 
+	/**
+	 * Get firmware-safe settings (only major sections, ignores embedded data)
+	 *
+	 * This is the recommended mode for raw ARM firmware. It:
+	 * - Only creates sections for large regions (>4KB for data, >8KB for code)
+	 * - Ignores literal pools and small data tables embedded in code
+	 * - Uses function boundaries to avoid splitting code regions
+	 * - Is very conservative to avoid incorrect section boundaries
+	 */
+	static RegionDetectionSettings FirmwareSafeSettings();
+
 private:
 	// Analysis methods
 	double CalculateEntropy(uint64_t start, uint64_t size);
@@ -179,6 +198,7 @@ private:
 	bool IsValidThumbInstruction(uint16_t instr);
 	bool IsPadding(uint64_t start, uint64_t size);
 	bool IsLiteralPool(uint64_t start, uint64_t size);
+	bool LooksLikePointerTable(uint64_t start, uint64_t size);
 	bool LooksLikeMMIO(uint64_t addr);
 	
 	// Region classification
@@ -191,7 +211,12 @@ private:
 	
 	// Name generation
 	std::string GenerateRegionName(const DetectedRegion& region, int index);
-	
+
+	// Function-aware filtering
+	bool IsInsideOrNearFunction(uint64_t start, uint64_t end);
+	bool IsEmbeddedInCode(uint64_t start, uint64_t end);
+	bool ShouldSkipAsLiteralPool(uint64_t start, uint64_t size, RegionType type);
+
 	BinaryNinja::Ref<BinaryNinja::BinaryView> m_view;
 	RegionDetectionSettings m_settings;
 	BinaryNinja::Ref<BinaryNinja::Logger> m_logger;

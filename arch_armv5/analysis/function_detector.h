@@ -75,13 +75,16 @@ enum class DetectionSource : uint32_t
 	// Statistical
 	InstructionSequence  = 1 << 24,  // Common instruction patterns
 	EntropyTransition    = 1 << 25,  // Data->code entropy change
-	
+
+	// CFG-based validation (Phase 2 - Graph Analysis)
+	CfgValidated         = 1 << 26,  // Valid CFG can be built from this entry
+
 	// Negative (reduce score)
-	MidInstruction       = 1 << 26,  // In middle of instruction
-	InsideFunction       = 1 << 27,  // Already inside known function
-	DataRegion           = 1 << 28,  // Marked as data
-	InvalidInstruction   = 1 << 29,  // Cannot decode
-	UnlikelyPattern      = 1 << 30,  // Anti-pattern detected
+	MidInstruction       = 1 << 27,  // In middle of instruction
+	InsideFunction       = 1 << 28,  // Already inside known function
+	DataRegion           = 1 << 29,  // Marked as data
+	InvalidInstruction   = 1 << 30,  // Cannot decode
+	UnlikelyPattern      = 1U << 31, // Anti-pattern detected
 };
 
 /**
@@ -94,13 +97,20 @@ struct FunctionCandidate
 	double score;                   // Combined score (0.0 - 1.0)
 	uint32_t sources;               // Bitmask of DetectionSource
 	std::string description;        // Human-readable explanation
-	
+
 	// Detailed scores per source
 	std::map<DetectionSource, double> sourceScores;
-	
+
 	// Anti-patterns detected
 	std::vector<std::string> warnings;
-	
+
+	// CFG validation results (Phase 2)
+	bool cfgValidated = false;
+	size_t cfgBlockCount = 0;
+	size_t cfgEdgeCount = 0;
+	size_t cfgLoopCount = 0;
+	int cfgComplexity = 0;          // Cyclomatic complexity
+
 	bool operator<(const FunctionCandidate& other) const
 	{
 		return score > other.score;  // Higher score = better
@@ -177,13 +187,36 @@ struct FunctionDetectionSettings
 	// Statistical
 	DetectorConfig instructionSequence = {true, 0.8, 0.5};
 	DetectorConfig entropyTransition = {true, 0.7, 0.5};
-	
+
+	// CFG-based validation (high confidence - validates structure)
+	DetectorConfig cfgValidation = {true, 2.0, 0.3};
+	bool useCfgValidation = true;           // Enable CFG-based validation
+	size_t cfgMaxBlocks = 200;              // Max blocks to explore per candidate
+	size_t cfgMaxInstructions = 5000;       // Max instructions per candidate
+
+	// Linear sweep (Nucleus-style basic block grouping)
+	bool useLinearSweep = true;             // Enable linear sweep discovery
+	double linearSweepWeight = 1.8;         // Weight for linear sweep candidates
+	size_t linearSweepMaxBlocks = 50000;    // Max blocks for linear sweep
+	double linearSweepMinConfidence = 0.3;  // Min confidence from linear sweep
+
+	// Switch table resolution
+	bool useSwitchResolution = true;        // Enable switch table resolution
+	double switchTargetWeight = 1.5;        // Weight for switch case targets
+	size_t switchMaxTables = 1000;          // Max tables to resolve
+
+	// Tail call analysis (stack-based)
+	bool useTailCallAnalysis = true;        // Enable stack-based tail call detection
+	double tailCallTargetWeight = 1.6;      // Weight for tail call targets
+	size_t tailCallMaxDepth = 32;           // Max instructions to analyze per function
+
 	// Negative weights (subtracted from score)
 	double midInstructionPenalty = 1.0;
 	double insideFunctionPenalty = 0.8;
 	double dataRegionPenalty = 0.9;
 	double invalidInstructionPenalty = 0.5;
 	double unlikelyPatternPenalty = 0.3;
+	double epiloguePenalty = 5.0;           // Very strong penalty for epilogue instructions (always reject)
 	
 	// Scanning parameters
 	uint32_t maxCandidates = 10000;
@@ -288,6 +321,10 @@ private:
 	void ScanRtosPatterns(std::map<uint64_t, FunctionCandidate>& candidates);
 	void ScanStatisticalPatterns(std::map<uint64_t, FunctionCandidate>& candidates);
 	void ApplyNegativePatterns(std::map<uint64_t, FunctionCandidate>& candidates);
+	void ScanCfgValidation(std::map<uint64_t, FunctionCandidate>& candidates);
+	void ScanLinearSweep(std::map<uint64_t, FunctionCandidate>& candidates);
+	void ScanSwitchTargets(std::map<uint64_t, FunctionCandidate>& candidates);
+	void ScanTailCallTargets(std::map<uint64_t, FunctionCandidate>& candidates);
 	
 	// Helper methods
 	void AddCandidate(std::map<uint64_t, FunctionCandidate>& candidates,
@@ -296,6 +333,7 @@ private:
 	bool IsValidInstruction(uint64_t address, bool thumb);
 	bool IsInsideKnownFunction(uint64_t address);
 	bool IsDataRegion(uint64_t address);
+	bool IsEpilogueInstruction(uint64_t address, bool isThumb);
 	double CalculateFinalScore(const FunctionCandidate& candidate);
 	bool CheckArmPrologue(uint64_t address, uint32_t instr);
 	bool CheckThumbPrologue(uint64_t address, uint16_t instr, uint16_t next);
@@ -315,6 +353,10 @@ private:
 	std::set<uint64_t> m_existingFunctions;
 	std::set<uint64_t> m_callTargets;
 	std::map<uint64_t, size_t> m_xrefCounts;
+	
+	// Code region boundary estimation
+	uint64_t m_estimatedCodeEnd = 0;
+	void EstimateCodeBoundary();
 };
 
 /**

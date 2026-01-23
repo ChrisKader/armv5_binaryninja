@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
 
 using namespace BinaryNinja;
 
@@ -78,6 +79,46 @@ RegionDetectionSettings RegionDetector::ConservativeSettings()
 	s.paddingThreshold = 32;
 	s.mergeGapThreshold = 16;
 	s.codeEntropyMin = 5.0;
+	return s;
+}
+
+RegionDetectionSettings RegionDetector::FirmwareSafeSettings()
+{
+	RegionDetectionSettings s;
+
+	// Very high thresholds - only detect major sections
+	s.minCodeDensity = 0.75;       // Slightly lower - some code has literal pools mixed in
+	s.minRegionSize = 16384;       // 16KB minimum for any region
+	s.minCodeRegion = 32768;       // 32KB minimum for code sections
+	s.minDataRegion = 16384;       // 16KB minimum for data sections
+	s.paddingThreshold = 128;      // Larger padding detection (flash erases to 0xFF)
+	s.mergeGapThreshold = 65536;   // 64KB - aggressively merge same-type regions
+
+	// Entropy ranges tuned for firmware
+	s.codeEntropyMin = 4.0;        // Lower threshold - some optimized code is denser
+	s.codeEntropyMax = 7.5;
+	s.dataEntropyMin = 0.5;        // BSS/padding can be very low
+	s.dataEntropyMax = 6.5;
+
+	// Larger scanning window for major regions
+	s.windowSize = 16384;          // 16KB window
+	s.windowStep = 4096;           // 4KB step
+
+	// Function-aware filtering enabled
+	s.useFunctionAwareness = true;
+	s.literalPoolMaxSize = 4096;      // Ignore data regions up to 4KB (literal pools, jump tables)
+	s.minMajorDataSection = 16384;    // Only create data sections for 16KB+ regions
+	s.minMajorCodeSection = 32768;    // Only create code sections for 32KB+ regions
+	s.skipEmbeddedData = true;        // Skip small data regions surrounded by code
+	s.embeddedDataMaxGap = 4096;      // Data within 4KB of code is "embedded"
+
+	// Always merge adjacent regions
+	s.mergeAdjacentRegions = true;
+
+	// Prefer alignment boundaries
+	s.preferredAlignment = 4096;
+	s.useAlignmentHints = true;
+
 	return s;
 }
 
@@ -247,61 +288,219 @@ bool RegionDetector::IsPadding(uint64_t start, uint64_t size)
 {
 	if (size < m_settings.paddingThreshold)
 		return false;
-	
+
 	DataBuffer buffer = m_view->ReadBuffer(start, std::min(size, (uint64_t)256));
 	if (buffer.GetLength() == 0)
 		return false;
-	
+
 	const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
 	uint8_t first = data[0];
-	
-	// Check for common padding patterns
-	if (first != 0x00 && first != 0xFF && first != 0xCC && first != 0xFE)
-		return false;
-	
-	// Verify consistency
+
+	// Count how many bytes match the first byte
+	size_t matchCount = 1;
 	for (size_t i = 1; i < buffer.GetLength(); i++)
 	{
-		if (data[i] != first)
-			return false;
+		if (data[i] == first)
+			matchCount++;
 	}
-	
-	return true;
+
+	// If 95% or more of bytes are the same value, it's padding
+	// This catches any repeated byte pattern (0x00, 0xFF, 0xFE, 0xAA, etc.)
+	double repeatRatio = static_cast<double>(matchCount) / buffer.GetLength();
+	if (repeatRatio >= 0.95)
+		return true;
+
+	// Also check for alternating patterns like 0x55/0xAA (sometimes used as fill)
+	if (buffer.GetLength() >= 4)
+	{
+		uint8_t second = data[1];
+		if (first != second)
+		{
+			size_t alternateMatch = 0;
+			for (size_t i = 0; i < buffer.GetLength(); i++)
+			{
+				if ((i % 2 == 0 && data[i] == first) || (i % 2 == 1 && data[i] == second))
+					alternateMatch++;
+			}
+			double alternateRatio = static_cast<double>(alternateMatch) / buffer.GetLength();
+			if (alternateRatio >= 0.95)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool RegionDetector::IsInsideOrNearFunction(uint64_t start, uint64_t end)
+{
+	if (!m_settings.useFunctionAwareness)
+		return false;
+
+	// Check if this region overlaps with or is very close to any function
+	auto functions = m_view->GetAnalysisFunctionsForAddress(start);
+	if (!functions.empty())
+		return true;
+
+	functions = m_view->GetAnalysisFunctionsForAddress(end - 1);
+	if (!functions.empty())
+		return true;
+
+	// Check for nearby functions within the gap threshold
+	uint64_t searchStart = (start > m_settings.embeddedDataMaxGap) ? start - m_settings.embeddedDataMaxGap : 0;
+	uint64_t searchEnd = end + m_settings.embeddedDataMaxGap;
+
+	auto allFunctions = m_view->GetAnalysisFunctionList();
+	for (const auto& func : allFunctions)
+	{
+		if (!func)
+			continue;
+
+		uint64_t funcStart = func->GetStart();
+		uint64_t funcEnd = funcStart;
+
+		// Get function end from basic blocks
+		for (const auto& bb : func->GetBasicBlocks())
+		{
+			if (bb && bb->GetEnd() > funcEnd)
+				funcEnd = bb->GetEnd();
+		}
+
+		// Check if function is near our region
+		if (funcEnd >= searchStart && funcStart <= searchEnd)
+			return true;
+	}
+
+	return false;
+}
+
+bool RegionDetector::IsEmbeddedInCode(uint64_t start, uint64_t end)
+{
+	if (!m_settings.skipEmbeddedData)
+		return false;
+
+	uint64_t regionSize = end - start;
+
+	// Large regions are not "embedded"
+	if (regionSize >= m_settings.minMajorDataSection)
+		return false;
+
+	// Check if there's code before and after this region
+	uint64_t checkBefore = (start > m_settings.embeddedDataMaxGap) ? start - m_settings.embeddedDataMaxGap : m_view->GetStart();
+	uint64_t checkAfter = std::min(end + m_settings.embeddedDataMaxGap, m_view->GetEnd());
+
+	// Check code density before
+	double densityBefore = CalculateCodeDensity(checkBefore, start - checkBefore);
+
+	// Check code density after
+	double densityAfter = CalculateCodeDensity(end, checkAfter - end);
+
+	// If both sides have decent code density, this is embedded data (likely literal pool)
+	return (densityBefore >= 0.5 && densityAfter >= 0.5);
+}
+
+bool RegionDetector::ShouldSkipAsLiteralPool(uint64_t start, uint64_t size, RegionType type)
+{
+	// Only skip data-like regions
+	if (type == RegionType::Code)
+		return false;
+
+	// Skip if too small to be a major section
+	if (size < m_settings.literalPoolMaxSize)
+	{
+		// Check if it looks like a literal pool
+		if (IsLiteralPool(start, size))
+			return true;
+
+		// Check if embedded in code
+		if (IsEmbeddedInCode(start, start + size))
+			return true;
+	}
+
+	// Skip small data regions that are near functions
+	if (size < m_settings.minMajorDataSection)
+	{
+		if (IsInsideOrNearFunction(start, start + size))
+			return true;
+	}
+
+	return false;
 }
 
 bool RegionDetector::IsLiteralPool(uint64_t start, uint64_t size)
 {
 	if (size < 8 || size > 1024)
 		return false;
-	
+
 	DataBuffer buffer = m_view->ReadBuffer(start, size);
 	if (buffer.GetLength() < size)
 		return false;
-	
+
 	const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
-	
+
 	// Literal pools contain mostly valid addresses
 	uint64_t imageStart = m_view->GetStart();
 	uint64_t imageEnd = m_view->GetEnd();
-	
+
 	size_t validAddrs = 0;
 	size_t totalWords = size / 4;
-	
+
 	for (size_t i = 0; i + 3 < size; i += 4)
 	{
 		uint32_t val = data[i] | (data[i+1] << 8) | (data[i+2] << 16) | (data[i+3] << 24);
-		
+
 		// Check if it's a plausible address
 		uint64_t addr = val & ~1ULL;  // Clear Thumb bit
 		if (addr >= imageStart && addr < imageEnd)
 			validAddrs++;
-		
+
 		// Also check for small constants (common in literal pools)
 		if (val < 0x10000 || (val >= 0xFFFF0000))
 			validAddrs++;
 	}
-	
+
 	return totalWords > 0 && (static_cast<double>(validAddrs) / totalWords) > 0.5;
+}
+
+bool RegionDetector::LooksLikePointerTable(uint64_t start, uint64_t size)
+{
+	// Pointer tables are larger than literal pools and contain many valid addresses
+	if (size < 16)
+		return false;
+
+	// Sample up to 256 bytes
+	size_t sampleSize = std::min(size, (uint64_t)256);
+	DataBuffer buffer = m_view->ReadBuffer(start, sampleSize);
+	if (buffer.GetLength() < sampleSize)
+		return false;
+
+	const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
+
+	uint64_t imageStart = m_view->GetStart();
+	uint64_t imageEnd = m_view->GetEnd();
+
+	size_t validAddrs = 0;
+	size_t totalWords = sampleSize / 4;
+
+	for (size_t i = 0; i + 3 < sampleSize; i += 4)
+	{
+		uint32_t val = data[i] | (data[i+1] << 8) | (data[i+2] << 16) | (data[i+3] << 24);
+
+		// Check if it's a plausible code/data address
+		uint64_t addr = val & ~1ULL;  // Clear Thumb bit
+		if (addr >= imageStart && addr < imageEnd)
+		{
+			validAddrs++;
+		}
+		// Also check for MMIO addresses (common in firmware)
+		else if ((val >= 0x40000000 && val < 0x60000000) ||
+		         (val >= 0xE0000000 && val < 0xF0000000))
+		{
+			validAddrs++;
+		}
+	}
+
+	// If 40% or more of words look like valid addresses, it's a pointer table
+	return totalWords > 0 && (static_cast<double>(validAddrs) / totalWords) >= 0.4;
 }
 
 bool RegionDetector::LooksLikeMMIO(uint64_t addr)
@@ -330,85 +529,208 @@ RegionType RegionDetector::ClassifyRegion(uint64_t start, uint64_t size,
 	// Check for MMIO first (address-based)
 	if (LooksLikeMMIO(start))
 		return RegionType::MMIO;
-	
+
 	// Check for padding (very low entropy, uniform bytes)
 	if (entropy < m_settings.paddingEntropyMax && IsPadding(start, size))
 		return RegionType::Padding;
-	
+
 	// Check for BSS (all zeros, no file data)
 	if (entropy < 0.1)
 		return RegionType::BSS;
-	
+
 	// Check for compressed/encrypted data (very high entropy)
 	if (entropy > m_settings.compressedEntropyMin)
 		return RegionType::Compressed;
-	
-	// Check for string tables
-	if (stringDensity > m_settings.minStringDensity && entropy < 5.0)
-		return RegionType::StringTable;
-	
-	// Check for code (good entropy + high instruction density)
+
+	// IMPORTANT: Check for code BEFORE strings
+	// Pointer tables often have bytes in the printable ASCII range (0x20-0x7F)
+	// which causes them to be misclassified as strings. Code detection is more reliable.
 	if (entropy >= m_settings.codeEntropyMin && entropy <= m_settings.codeEntropyMax &&
 		codeDensity >= m_settings.minCodeDensity)
 		return RegionType::Code;
-	
-	// Check for literal pools
+
+	// Check for literal pools (pointer tables, constants)
+	// Do this before string check - literal pools can look like strings
 	if (m_settings.detectLiteralPools && IsLiteralPool(start, size))
 		return RegionType::LiteralPool;
-	
+
+	// Check if this looks like a pointer table (common in ARM firmware)
+	// Pointer tables have medium entropy and contain valid addresses
+	if (LooksLikePointerTable(start, size))
+		return RegionType::Data;  // Classify as data, not strings
+
+	// Check for string tables - must have VERY high string density
+	// AND low entropy (pure ASCII text has low entropy)
+	// AND must NOT look like code or pointer tables
+	if (stringDensity > m_settings.minStringDensity &&
+		entropy < 5.0 &&
+		codeDensity < 0.3)  // Must not look like code at all
+		return RegionType::StringTable;
+
 	// Default to data
 	if (entropy >= m_settings.dataEntropyMin && entropy <= m_settings.dataEntropyMax)
 		return RegionType::Data;
-	
+
 	return RegionType::Unknown;
 }
 
 std::vector<uint64_t> RegionDetector::FindBoundaries()
 {
 	std::vector<uint64_t> boundaries;
-	
+	std::set<uint64_t> functionRanges;  // Store function address ranges for quick lookup
+
 	uint64_t start = m_view->GetStart();
 	uint64_t end = m_view->GetEnd();
 	uint64_t size = end - start;
-	
+
 	if (size == 0)
 		return boundaries;
-	
+
 	boundaries.push_back(start);
-	
-	// Add aligned boundaries
-	if (m_settings.useAlignmentHints)
+
+	// Collect function boundaries if function-awareness is enabled
+	// This ensures we don't split sections in the middle of functions
+	std::vector<std::pair<uint64_t, uint64_t>> functionExtents;
+	if (m_settings.useFunctionAwareness)
 	{
-		for (uint64_t addr = start; addr < end; addr += m_settings.preferredAlignment)
+		auto allFunctions = m_view->GetAnalysisFunctionList();
+		m_logger->LogDebug("RegionDetector: Found %zu functions for boundary analysis", allFunctions.size());
+
+		for (const auto& func : allFunctions)
 		{
-			uint64_t aligned = (addr + m_settings.preferredAlignment - 1) & ~(m_settings.preferredAlignment - 1);
-			if (aligned > start && aligned < end)
-				boundaries.push_back(aligned);
+			if (!func)
+				continue;
+
+			uint64_t funcStart = func->GetStart();
+			uint64_t funcEnd = funcStart;
+
+			// Get function end from basic blocks
+			for (const auto& bb : func->GetBasicBlocks())
+			{
+				if (bb && bb->GetEnd() > funcEnd)
+					funcEnd = bb->GetEnd();
+			}
+
+			if (funcEnd > funcStart)
+			{
+				functionExtents.push_back({funcStart, funcEnd});
+			}
+		}
+
+		// Sort function extents by start address
+		std::sort(functionExtents.begin(), functionExtents.end());
+	}
+
+	// Helper lambda to check if an address is inside any function
+	auto isInsideFunction = [&functionExtents](uint64_t addr) -> bool {
+		for (const auto& extent : functionExtents)
+		{
+			if (addr > extent.first && addr < extent.second)
+				return true;
+			if (extent.first > addr)  // Past the point where it could match
+				break;
+		}
+		return false;
+	};
+
+	// Helper lambda to snap an address to a nearby alignment boundary
+	auto snapToAlignment = [this, start, end](uint64_t addr) -> uint64_t {
+		if (!m_settings.useAlignmentHints)
+			return addr;
+
+		// Find the nearest alignment boundary within a reasonable distance
+		uint32_t align = m_settings.preferredAlignment;
+		uint64_t alignedDown = addr & ~(uint64_t)(align - 1);
+		uint64_t alignedUp = alignedDown + align;
+
+		// Use the closer one, but prefer staying within bounds
+		uint64_t distDown = addr - alignedDown;
+		uint64_t distUp = alignedUp - addr;
+
+		if (alignedDown >= start && distDown <= m_settings.windowStep)
+			return alignedDown;
+		if (alignedUp < end && distUp <= m_settings.windowStep)
+			return alignedUp;
+
+		return addr;  // Don't snap if too far
+	};
+
+	// For firmware-safe mode with large windows, use a simpler approach:
+	// Only add boundaries at major transitions, snapped to alignment
+	if (m_settings.useFunctionAwareness && m_settings.windowSize >= 4096)
+	{
+		// Find code/data transitions using larger windows
+		double prevCodeDensity = -1;
+		for (uint64_t addr = start; addr < end; addr += m_settings.windowStep)
+		{
+			uint64_t windowEnd = std::min(addr + m_settings.windowSize, end);
+			double codeDensity = CalculateCodeDensity(addr, windowEnd - addr);
+
+			// Detect code/data transitions (more reliable than entropy for firmware)
+			if (prevCodeDensity >= 0)
+			{
+				bool wasCode = prevCodeDensity >= m_settings.minCodeDensity;
+				bool isCode = codeDensity >= m_settings.minCodeDensity;
+
+				if (wasCode != isCode)
+				{
+					// Don't add boundary if we're inside a function
+					if (!isInsideFunction(addr))
+					{
+						uint64_t snapped = snapToAlignment(addr);
+						if (!isInsideFunction(snapped))
+							boundaries.push_back(snapped);
+					}
+				}
+			}
+
+			prevCodeDensity = codeDensity;
 		}
 	}
-	
-	// Analyze entropy transitions
-	double prevEntropy = -1;
-	for (uint64_t addr = start; addr < end; addr += m_settings.windowStep)
+	else
 	{
-		uint64_t windowEnd = std::min(addr + m_settings.windowSize, end);
-		double entropy = CalculateEntropy(addr, windowEnd - addr);
-		
-		// Detect significant entropy changes
-		if (prevEntropy >= 0 && std::abs(entropy - prevEntropy) > 1.5)
+		// Original entropy-based approach for other presets
+		// Add aligned boundaries
+		if (m_settings.useAlignmentHints)
 		{
-			boundaries.push_back(addr);
+			for (uint64_t addr = start; addr < end; addr += m_settings.preferredAlignment)
+			{
+				uint64_t aligned = (addr + m_settings.preferredAlignment - 1) & ~(m_settings.preferredAlignment - 1);
+				if (aligned > start && aligned < end && !isInsideFunction(aligned))
+					boundaries.push_back(aligned);
+			}
 		}
-		
-		prevEntropy = entropy;
+
+		// Analyze entropy transitions
+		double prevEntropy = -1;
+		for (uint64_t addr = start; addr < end; addr += m_settings.windowStep)
+		{
+			uint64_t windowEnd = std::min(addr + m_settings.windowSize, end);
+			double entropy = CalculateEntropy(addr, windowEnd - addr);
+
+			// Detect significant entropy changes (only if not inside a function)
+			if (prevEntropy >= 0 && std::abs(entropy - prevEntropy) > 1.5)
+			{
+				if (!isInsideFunction(addr))
+				{
+					uint64_t snapped = snapToAlignment(addr);
+					if (!isInsideFunction(snapped))
+						boundaries.push_back(snapped);
+				}
+			}
+
+			prevEntropy = entropy;
+		}
 	}
-	
+
 	boundaries.push_back(end);
-	
+
 	// Sort and remove duplicates
 	std::sort(boundaries.begin(), boundaries.end());
 	boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
-	
+
+	m_logger->LogDebug("RegionDetector: Found %zu boundary candidates", boundaries.size());
+
 	return boundaries;
 }
 
@@ -416,28 +738,65 @@ void RegionDetector::MergeRegions(std::vector<DetectedRegion>& regions)
 {
 	if (!m_settings.mergeAdjacentRegions || regions.size() < 2)
 		return;
-	
+
 	std::vector<DetectedRegion> merged;
 	DetectedRegion current = regions[0];
-	
+
 	for (size_t i = 1; i < regions.size(); i++)
 	{
 		const DetectedRegion& next = regions[i];
-		
+
 		// Check if we should merge
-		bool canMerge = (current.type == next.type) &&
-			(next.start <= current.end + m_settings.mergeGapThreshold) &&
-			(current.readable == next.readable) &&
-			(current.writable == next.writable) &&
-			(current.executable == next.executable);
-		
+		bool canMerge = false;
+
+		// Same type within gap threshold
+		if (current.type == next.type &&
+			next.start <= current.end + m_settings.mergeGapThreshold &&
+			current.readable == next.readable &&
+			current.writable == next.writable &&
+			current.executable == next.executable)
+		{
+			canMerge = true;
+		}
+
+		// For firmware-safe mode, be more aggressive about merging code regions
+		// Small data/unknown regions between code should be absorbed into code
+		if (m_settings.useFunctionAwareness && !canMerge)
+		{
+			// If current is CODE and next is CODE, merge even with gap
+			if (current.type == RegionType::Code && next.type == RegionType::Code)
+			{
+				uint64_t gap = (next.start > current.end) ? (next.start - current.end) : 0;
+				// Merge code regions with gaps up to 64KB (literal pools, small data tables)
+				if (gap <= 65536)
+					canMerge = true;
+			}
+
+			// Absorb small non-code regions into surrounding code
+			if (current.type == RegionType::Code && next.type != RegionType::Code)
+			{
+				uint64_t nextSize = next.end - next.start;
+				// If the non-code region is small and there's more code after it, absorb it
+				if (nextSize < m_settings.minMajorDataSection && i + 1 < regions.size())
+				{
+					const DetectedRegion& afterNext = regions[i + 1];
+					if (afterNext.type == RegionType::Code)
+					{
+						// Extend current to include this small region
+						current.end = next.end;
+						continue;  // Skip adding 'next' and check afterNext
+					}
+				}
+			}
+		}
+
 		if (canMerge)
 		{
 			// Extend current region
 			current.end = next.end;
 			current.entropy = (current.entropy + next.entropy) / 2.0;
 			current.codeDensity = (current.codeDensity + next.codeDensity) / 2.0;
-			
+
 			// Take higher confidence
 			if (static_cast<int>(next.confidence) > static_cast<int>(current.confidence))
 				current.confidence = next.confidence;
@@ -448,7 +807,7 @@ void RegionDetector::MergeRegions(std::vector<DetectedRegion>& regions)
 			current = next;
 		}
 	}
-	
+
 	merged.push_back(current);
 	regions = merged;
 }
@@ -532,7 +891,26 @@ std::vector<DetectedRegion> RegionDetector::Detect(const RegionDetectionSettings
 			continue;
 		if ((type == RegionType::Data || type == RegionType::RWData) && regionSize < settings.minDataRegion)
 			continue;
-		
+
+		// Function-aware filtering: skip small data regions that look like literal pools
+		// or are embedded in code (common in ARM firmware)
+		if (ShouldSkipAsLiteralPool(regionStart, regionSize, type))
+		{
+			m_logger->LogDebug("RegionDetector: Skipping 0x%llx (size=%llu) - likely embedded data/literal pool",
+				(unsigned long long)regionStart, (unsigned long long)regionSize);
+			continue;
+		}
+
+		// For firmware-safe mode, apply stricter size requirements
+		if (settings.useFunctionAwareness)
+		{
+			if (type == RegionType::Code && regionSize < settings.minMajorCodeSection)
+				continue;
+			if ((type == RegionType::Data || type == RegionType::RWData || type == RegionType::LiteralPool) &&
+				regionSize < settings.minMajorDataSection)
+				continue;
+		}
+
 		// Determine confidence
 		Confidence conf = Confidence::Medium;
 		if (type == RegionType::Code && codeDensity > 0.9)

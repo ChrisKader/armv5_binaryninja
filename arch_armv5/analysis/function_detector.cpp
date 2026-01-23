@@ -3,6 +3,11 @@
  */
 
 #include "function_detector.h"
+#include "cfg/control_flow_graph.h"
+#include "cfg/dominator_tree.h"
+#include "linear_sweep.h"
+#include "prologue_patterns.h"
+#include "switch_resolver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,6 +48,7 @@ const char* DetectionSourceToString(DetectionSource source)
 	case DetectionSource::CallbackPattern:      return "Callback pattern";
 	case DetectionSource::InstructionSequence:  return "Instruction sequence";
 	case DetectionSource::EntropyTransition:    return "Entropy transition";
+	case DetectionSource::CfgValidated:         return "CFG validated";
 	case DetectionSource::MidInstruction:       return "Mid-instruction (penalty)";
 	case DetectionSource::InsideFunction:       return "Inside function (penalty)";
 	case DetectionSource::DataRegion:           return "Data region (penalty)";
@@ -82,23 +88,36 @@ FunctionDetectionSettings FunctionDetector::DefaultSettings()
 FunctionDetectionSettings FunctionDetector::AggressiveSettings()
 {
 	FunctionDetectionSettings s;
-	s.minimumScore = 0.25;
+	s.minimumScore = 0.35;  // Slightly higher to reduce false positives
 	s.highConfidenceScore = 0.6;
-	s.alignmentPreference = 2;
+	s.alignmentPreference = 4;  // Prefer 4-byte aligned for ARM
 	
-	// Lower thresholds
+	// Lower thresholds for weak signals
 	s.prologuePush.threshold = 0.3;
 	s.blTarget.threshold = 0.2;
 	s.afterUnconditionalRet.threshold = 0.3;
 	
-	// Higher weights for weak signals
-	s.alignmentBoundary.weight = 0.5;
-	s.instructionSequence.weight = 1.2;
-	s.entropyTransition.weight = 1.0;
+	// Moderate weights for weak signals
+	s.alignmentBoundary.weight = 0.3;
+	s.instructionSequence.weight = 1.0;
+	s.entropyTransition.weight = 0.8;
 	
-	// Lower penalties
-	s.midInstructionPenalty = 0.5;
-	s.unlikelyPatternPenalty = 0.1;
+	// Keep strong penalties to filter out bad candidates
+	s.midInstructionPenalty = 3.0;  // Strong penalty for misaligned
+	s.unlikelyPatternPenalty = 0.3;
+	
+	// Enable new detection methods with balanced weights
+	s.useLinearSweep = true;
+	s.linearSweepWeight = 2.5;  // Higher weight so linear sweep candidates can pass threshold
+	s.linearSweepMinConfidence = 0.3;  // Lower confidence threshold for more candidates
+	s.useSwitchResolution = true;
+	s.switchTargetWeight = 1.5;
+	s.useTailCallAnalysis = true;
+	s.tailCallTargetWeight = 1.5;
+	
+	// Higher limits for scanning
+	s.maxCandidates = 15000;
+	s.linearSweepMaxBlocks = 75000;
 	
 	return s;
 }
@@ -228,15 +247,63 @@ bool FunctionDetector::IsDataRegion(uint64_t address)
 	auto seg = m_view->GetSegmentAt(address);
 	if (seg && !(seg->GetFlags() & SegmentExecutable))
 		return true;
+	
+	// For raw firmware without segments, use heuristics to detect data
+	if (m_view->GetSegments().empty())
+	{
+		// Check if this looks like ASCII string data
+		DataBuffer buf = m_view->ReadBuffer(address, 16);
+		if (buf.GetLength() >= 16)
+		{
+			const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+			int printableCount = 0;
+			bool hasNull = false;
+			for (size_t i = 0; i < 16; i++)
+			{
+				if (bytes[i] == 0)
+					hasNull = true;
+				else if ((bytes[i] >= 0x20 && bytes[i] < 0x7F) || bytes[i] == '\n' || bytes[i] == '\r' || bytes[i] == '\t')
+					printableCount++;
+			}
+			// If mostly printable ASCII with at least one null, likely a string region
+			if (printableCount >= 10 && hasNull)
+				return true;
+		}
+		
+		// Check if this looks like a pointer table (4+ consecutive valid pointers)
+		if (buf.GetLength() >= 16)
+		{
+			uint64_t start = m_view->GetStart();
+			uint64_t end = m_view->GetEnd();
+			int ptrCount = 0;
+			for (size_t i = 0; i + 4 <= 16; i += 4)
+			{
+				uint32_t val = 0;
+				memcpy(&val, static_cast<const uint8_t*>(buf.GetData()) + i, 4);
+				// Check if it looks like a pointer into the binary
+				if (val >= start && val < end && (val & 3) == 0)
+					ptrCount++;
+			}
+			// 4 consecutive pointers = likely pointer table
+			if (ptrCount >= 4)
+				return true;
+		}
+	}
+	
 	return false;
 }
 
 bool FunctionDetector::CheckArmPrologue(uint64_t address, uint32_t instr)
 {
 	uint32_t cond = (instr >> 28) & 0xF;
-	
+
+	// Reject unconditional space (0xF) except for specific valid instructions
+	if (cond == 0xF)
+		return false;
+
 	// PUSH {regs, lr} = STMDB sp!, {regs}
-	// Encoding: cond 100 1 0 0 1 0 1101 reglist
+	// Encoding: cond 1001 0010 1101 reglist
+	// Mask 0x0FFF0000 checks bits [27:16] for STMDB SP!
 	if ((instr & 0x0FFF0000) == 0x092D0000)
 	{
 		uint32_t reglist = instr & 0xFFFF;
@@ -244,31 +311,42 @@ bool FunctionDetector::CheckArmPrologue(uint64_t address, uint32_t instr)
 		if (reglist & (1 << 14))
 			return true;
 	}
-	
-	// STMFD sp!, {regs} with LR
-	// Encoding: cond 100 1 0 0 1 0 1101 reglist (same as PUSH)
+
+	// SUB sp, sp, #imm (stack frame allocation)
+	// Encoding: cond 0010 0100 1101 1101 imm12
+	// Mask 0x0FFF0000 checks bits [27:16] for SUB Rd=SP, Rn=SP
+	if ((instr & 0x0FFF0000) == 0x024DD000)
+		return true;
+
+	// MOV r11, sp (frame pointer setup)
+	// Encoding: cond 0001 1010 0000 1011 0000 0000 1101
+	// Full instruction (with cond=AL): E1A0B00D
+	// Mask out condition field and check opcode
+	if ((instr & 0x0FFFFFFF) == 0x01A0B00D)
+		return true;
+
+	// MOV ip, sp (ARMCC frame pointer setup)
+	// Encoding: cond 0001 1010 0000 1100 0000 0000 1101
+	// Full instruction (with cond=AL): E1A0C00D
+	if ((instr & 0x0FFFFFFF) == 0x01A0C00D)
+		return true;
+
+	// STR lr, [sp, #-4]! (pre-indexed store of LR)
+	// Encoding: cond 0101 0010 1101 1110 0000 0000 0100
+	// Full instruction (with cond=AL): E52DE004
+	if ((instr & 0x0FFFFFFF) == 0x052DE004)
+		return true;
+
+	// STMFD sp!, {fp, ip, lr, pc} - full APCS prologue
+	// Encoding: cond 1001 0010 1101 reglist (with fp,ip,lr,pc set)
 	if ((instr & 0x0FFF0000) == 0x092D0000)
 	{
 		uint32_t reglist = instr & 0xFFFF;
-		if (reglist & (1 << 14))
+		// Check for classic APCS prologue registers (r11, r12, lr, pc)
+		if ((reglist & 0xD800) == 0xD800)  // fp(r11), ip(r12), lr set
 			return true;
 	}
-	
-	// SUB sp, sp, #imm
-	// Encoding: cond 001 0010 0 1101 1101 imm12
-	if ((instr & 0x0FFF0000) == 0x024DD000)
-		return true;
-	
-	// MOV r11, sp (frame pointer setup)
-	// Encoding: cond 000 1101 0 0000 1011 00000000 1101
-	if ((instr & 0x0FFFFFFF) == 0x01A0B00D)
-		return true;
-	
-	// STR lr, [sp, #-4]!
-	// Encoding: cond 0101 0010 1101 1110 0000 0000 0100
-	if ((instr & 0x0FFFFFFF) == 0x052DE004)
-		return true;
-	
+
 	return false;
 }
 
@@ -434,25 +512,107 @@ void FunctionDetector::ScanProloguePatterns(std::map<uint64_t, FunctionCandidate
 	}
 }
 
+bool FunctionDetector::IsEpilogueInstruction(uint64_t address, bool isThumb)
+{
+	// Check if the instruction at this address is an epilogue (return) pattern
+	// Functions don't start with return instructions
+	if (!isThumb)
+	{
+		uint32_t instr = ReadInstruction32(address);
+		uint32_t cond = (instr >> 28) & 0xF;
+
+		// Only unconditional returns are definite epilogues
+		if (cond != 0xE)
+			return false;
+
+		// BX LR
+		if ((instr & 0x0FFFFFFF) == 0x012FFF1E)
+			return true;
+		// MOV pc, lr
+		if ((instr & 0x0FFFFFFF) == 0x01A0F00E)
+			return true;
+		// POP/LDMIA sp!, {..., pc}
+		if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)))
+			return true;
+		// LDR pc, [sp], #imm (post-indexed return)
+		if ((instr & 0x0FFF0000) == 0x049D0000 && ((instr >> 12) & 0xF) == 0xF)
+			return true;
+	}
+	else
+	{
+		uint16_t instr = ReadInstruction16(address);
+
+		// POP {pc} - Thumb return
+		if ((instr & 0xFE00) == 0xBC00 && (instr & 0x0100))
+			return true;
+		// BX LR - Thumb return
+		if (instr == 0x4770)
+			return true;
+	}
+
+	return false;
+}
+
+void FunctionDetector::EstimateCodeBoundary()
+{
+	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
+	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+
+	// Find the highest PROLOGUE address - prologues are reliable code indicators
+	// PUSH {lr} / STMFD sp!, {..., lr} patterns
+	uint64_t highestPrologue = start;
+	for (uint64_t addr = start; addr + 4 <= end; addr += 4)
+	{
+		uint32_t instr = ReadInstruction32(addr);
+		// PUSH/STMFD sp!, {...} with LR (bit 14 set)
+		if ((instr & 0x0FFF0000) == 0x092D0000 && (instr & 0x4000))
+		{
+			highestPrologue = addr;
+		}
+	}
+
+	// Use configured boundary if set, otherwise auto-detect
+	uint64_t configuredBoundary = 0;
+	// TODO: Get firmware settings to access codeDataBoundary
+	// For now, use automatic detection
+
+	uint64_t codeBoundary = highestPrologue;
+
+	// Add margin for tail code (functions without prologues)
+	m_estimatedCodeEnd = codeBoundary + 0x8000;  // 32KB margin
+	if (m_estimatedCodeEnd > end)
+		m_estimatedCodeEnd = end;
+
+	m_logger->LogInfo("FunctionDetector: Code boundary estimated at 0x%llx (highest prologue at 0x%llx)",
+		(unsigned long long)m_estimatedCodeEnd, (unsigned long long)highestPrologue);
+}
+
 void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& candidates)
 {
 	if (!m_settings.blTarget.enabled && !m_settings.blxTarget.enabled)
 		return;
-	
+
 	m_logger->LogDebug("FunctionDetector: Scanning call targets...");
-	
+
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+
+	// Use estimated code end to limit scan range
+	uint64_t codeRegionEnd = m_estimatedCodeEnd > 0 ? m_estimatedCodeEnd : end;
 	
+	m_logger->LogDebug("FunctionDetector: Scanning call targets from 0x%llx to 0x%llx",
+		(unsigned long long)start, (unsigned long long)codeRegionEnd);
+
 	// Collect all call targets
 	m_callTargets.clear();
-	
-	// Scan for BL/BLX instructions
-	for (uint64_t addr = start; addr + 4 <= end; addr += 4)
+
+	// Scan for BL/BLX instructions - ONLY in estimated code region
+	// This prevents data-as-BL from creating false call targets
+	for (uint64_t addr = start; addr + 4 <= codeRegionEnd; addr += 4)
 	{
 		uint32_t instr = ReadInstruction32(addr);
 		uint32_t cond = (instr >> 28) & 0xF;
-		
+
 		// BL <label> - Encoding: cond 1011 imm24
 		if ((instr & 0x0F000000) == 0x0B000000 && cond <= 0xE)
 		{
@@ -460,17 +620,21 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 			if (offset & 0x00800000)
 				offset |= 0xFF000000;  // Sign extend
 			offset = (offset << 2) + 8;  // PC + 8 + offset*4
-			
+
 			uint64_t target = addr + offset;
 			if (target >= start && target < end)
 			{
+				// Skip targets that are epilogue instructions (stub functions)
+				if (IsEpilogueInstruction(target, false))
+					continue;
+
 				m_callTargets.insert(target);
 				AddCandidate(candidates, target, false,
 					DetectionSource::BlTarget, m_settings.blTarget.weight,
 					"BL target");
 			}
 		}
-		
+
 		// BLX <label> - Encoding: 1111 101 H imm24
 		if ((instr & 0xFE000000) == 0xFA000000)
 		{
@@ -478,10 +642,14 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 			if (offset & 0x00800000)
 				offset |= 0xFF000000;
 			offset = (offset << 2) + ((instr >> 23) & 2) + 8;
-			
+
 			uint64_t target = (addr + offset) & ~1ULL;
 			if (target >= start && target < end)
 			{
+				// Skip targets that are epilogue instructions
+				if (IsEpilogueInstruction(target, true))
+					continue;
+
 				m_callTargets.insert(target);
 				AddCandidate(candidates, target, true,  // BLX targets Thumb
 					DetectionSource::BlxTarget, m_settings.blxTarget.weight,
@@ -489,13 +657,13 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 			}
 		}
 	}
-	
+
 	// Also scan Thumb BL/BLX
 	for (uint64_t addr = start; addr + 4 <= end; addr += 2)
 	{
 		uint16_t hw1 = ReadInstruction16(addr);
 		uint16_t hw2 = ReadInstruction16(addr + 2);
-		
+
 		// 32-bit Thumb BL: 11110 S imm10 11 J1 1 J2 imm11
 		if ((hw1 & 0xF800) == 0xF000 && (hw2 & 0xD000) == 0xD000)
 		{
@@ -504,18 +672,23 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 			uint32_t J1 = (hw2 >> 13) & 1;
 			uint32_t J2 = (hw2 >> 11) & 1;
 			uint32_t imm11 = hw2 & 0x7FF;
-			
+
 			uint32_t I1 = ~(J1 ^ S) & 1;
 			uint32_t I2 = ~(J2 ^ S) & 1;
-			
+
 			int32_t offset = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | (imm11 << 1);
 			if (S)
 				offset |= 0xFE000000;  // Sign extend
-			
+
 			uint64_t target = addr + 4 + offset;
 			if (target >= start && target < end)
 			{
 				bool toThumb = (hw2 & 0x1000) != 0;  // BL vs BLX
+
+				// Skip targets that are epilogue instructions
+				if (IsEpilogueInstruction(target, toThumb))
+					continue;
+
 				m_callTargets.insert(target);
 				AddCandidate(candidates, target, toThumb,
 					DetectionSource::BlTarget, m_settings.blTarget.weight,
@@ -523,7 +696,7 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 			}
 		}
 	}
-	
+
 	m_logger->LogDebug("FunctionDetector: Found %zu call targets", m_callTargets.size());
 }
 
@@ -585,53 +758,213 @@ void FunctionDetector::ScanCrossReferences(std::map<uint64_t, FunctionCandidate>
 void FunctionDetector::ScanStructuralPatterns(std::map<uint64_t, FunctionCandidate>& candidates)
 {
 	m_logger->LogDebug("FunctionDetector: Scanning structural patterns...");
-	
+
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
-	
+
 	// Look for code after return instructions
 	if (m_settings.afterUnconditionalRet.enabled)
 	{
 		for (uint64_t addr = start; addr + 8 <= end; addr += 4)
 		{
 			uint32_t instr = ReadInstruction32(addr);
-			
+			uint32_t cond = (instr >> 28) & 0xF;
+
+			// Skip if conditional (not a definite return)
+			bool isReturn = false;
+			const char* returnType = nullptr;
+
 			// BX LR - Return from function
 			// Encoding: cond 0001 0010 1111 1111 1111 0001 1110
-			if ((instr & 0x0FFFFFFF) == 0x012FFF1E)
+			if ((instr & 0x0FFFFFFF) == 0x012FFF1E && cond == 0xE)
+			{
+				isReturn = true;
+				returnType = "After BX LR";
+			}
+
+			// MOV pc, lr - Return from function (common in ARMv4/ARMv5 leaf functions)
+			// Encoding: cond 0001 1010 0000 1111 0000 0000 1110 = MOV pc, lr
+			// With cond=AL: E1A0F00E
+			if ((instr & 0x0FFFFFFF) == 0x01A0F00E && cond == 0xE)
+			{
+				isReturn = true;
+				returnType = "After MOV pc, lr";
+			}
+
+			// POP {pc} / LDMIA sp!, {..., pc}
+			// Encoding: cond 1000 1011 1101 reglist (LDMIA sp!)
+			if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)) && cond == 0xE)
+			{
+				isReturn = true;
+				returnType = "After POP {pc}";
+			}
+
+			// LDMFD sp!, {..., pc} - same encoding as LDMIA sp!
+			// Already covered above
+
+			// LDR pc, [sp], #imm - Post-indexed load to PC
+			// Encoding: cond 0100 1001 1101 1111 imm12 (LDR pc, [sp], #imm)
+			// Example: E49DF004 = LDR pc, [sp], #4
+			if ((instr & 0x0FFF0000) == 0x049D0000 && ((instr >> 12) & 0xF) == 0xF && cond == 0xE)
+			{
+				isReturn = true;
+				returnType = "After LDR pc, [sp]";
+			}
+
+			// LDMDB sp, {..., pc} - Decrement before variant (sometimes used)
+			// Encoding: cond 1001 0001 1101 reglist
+			if ((instr & 0x0FFF0000) == 0x091D0000 && (instr & (1 << 15)) && cond == 0xE)
+			{
+				isReturn = true;
+				returnType = "After LDMDB {pc}";
+			}
+
+			if (isReturn)
 			{
 				// Next instruction might be a new function
+				// We no longer require a prologue pattern - this catches leaf functions
+				// and optimized code that doesn't use traditional prologues
 				uint64_t nextAddr = addr + 4;
-				if (IsValidInstruction(nextAddr, false))
+				if (IsValidInstruction(nextAddr, false) && !IsInsideKnownFunction(nextAddr))
 				{
+					uint32_t nextInstr = ReadInstruction32(nextAddr);
+
+					// Skip if this looks like an epilogue (return instruction)
+					// These are false positives - function boundaries, not starts
+					bool looksLikeEpilogue = IsEpilogueInstruction(nextAddr, false);
+					if (looksLikeEpilogue)
+						continue;
+
+					// Skip if this looks like data (common patterns)
+					// All zeros or all 0xFF are likely padding/data
+					if (nextInstr == 0x00000000 || nextInstr == 0xFFFFFFFF)
+						continue;
+
+					// Skip undefined instruction space (0x06xxxxxx, 0x07xxxxxx with bit 4 set)
+					uint32_t opcode = (nextInstr >> 25) & 0x7;
+					if (opcode == 0x3 && (nextInstr & (1 << 4)))
+						continue;  // Undefined instruction
+
+					// Check for prologue patterns - if present, use full weight
+					// If not present but still valid code, use reduced weight
+					bool hasPrologue = false;
+
+					// PUSH/STMFD sp!, {...}
+					if ((nextInstr & 0x0FFF0000) == 0x092D0000)
+						hasPrologue = true;
+					// SUB sp, sp, #imm
+					if ((nextInstr & 0x0FFF0000) == 0x024DD000)
+						hasPrologue = true;
+					// MOV ip, sp (ARMCC frame setup)
+					if ((nextInstr & 0x0FFFFFFF) == 0x01A0C00D)
+						hasPrologue = true;
+					// MOV r11, sp (frame pointer setup)
+					if ((nextInstr & 0x0FFFFFFF) == 0x01A0B00D)
+						hasPrologue = true;
+					// STR lr, [sp, #-4]! (pre-indexed store of LR)
+					if ((nextInstr & 0x0FFFFFFF) == 0x052DE004)
+						hasPrologue = true;
+					// STR lr, [sp, #-imm]! (any pre-indexed LR store)
+					if ((nextInstr & 0x0FFF0000) == 0x052D0000 && ((nextInstr >> 12) & 0xF) == 14)
+						hasPrologue = true;
+
+					// Use full weight for prologue, reduced weight for non-prologue
+					// Non-prologue candidates will still be found but need more corroboration
+					double weight = hasPrologue ? m_settings.afterUnconditionalRet.weight
+					                            : m_settings.afterUnconditionalRet.weight * 0.6;
+
 					AddCandidate(candidates, nextAddr, false,
-						DetectionSource::AfterUnconditionalRet, m_settings.afterUnconditionalRet.weight,
-						"After BX LR");
-				}
-			}
-			
-			// POP {pc} variants
-			// LDMIA sp!, {..., pc}
-			if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)))
-			{
-				uint64_t nextAddr = addr + 4;
-				if (IsValidInstruction(nextAddr, false))
-				{
-					AddCandidate(candidates, nextAddr, false,
-						DetectionSource::AfterUnconditionalRet, m_settings.afterUnconditionalRet.weight,
-						"After POP {pc}");
+						DetectionSource::AfterUnconditionalRet, weight,
+						hasPrologue ? returnType : std::string(returnType) + " (no prologue)");
 				}
 			}
 		}
 	}
 	
+	// Look for code after unconditional tail calls (B instruction)
+	// Functions can end with a tail call (B to another function) instead of return
+	if (m_settings.afterTailCall.enabled)
+	{
+		for (uint64_t addr = start; addr + 8 <= end; addr += 4)
+		{
+			uint32_t instr = ReadInstruction32(addr);
+			uint32_t cond = (instr >> 28) & 0xF;
+
+			// Only unconditional branches are potential tail calls
+			if (cond != 0xE)
+				continue;
+
+			// B <label> - Unconditional branch
+			// Encoding: cond 1010 imm24
+			if ((instr & 0x0F000000) == 0x0A000000)
+			{
+				// This could be a tail call - the next address might be a new function
+				// However, we need to be careful: it could also be in the middle of
+				// a function with a conditional branch around this.
+				// Check if the target is outside a small range (likely tail call vs loop)
+				int32_t offset = instr & 0x00FFFFFF;
+				if (offset & 0x00800000)
+					offset |= 0xFF000000;  // Sign extend
+				int64_t relOffset = (int64_t)offset << 2;
+
+				// Skip backward branches (loops) and very short forward branches
+				// Tail calls typically jump far (to another function)
+				if (relOffset < 8 || std::abs(relOffset) > 0x1000)
+				{
+					uint64_t nextAddr = addr + 4;
+					// Only consider if next address looks like valid code start
+					if (IsValidInstruction(nextAddr, false) && !IsInsideKnownFunction(nextAddr))
+					{
+						uint32_t nextInstr = ReadInstruction32(nextAddr);
+
+						// Skip if this looks like an epilogue
+						if (IsEpilogueInstruction(nextAddr, false))
+							continue;
+
+						// Skip if this looks like data
+						if (nextInstr == 0x00000000 || nextInstr == 0xFFFFFFFF)
+							continue;
+
+						// Skip undefined instruction space
+						uint32_t opcode = (nextInstr >> 25) & 0x7;
+						if (opcode == 0x3 && (nextInstr & (1 << 4)))
+							continue;
+
+						// Check for prologue patterns - higher weight if present
+						bool hasPrologue = false;
+						// PUSH/STMFD
+						if ((nextInstr & 0x0FFF0000) == 0x092D0000)
+							hasPrologue = true;
+						// SUB sp, sp, #imm
+						if ((nextInstr & 0x0FFF0000) == 0x024DD000)
+							hasPrologue = true;
+						// MOV ip, sp (ARMCC)
+						if ((nextInstr & 0x0FFFFFFF) == 0x01A0C00D)
+							hasPrologue = true;
+						// STR lr, [sp, #-4]!
+						if ((nextInstr & 0x0FFFFFFF) == 0x052DE004)
+							hasPrologue = true;
+
+						double weight = hasPrologue ? m_settings.afterTailCall.weight
+						                            : m_settings.afterTailCall.weight * 0.5;
+
+						AddCandidate(candidates, nextAddr, false,
+							DetectionSource::AfterTailCall, weight,
+							hasPrologue ? "After tail call (B instruction)"
+							            : "After tail call (no prologue)");
+					}
+				}
+			}
+		}
+	}
+
 	// Look for code after padding
 	if (m_settings.afterPadding.enabled)
 	{
 		DataBuffer buf = m_view->ReadBuffer(start, std::min((uint64_t)65536, end - start));
 		const uint8_t* data = static_cast<const uint8_t*>(buf.GetData());
 		size_t len = buf.GetLength();
-		
+
 		size_t padCount = 0;
 		for (size_t i = 0; i < len - 4; i++)
 		{
@@ -748,42 +1081,96 @@ void FunctionDetector::ScanCompilerPatterns(std::map<uint64_t, FunctionCandidate
 {
 	if (!m_settings.detectCompilerStyle)
 		return;
-	
+
 	m_logger->LogDebug("FunctionDetector: Scanning compiler-specific patterns...");
-	
+
 	// Detect compiler from existing code
 	DetectedCompiler compiler = DetectCompilerStyle();
 	m_stats.detectedCompiler = compiler;
-	
+
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
-	
-	// GCC-specific patterns
+
+	// Use enhanced prologue matcher for comprehensive pattern detection
+	PrologueMatcher matcher(m_view);
+
+	// Scan with the enhanced pattern matcher
+	auto matches = matcher.scanForPrologues(start, end,
+		m_settings.detectArmFunctions,
+		m_settings.detectThumbFunctions,
+		0.7);  // Minimum confidence for compiler patterns
+
+	for (const auto& match : matches)
+	{
+		// Determine detection source based on compiler
+		DetectionSource source = DetectionSource::GccPrologue;
+		double weight = m_settings.gccPrologue.weight;
+
+		if (match.compiler == "ARMCC")
+		{
+			source = DetectionSource::ArmccPrologue;
+			weight = m_settings.armccPrologue.weight;
+		}
+		else if (match.compiler == "IAR")
+		{
+			source = DetectionSource::IarPrologue;
+			weight = m_settings.iarPrologue.weight;
+		}
+		else if (match.isInterruptHandler)
+		{
+			source = DetectionSource::InterruptPrologue;
+			weight = m_settings.interruptPrologue.weight;
+		}
+
+		// Scale weight by confidence
+		double score = weight * match.confidence;
+
+		// Build description
+		std::string desc = match.patternName;
+		if (match.savesLR)
+			desc += " (saves LR)";
+		if (match.savesFramePointer)
+			desc += " (uses FP)";
+		if (match.stackAdjustment != 0)
+			desc += " (stack: " + std::to_string(match.stackAdjustment) + ")";
+
+		AddCandidate(candidates, match.address, match.isThumb, source, score, desc);
+	}
+
+	// Also do the legacy simple pattern detection for compatibility
+	// GCC-specific patterns (simple fallback)
 	if (compiler == DetectedCompiler::GCC || compiler == DetectedCompiler::Unknown)
 	{
 		for (uint64_t addr = start; addr + 8 <= end; addr += 4)
 		{
+			// Skip if already found by enhanced matcher
+			if (candidates.count(addr))
+				continue;
+
 			uint32_t instr1 = ReadInstruction32(addr);
 			uint32_t instr2 = ReadInstruction32(addr + 4);
-			
+
 			// GCC often uses: PUSH {r4-r11, lr} followed by SUB sp, sp, #imm
 			if ((instr1 & 0x0FFF0000) == 0x092D0000 &&  // PUSH
 				(instr2 & 0x0FFF0000) == 0x024DD000)    // SUB sp
 			{
 				AddCandidate(candidates, addr, false,
 					DetectionSource::GccPrologue, m_settings.gccPrologue.weight,
-					"GCC prologue pattern");
+					"GCC prologue pattern (legacy)");
 			}
 		}
 	}
-	
-	// ARMCC-specific patterns
+
+	// ARMCC-specific patterns (simple fallback)
 	if (compiler == DetectedCompiler::ARMCC || compiler == DetectedCompiler::Unknown)
 	{
 		for (uint64_t addr = start; addr + 4 <= end; addr += 4)
 		{
+			if (candidates.count(addr))
+				continue;
+
 			uint32_t instr = ReadInstruction32(addr);
-			
+
 			// ARMCC often uses STMFD with r12
 			if ((instr & 0x0FFF0000) == 0x092D0000)
 			{
@@ -792,7 +1179,7 @@ void FunctionDetector::ScanCompilerPatterns(std::map<uint64_t, FunctionCandidate
 				{
 					AddCandidate(candidates, addr, false,
 						DetectionSource::ArmccPrologue, m_settings.armccPrologue.weight,
-						"ARMCC prologue pattern");
+						"ARMCC prologue pattern (legacy)");
 				}
 			}
 		}
@@ -850,6 +1237,399 @@ void FunctionDetector::ScanStatisticalPatterns(std::map<uint64_t, FunctionCandid
 	}
 }
 
+void FunctionDetector::ScanSwitchTargets(std::map<uint64_t, FunctionCandidate>& candidates)
+{
+	if (!m_settings.useSwitchResolution)
+		return;
+
+	m_logger->LogDebug("FunctionDetector: Resolving switch tables...");
+
+	// Configure switch resolver
+	SwitchResolverSettings swSettings;
+	swSettings.scanStart = m_settings.scanStart;
+	swSettings.scanEnd = m_settings.scanEnd;
+	swSettings.maxTotalTables = m_settings.switchMaxTables;
+	swSettings.validateTargets = true;
+
+	SwitchResolver resolver(m_view);
+	auto switches = resolver.resolveAll(swSettings);
+
+	m_logger->LogDebug("FunctionDetector: Found %zu switch tables", switches.size());
+
+	// Collect all switch targets
+	std::set<uint64_t> switchTargets;
+	for (const auto& sw : switches)
+	{
+		for (uint64_t target : sw.targets)
+		{
+			switchTargets.insert(target & ~1ULL);
+		}
+	}
+
+	m_logger->LogDebug("FunctionDetector: %zu unique switch targets", switchTargets.size());
+
+	// Add switch targets as candidates
+	// These are typically case handlers, not full functions, so use lower weight
+	// unless they look like function starts
+	for (uint64_t target : switchTargets)
+	{
+		if (m_existingFunctions.count(target))
+			continue;
+
+		// Skip if inside known function
+		if (IsInsideKnownFunction(target))
+			continue;
+
+		// Check if this target has a prologue pattern
+		bool isThumb = false;  // Determine from address bit or context
+		for (const auto& sw : switches)
+		{
+			for (uint64_t t : sw.targets)
+			{
+				if ((t & ~1ULL) == target)
+				{
+					isThumb = t & 1;
+					break;
+				}
+			}
+		}
+
+		bool hasPrologue = false;
+		if (!isThumb)
+		{
+			uint32_t instr = ReadInstruction32(target);
+			// Check for PUSH/STMFD
+			if ((instr & 0x0FFF0000) == 0x092D0000)
+				hasPrologue = true;
+			// Check for SUB sp
+			if ((instr & 0x0FFF0000) == 0x024DD000)
+				hasPrologue = true;
+		}
+		else
+		{
+			uint16_t instr = ReadInstruction16(target);
+			// Check for PUSH
+			if ((instr & 0xFE00) == 0xB400)
+				hasPrologue = true;
+		}
+
+		// Use higher weight for targets with prologues (likely real functions)
+		// Use lower weight for targets without (likely case blocks within a function)
+		double weight = hasPrologue ? m_settings.switchTargetWeight
+		                            : m_settings.switchTargetWeight * 0.4;
+
+		AddCandidate(candidates, target, isThumb,
+			DetectionSource::SwitchCaseHandler, weight,
+			hasPrologue ? "Switch target (with prologue)" : "Switch case target");
+	}
+
+	auto stats = resolver.getStats();
+	m_logger->LogDebug("FunctionDetector: Switch resolver stats: %zu TBB, %zu TBH, %zu ARM tables",
+		stats.tbbTables, stats.tbhTables, stats.armTables);
+}
+
+void FunctionDetector::ScanTailCallTargets(std::map<uint64_t, FunctionCandidate>& candidates)
+{
+	if (!m_settings.useTailCallAnalysis)
+		return;
+
+	m_logger->LogDebug("FunctionDetector: Analyzing tail calls with stack tracking...");
+
+	// Analyze existing functions to find tail calls
+	// A tail call is an unconditional branch (B) where the stack has been restored
+	// to its entry state (SP == entry SP)
+
+	std::set<uint64_t> tailCallTargets;
+
+	for (const auto& func : m_view->GetAnalysisFunctionList())
+	{
+		uint64_t funcStart = func->GetStart();
+		auto arch = func->GetArchitecture();
+		if (!arch)
+			continue;
+
+		bool isThumb = false;
+		std::string archName = arch->GetName();
+		if (archName.find('t') != std::string::npos || archName.find("thumb") != std::string::npos)
+			isThumb = true;
+
+		// Get basic blocks and look for unconditional branches at the end
+		auto blocks = func->GetBasicBlocks();
+		for (auto& block : blocks)
+		{
+			// Skip if not an exit block
+			auto outEdges = block->GetOutgoingEdges();
+			bool hasUnconditionalBranch = false;
+			uint64_t branchTarget = 0;
+
+			for (const auto& edge : outEdges)
+			{
+				if (edge.type == UnconditionalBranch)
+				{
+					hasUnconditionalBranch = true;
+					branchTarget = edge.target->GetStart();
+					break;
+				}
+			}
+
+			if (!hasUnconditionalBranch || branchTarget == 0)
+				continue;
+
+			// Check if the branch target is outside this function
+			bool targetOutsideFunction = true;
+			for (auto& b : blocks)
+			{
+				if (branchTarget >= b->GetStart() && branchTarget < b->GetEnd())
+				{
+					targetOutsideFunction = false;
+					break;
+				}
+			}
+
+			if (!targetOutsideFunction)
+				continue;  // Internal branch, not a tail call
+
+			// Check if the stack is balanced at the branch point
+			// We do this by looking for matching PUSH/POP or SUB/ADD pairs
+			// This is a simplified analysis - full dataflow would be more accurate
+
+			uint64_t blockStart = block->GetStart();
+			uint64_t blockEnd = block->GetEnd();
+
+			// Simple heuristic: check if there's a stack restore before the branch
+			bool hasStackRestore = false;
+			size_t instrSize = isThumb ? 2 : 4;
+
+			// Scan backwards from the branch looking for stack restore
+			for (uint64_t addr = blockEnd - instrSize; addr >= blockStart && addr >= blockEnd - 32; addr -= instrSize)
+			{
+				if (!isThumb)
+				{
+					uint32_t instr = ReadInstruction32(addr);
+
+					// ADD sp, sp, #imm (stack cleanup)
+					if ((instr & 0x0FFF0000) == 0x028DD000)
+					{
+						hasStackRestore = true;
+						break;
+					}
+
+					// POP without PC (partial restore, then tail call)
+					if ((instr & 0x0FFF0000) == 0x08BD0000 && !(instr & (1 << 15)))
+					{
+						hasStackRestore = true;
+						break;
+					}
+
+					// LDM sp!, {...} without PC
+					if ((instr & 0x0FFF0000) == 0x08BD0000 && !(instr & (1 << 15)))
+					{
+						hasStackRestore = true;
+						break;
+					}
+				}
+				else
+				{
+					uint16_t instr = ReadInstruction16(addr);
+
+					// ADD sp, #imm (Thumb)
+					if ((instr & 0xFF80) == 0xB000 && (instr & 0x80) == 0)
+					{
+						hasStackRestore = true;
+						break;
+					}
+
+					// POP without PC (Thumb)
+					if ((instr & 0xFE00) == 0xBC00 && !(instr & 0x100))
+					{
+						hasStackRestore = true;
+						break;
+					}
+				}
+			}
+
+			// Also consider functions that never pushed (leaf functions doing tail calls)
+			// Check if the function has any stack allocation at entry
+			bool hasStackAlloc = false;
+			uint64_t checkEnd = std::min(funcStart + 16, blockStart);
+			for (uint64_t addr = funcStart; addr < checkEnd; addr += instrSize)
+			{
+				if (!isThumb)
+				{
+					uint32_t instr = ReadInstruction32(addr);
+					// PUSH or SUB sp
+					if ((instr & 0x0FFF0000) == 0x092D0000 ||
+					    (instr & 0x0FFF0000) == 0x024DD000)
+					{
+						hasStackAlloc = true;
+						break;
+					}
+				}
+				else
+				{
+					uint16_t instr = ReadInstruction16(addr);
+					// PUSH or SUB sp
+					if ((instr & 0xFE00) == 0xB400 ||
+					    ((instr & 0xFF80) == 0xB080))
+					{
+						hasStackAlloc = true;
+						break;
+					}
+				}
+			}
+
+			// If no stack allocation, or stack was restored, this is likely a tail call
+			if (!hasStackAlloc || hasStackRestore)
+			{
+				tailCallTargets.insert(branchTarget);
+			}
+		}
+	}
+
+	m_logger->LogDebug("FunctionDetector: Found %zu tail call targets", tailCallTargets.size());
+
+	// Add tail call targets as function candidates
+	for (uint64_t target : tailCallTargets)
+	{
+		if (m_existingFunctions.count(target))
+			continue;
+
+		// Skip if inside known function
+		if (IsInsideKnownFunction(target))
+			continue;
+
+		// Determine if Thumb based on address or existing knowledge
+		bool isThumb = (target & 1) != 0;
+		target &= ~1ULL;
+
+		if (!IsValidInstruction(target, isThumb))
+			continue;
+
+		if (IsEpilogueInstruction(target, isThumb))
+			continue;
+
+		AddCandidate(candidates, target, isThumb,
+			DetectionSource::BlTarget,  // Reuse BL target since tail calls are similar
+			m_settings.tailCallTargetWeight,
+			"Tail call target (stack balanced)");
+	}
+}
+
+void FunctionDetector::ScanLinearSweep(std::map<uint64_t, FunctionCandidate>& candidates)
+{
+	if (!m_settings.useLinearSweep)
+		return;
+
+	m_logger->LogDebug("FunctionDetector: Running linear sweep analysis (Nucleus-style)...");
+
+	// Configure the linear sweep analyzer
+	// LIMIT scan range to estimated code region to avoid finding blocks in data
+	LinearSweepSettings lsSettings;
+	lsSettings.scanStart = m_settings.scanStart;
+	lsSettings.scanEnd = m_estimatedCodeEnd > 0 ? m_estimatedCodeEnd : m_settings.scanEnd;
+	lsSettings.maxTotalBlocks = m_settings.linearSweepMaxBlocks;
+	lsSettings.minimumConfidence = m_settings.linearSweepMinConfidence;
+	lsSettings.skipKnownFunctions = m_settings.respectExistingFunctions;
+	
+	m_logger->LogDebug("FunctionDetector: Linear sweep range 0x%llx to 0x%llx",
+		(unsigned long long)lsSettings.scanStart, (unsigned long long)lsSettings.scanEnd);
+
+	LinearSweepAnalyzer analyzer(m_view);
+	auto functions = analyzer.analyze(lsSettings);
+
+	m_logger->LogDebug("FunctionDetector: Linear sweep found %zu function candidates", functions.size());
+
+	// Add discovered functions as candidates
+	for (const auto& func : functions)
+	{
+		// Skip if already exists or already a candidate
+		if (m_existingFunctions.count(func.entryPoint))
+			continue;
+
+		// Weight based on linear sweep confidence
+		double weight = m_settings.linearSweepWeight * func.confidence;
+
+		// Build description
+		std::string desc = "Linear sweep: " + std::to_string(func.blockCount) + " blocks";
+		if (func.hasReturn)
+			desc += ", has return";
+		if (func.isReferencedByCall)
+			desc += ", called";
+
+		// Add as candidate - use CfgValidated source since linear sweep validates via CFG structure
+		AddCandidate(candidates, func.entryPoint, func.isThumb,
+			DetectionSource::CfgValidated, weight, desc);
+	}
+
+	auto stats = analyzer.getStats();
+	m_logger->LogDebug("FunctionDetector: Linear sweep stats: %zu blocks, %zu groups, %.2fs",
+		stats.blocksDiscovered, stats.groupsFormed, stats.scanTimeSeconds);
+}
+
+void FunctionDetector::ScanCfgValidation(std::map<uint64_t, FunctionCandidate>& candidates)
+{
+	if (!m_settings.useCfgValidation || !m_settings.cfgValidation.enabled)
+		return;
+
+	m_logger->LogDebug("FunctionDetector: Validating candidates with CFG analysis...");
+
+	size_t validated = 0;
+	size_t failed = 0;
+
+	for (auto& pair : candidates)
+	{
+		FunctionCandidate& c = pair.second;
+
+		// Only validate candidates with a minimum score threshold
+		if (c.score < m_settings.cfgValidation.threshold)
+			continue;
+
+		// Try to build a CFG from this candidate
+		try
+		{
+			ControlFlowGraph cfg(m_view, c.address, c.isThumb);
+			if (cfg.build(m_settings.cfgMaxBlocks, m_settings.cfgMaxInstructions))
+			{
+				// CFG built successfully - this is a strong signal
+				c.cfgValidated = true;
+				c.cfgBlockCount = cfg.blockCount();
+				c.cfgEdgeCount = cfg.edgeCount();
+				c.cfgComplexity = cfg.cyclomaticComplexity();
+
+				// Check for valid structure (at least 1 block, has exit)
+				auto exits = cfg.getExitBlocks();
+				if (cfg.blockCount() >= 1 && !exits.empty())
+				{
+					c.sources |= static_cast<uint32_t>(DetectionSource::CfgValidated);
+					c.sourceScores[DetectionSource::CfgValidated] = m_settings.cfgValidation.weight;
+
+					// Compute loop count using dominator tree
+					DominatorTree domTree(cfg);
+					domTree.compute();
+					auto loops = domTree.findNaturalLoops();
+					c.cfgLoopCount = loops.size();
+
+					validated++;
+				}
+			}
+			else
+			{
+				// CFG failed to build - not necessarily bad, could be partial code
+				c.warnings.push_back("CFG validation failed: " + cfg.errorMessage());
+				failed++;
+			}
+		}
+		catch (const std::exception& e)
+		{
+			c.warnings.push_back("CFG exception: " + std::string(e.what()));
+			failed++;
+		}
+	}
+
+	m_logger->LogDebug("FunctionDetector: CFG validation complete - %zu validated, %zu failed",
+		validated, failed);
+}
+
 void FunctionDetector::ApplyNegativePatterns(std::map<uint64_t, FunctionCandidate>& candidates)
 {
 	m_logger->LogDebug("FunctionDetector: Applying negative patterns...");
@@ -874,12 +1654,20 @@ void FunctionDetector::ApplyNegativePatterns(std::map<uint64_t, FunctionCandidat
 			c.warnings.push_back("In data region");
 		}
 		
-		// Check if mid-instruction (for ARM, must be 4-byte aligned)
+		// Check if mid-instruction (for ARM, must be 4-byte aligned; Thumb must be 2-byte aligned)
+		bool isMisaligned = false;
 		if (!c.isThumb && (c.address & 3))
+			isMisaligned = true;
+		if (c.isThumb && (c.address & 1))
+			isMisaligned = true;
+
+		if (isMisaligned)
 		{
 			c.sources |= static_cast<uint32_t>(DetectionSource::MidInstruction);
 			c.sourceScores[DetectionSource::MidInstruction] = -m_settings.midInstructionPenalty;
-			c.warnings.push_back("Misaligned for ARM");
+			c.warnings.push_back(c.isThumb ? "Misaligned for Thumb" : "Misaligned for ARM");
+			// Set score to 0 for misaligned - this is a hard rejection
+			c.score = 0;
 		}
 		
 		// Check if invalid instruction
@@ -888,6 +1676,59 @@ void FunctionDetector::ApplyNegativePatterns(std::map<uint64_t, FunctionCandidat
 			c.sources |= static_cast<uint32_t>(DetectionSource::InvalidInstruction);
 			c.sourceScores[DetectionSource::InvalidInstruction] = -m_settings.invalidInstructionPenalty;
 			c.warnings.push_back("Invalid instruction");
+		}
+
+		// Check if candidate is at an epilogue instruction (return pattern)
+		// Functions don't start with return instructions - this is a strong anti-pattern
+		if (!c.isThumb)
+		{
+			uint32_t instr = ReadInstruction32(c.address);
+			uint32_t cond = (instr >> 28) & 0xF;
+			bool isEpilogue = false;
+
+			// BX LR - unconditional return
+			if ((instr & 0x0FFFFFFF) == 0x012FFF1E && cond == 0xE)
+				isEpilogue = true;
+			// MOV pc, lr - unconditional return
+			if ((instr & 0x0FFFFFFF) == 0x01A0F00E && cond == 0xE)
+				isEpilogue = true;
+			// POP/LDMIA sp!, {..., pc} - unconditional return
+			if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)) && cond == 0xE)
+				isEpilogue = true;
+			// LDR pc, [sp], #imm - post-indexed return
+			if ((instr & 0x0FFF0000) == 0x049D0000 && ((instr >> 12) & 0xF) == 0xF && cond == 0xE)
+				isEpilogue = true;
+
+			if (isEpilogue)
+			{
+				// Use strong epilogue penalty - this is a definite anti-pattern
+				c.sources |= static_cast<uint32_t>(DetectionSource::UnlikelyPattern);
+				c.sourceScores[DetectionSource::UnlikelyPattern] = -m_settings.epiloguePenalty;
+				c.warnings.push_back("Epilogue instruction (return) - not a function start");
+			}
+		}
+		else
+		{
+			// Thumb epilogue detection
+			uint16_t instr = ReadInstruction16(c.address);
+			bool isEpilogue = false;
+
+			// POP {pc} - Thumb return
+			// Encoding: 1011 1 10 P reglist8
+			if ((instr & 0xFE00) == 0xBC00 && (instr & 0x0100))
+				isEpilogue = true;
+			// BX LR - Thumb return
+			// Encoding: 0100 0111 0 1110 000 = 0x4770
+			if (instr == 0x4770)
+				isEpilogue = true;
+
+			if (isEpilogue)
+			{
+				// Use strong epilogue penalty - this is a definite anti-pattern
+				c.sources |= static_cast<uint32_t>(DetectionSource::UnlikelyPattern);
+				c.sourceScores[DetectionSource::UnlikelyPattern] = -m_settings.epiloguePenalty;
+				c.warnings.push_back("Epilogue instruction (return) - not a function start");
+			}
 		}
 	}
 }
@@ -976,6 +1817,9 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	{
 		m_existingFunctions.insert(func->GetStart());
 	}
+	
+	// Estimate code boundary FIRST - this limits where we scan for candidates
+	EstimateCodeBoundary();
 	m_stats.existingFunctions = m_existingFunctions.size();
 	
 	// Collect candidates from all detectors
@@ -990,13 +1834,84 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	ScanCompilerPatterns(candidates);
 	ScanRtosPatterns(candidates);
 	ScanStatisticalPatterns(candidates);
+	ScanSwitchTargets(candidates);  // Switch table resolution
+	ScanTailCallTargets(candidates);  // Stack-based tail call detection
+	ScanLinearSweep(candidates);    // Nucleus-style basic block grouping
 	ApplyNegativePatterns(candidates);
+	
+	// Estimate code boundary using multiple heuristics
+	// The key insight: data decoded as BL gives false targets, so we need to validate
+	
+	// Strategy 1: Find the highest PROLOGUE address (prologues are reliable)
+	uint64_t highestPrologue = 0;
+	// Strategy 2: Find the highest BL target where the CALLER is already a known function
+	uint64_t highestValidBlTarget = 0;
+	
+	for (const auto& pair : candidates)
+	{
+		const FunctionCandidate& c = pair.second;
+		
+		// Prologues are very reliable indicators of real code
+		if ((c.sources & static_cast<uint32_t>(DetectionSource::ProloguePush)) ||
+		    (c.sources & static_cast<uint32_t>(DetectionSource::PrologueStmfd)))
+		{
+			highestPrologue = std::max(highestPrologue, c.address);
+		}
+		
+		// Only count BL targets if the caller is an existing (seeded) function
+		if (c.sources & static_cast<uint32_t>(DetectionSource::BlTarget))
+		{
+			// Check if this target is called from an existing function
+			// (existing functions are the entry point and seeded handlers)
+			if (m_existingFunctions.count(c.address) || c.address < highestPrologue)
+			{
+				highestValidBlTarget = std::max(highestValidBlTarget, c.address);
+			}
+		}
+	}
+	
+	// Use the more conservative estimate (lower of the two)
+	// Add a small margin for tail code
+	uint64_t estimatedCodeEnd = std::max(highestPrologue, highestValidBlTarget);
+	if (estimatedCodeEnd > 0)
+		estimatedCodeEnd += 0x2000;  // 8KB margin for tail code
+	
+	// If we couldn't estimate, use a fallback based on view start
+	if (estimatedCodeEnd == 0)
+		estimatedCodeEnd = m_view->GetEnd();  // No filtering in this case
+	
+	m_logger->LogDebug("FunctionDetector: Estimated code end at 0x%llx (prologue=0x%llx, bl=0x%llx)", 
+		(unsigned long long)estimatedCodeEnd, 
+		(unsigned long long)highestPrologue,
+		(unsigned long long)highestValidBlTarget);
 	
 	// Calculate final scores
 	std::vector<FunctionCandidate> result;
 	for (auto& pair : candidates)
 	{
 		FunctionCandidate& c = pair.second;
+
+		// HARD FILTER: Reject misaligned addresses - ARM must be 4-byte aligned, Thumb must be 2-byte aligned
+		if (!c.isThumb && (c.address & 3))
+			continue;  // Misaligned ARM
+		if (c.isThumb && (c.address & 1))
+			continue;  // Misaligned Thumb
+		
+		// HARD FILTER: Reject candidates well past estimated code end
+		// unless they have strong evidence (call target, prologue)
+		if (estimatedCodeEnd > 0 && c.address > estimatedCodeEnd)
+		{
+			bool hasStrongEvidence = (c.sources & static_cast<uint32_t>(DetectionSource::BlTarget)) ||
+			                         (c.sources & static_cast<uint32_t>(DetectionSource::ProloguePush)) ||
+			                         (c.sources & static_cast<uint32_t>(DetectionSource::PrologueStmfd));
+			if (!hasStrongEvidence)
+			{
+				m_logger->LogDebug("FunctionDetector: Rejecting 0x%llx - past code end without strong evidence",
+					(unsigned long long)c.address);
+				continue;
+			}
+		}
+
 		c.score = CalculateFinalScore(c);
 		
 		if (c.score >= settings.minimumScore)
@@ -1052,6 +1967,9 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 size_t FunctionDetector::ApplyCandidates(const std::vector<FunctionCandidate>& candidates, double minScore)
 {
 	size_t applied = 0;
+	size_t skippedMisaligned = 0;
+	Ref<Platform> defaultPlat = m_view->GetDefaultPlatform();
+	Ref<Architecture> defaultArch = m_view->GetDefaultArchitecture();
 	
 	for (const auto& c : candidates)
 	{
@@ -1062,14 +1980,45 @@ size_t FunctionDetector::ApplyCandidates(const std::vector<FunctionCandidate>& c
 		if (m_existingFunctions.find(c.address) != m_existingFunctions.end())
 			continue;
 		
-		// Create the function
-		Ref<Platform> platform = m_view->GetDefaultPlatform();
-		m_view->CreateUserFunction(platform, c.address);
+		// Validate alignment: ARM requires 4-byte, Thumb requires 2-byte
+		uint64_t funcAddr = c.address & ~1ULL;  // Clear potential Thumb bit
+		if (!c.isThumb && (funcAddr & 3))
+		{
+			// ARM function at non-4-byte-aligned address - skip
+			skippedMisaligned++;
+			continue;
+		}
+		if (c.isThumb && (funcAddr & 1))
+		{
+			// Thumb function at odd address after clearing Thumb bit - skip
+			skippedMisaligned++;
+			continue;
+		}
+		
+		// Use the correct platform based on candidate's isThumb flag
+		Ref<Platform> platform = defaultPlat;
+		if (c.isThumb && defaultArch)
+		{
+			// Get Thumb architecture and related platform
+			uint64_t thumbAddr = c.address | 1;
+			Ref<Architecture> thumbArch = defaultArch->GetAssociatedArchitectureByAddress(thumbAddr);
+			if (thumbArch && thumbArch != defaultArch)
+			{
+				Ref<Platform> thumbPlat = defaultPlat->GetRelatedPlatform(thumbArch);
+				if (thumbPlat)
+					platform = thumbPlat;
+			}
+		}
+		
+		m_view->CreateUserFunction(platform, funcAddr);
 		applied++;
 		
 		m_logger->LogDebug("FunctionDetector: Created function at 0x%llx (score=%.2f, %s)",
-			(unsigned long long)c.address, c.score, c.isThumb ? "Thumb" : "ARM");
+			(unsigned long long)funcAddr, c.score, c.isThumb ? "Thumb" : "ARM");
 	}
+	
+	if (skippedMisaligned > 0)
+		m_logger->LogDebug("FunctionDetector: Skipped %zu misaligned candidates", skippedMisaligned);
 	
 	m_logger->LogInfo("FunctionDetector: Applied %zu functions", applied);
 	return applied;

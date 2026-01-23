@@ -12,5 +12,11 @@
   },
   "rust-analyzer.files.exclude": [
     "binaryninja-api/rust"
+  ],
+  "cursorpyright.analysis.exclude": [
+    "**/node_modules",
+    "**/large_data_dir",
+    "**/.git",
+    "binaryninja-api/**"
   ]
 }

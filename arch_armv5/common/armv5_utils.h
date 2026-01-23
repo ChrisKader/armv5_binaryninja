@@ -102,10 +102,20 @@ namespace armv5 {
 	if (!view || !view->GetObject())
 		return false;
 
-	/* Check 2: Get architecture from platform or view default */
+	/* Check 2: Get architecture, accounting for Thumb bit in address */
 	Ref<Architecture> arch = platform ? platform->GetArchitecture() : view->GetDefaultArchitecture();
 	if (!arch)
 		return false;
+
+	/*
+	 * If address has Thumb bit (bit 0) set, resolve to the associated
+	 * architecture (which should be Thumb). This handles cases where
+	 * callers pass the default ARM platform but the address is Thumb.
+	 */
+	uint64_t tempAddr = addr;
+	Ref<Architecture> resolvedArch = arch->GetAssociatedArchitectureByAddress(tempAddr);
+	if (resolvedArch)
+		arch = resolvedArch;
 
 	/*
 	 * Determine enforcement policy based on binary structure.
@@ -117,11 +127,48 @@ namespace armv5 {
 	const bool enforceExecutable = !view->GetSegments().empty();
 	const bool enforceCodeSemantics = !view->GetSections().empty();
 
-	/* Check 3: Align to instruction boundary (ARM=4, Thumb=2) */
+	/*
+	 * Check 3: Handle ARM/Thumb addressing and alignment
+	 *
+	 * ARM uses bit 0 to indicate Thumb mode in branch targets:
+	 * - Bit 0 = 1: Thumb mode, actual address is addr & ~1
+	 * - Bit 0 = 0: ARM mode (for ARM architecture) or Thumb (for Thumb architecture)
+	 *
+	 * Alignment enforcement based on platform architecture:
+	 * - ARM architecture (alignment=4): must be 4-byte aligned, no Thumb bit
+	 * - Thumb architecture (alignment=2): must be 2-byte aligned after clearing Thumb bit
+	 */
+	const size_t archAlign = arch->GetInstructionAlignment();
 	uint64_t checkAddr = addr;
-	const size_t align = arch->GetInstructionAlignment();
-	if (align > 1)
-		checkAddr &= ~(static_cast<uint64_t>(align) - 1);
+
+	if (archAlign == 4)
+	{
+		// ARM architecture: reject if Thumb bit is set or not 4-byte aligned
+		if (addr & 3)
+		{
+			if (logger && label)
+				logger->LogDebug("%s: misaligned ARM address 0x%llx (requires 4-byte alignment)",
+					label, (unsigned long long)addr);
+			return false;
+		}
+	}
+	else if (archAlign == 2)
+	{
+		// Thumb architecture: clear Thumb bit, check 2-byte alignment
+		checkAddr = addr & ~1ULL;
+		if (checkAddr & 1)  // Should never happen but be safe
+		{
+			if (logger && label)
+				logger->LogDebug("%s: misaligned Thumb address 0x%llx",
+					label, (unsigned long long)addr);
+			return false;
+		}
+	}
+	else
+	{
+		// Unknown alignment, just clear bit 0 and continue
+		checkAddr = addr & ~1ULL;
+	}
 
 	/* Check 4: Must be within valid address range */
 	if (!view->IsValidOffset(checkAddr))
@@ -144,36 +191,76 @@ namespace armv5 {
 	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
 		return false;
 
-	/* Check 9 & 10: Read instruction bytes and validate */
-	DataBuffer buf = view->ReadBuffer(checkAddr, arch->GetMaxInstructionLength());
-	if (buf.GetLength() == 0)
-		return false;
-
 	/*
-	 * Reject obvious padding patterns.
-	 * Firmware often has large regions of 0x00 or 0xFF between sections.
-	 * These decode as valid ARM instructions (ANDEQ r0,r0,r0 for 0x00000000)
-	 * but are clearly not real code.
+	 * Check 9: Validate multiple consecutive instructions.
+	 *
+	 * A valid function should have multiple valid instructions in a row.
+	 * Checking just the first instruction isn't enough - data can accidentally
+	 * decode to a single valid instruction. By requiring 3+ valid instructions,
+	 * we dramatically reduce false positives from string/data regions.
 	 */
-	if (buf.GetLength() >= 4)
-	{
-		const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-		const bool allZero = bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
-		const bool allFF = bytes[0] == 0xFF && bytes[1] == 0xFF && bytes[2] == 0xFF && bytes[3] == 0xFF;
-		if (allZero || allFF)
-			return false;
-	}
-
-	/* Check 10: Must decode to a valid instruction */
-	InstructionInfo info;
-	if (!arch->GetInstructionInfo(static_cast<const uint8_t*>(buf.GetData()), checkAddr, buf.GetLength(), info))
-	{
-		if (logger && label)
-			logger->LogDebug("%s: no instruction at 0x%llx", label, (unsigned long long)checkAddr);
+	constexpr size_t kMinValidInstructions = 3;
+	constexpr size_t kMaxBytesToCheck = 16;  // Check up to 4 ARM instructions
+	
+	DataBuffer buf = view->ReadBuffer(checkAddr, kMaxBytesToCheck);
+	if (buf.GetLength() < 4)
 		return false;
+
+	const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+	size_t offset = 0;
+	size_t validCount = 0;
+	
+	while (offset + 4 <= buf.GetLength() && validCount < kMinValidInstructions)
+	{
+		/*
+		 * Reject obvious padding patterns.
+		 * Firmware often has large regions of 0x00 or 0xFF between sections.
+		 */
+		const uint8_t* instrBytes = bytes + offset;
+		const bool allZero = instrBytes[0] == 0 && instrBytes[1] == 0 && 
+		                     instrBytes[2] == 0 && instrBytes[3] == 0;
+		const bool allFF = instrBytes[0] == 0xFF && instrBytes[1] == 0xFF && 
+		                   instrBytes[2] == 0xFF && instrBytes[3] == 0xFF;
+		if (allZero || allFF)
+		{
+			if (logger && label)
+				logger->LogDebug("%s: padding at 0x%llx+%zu", label, (unsigned long long)checkAddr, offset);
+			return false;
+		}
+
+		/* Try to decode the instruction */
+		InstructionInfo info;
+		if (!arch->GetInstructionInfo(instrBytes, checkAddr + offset, buf.GetLength() - offset, info))
+		{
+			if (logger && label)
+				logger->LogDebug("%s: invalid instruction at 0x%llx+%zu", label, (unsigned long long)checkAddr, offset);
+			return false;
+		}
+		
+		if (info.length == 0)
+		{
+			if (logger && label)
+				logger->LogDebug("%s: zero-length instruction at 0x%llx+%zu", label, (unsigned long long)checkAddr, offset);
+			return false;
+		}
+
+		validCount++;
+		offset += info.length;
+		
+		/* Stop if we hit an unconditional branch/return - function might be very short */
+		for (size_t i = 0; i < info.branchCount; i++)
+		{
+			if (info.branchType[i] == UnconditionalBranch ||
+			    info.branchType[i] == FunctionReturn)
+			{
+				/* Accept short functions that end with branch/return */
+				if (validCount >= 1)
+					return true;
+			}
+		}
 	}
 
-	return info.length != 0;
+	return validCount >= kMinValidInstructions;
 }
 
 /**

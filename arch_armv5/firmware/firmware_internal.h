@@ -257,7 +257,8 @@ size_t ScanForFunctionPrologues(const BinaryNinja::Ref<BinaryNinja::BinaryView>&
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Architecture> armArch, BinaryNinja::Ref<BinaryNinja::Architecture> thumbArch,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger,
-	bool verboseLog, const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
+	bool verboseLog, const FirmwareScanTuning& tuning, uint64_t codeDataBoundary,
+	std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
 /**
  * Scan for call targets (PHASE 2).
@@ -271,7 +272,7 @@ size_t ScanForFunctionPrologues(const BinaryNinja::Ref<BinaryNinja::BinaryView>&
 size_t ScanForCallTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
-	const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
+	const FirmwareScanTuning& tuning, uint64_t codeDataBoundary, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
 /**
  * Scan for pointer tables (PHASE 3).
@@ -287,7 +288,7 @@ size_t ScanForCallTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
 size_t ScanForPointerTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
-	const FirmwareScanTuning& tuning, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
+	const FirmwareScanTuning& tuning, uint64_t codeDataBoundary, std::set<uint64_t>* seededFunctions, FirmwareScanPlan* plan);
 
 /**
  * Scan for orphan code blocks (PHASE 4).
@@ -308,8 +309,8 @@ size_t ScanForPointerTargets(const BinaryNinja::Ref<BinaryNinja::BinaryView>& vi
 size_t ScanForOrphanCodeBlocks(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view, const uint8_t* data,
 	uint64_t dataLen, BNEndianness endian, uint64_t imageBase, uint64_t length,
 	BinaryNinja::Ref<BinaryNinja::Platform> plat, BinaryNinja::Ref<BinaryNinja::Logger> logger, bool verboseLog,
-	const FirmwareScanTuning& tuning, uint32_t minValidInstr, uint32_t minBodyInstr, uint32_t minSpacingBytes,
-	uint32_t maxPerPage, bool requirePrologue, std::set<uint64_t>* addedFunctions, FirmwareScanPlan* plan);
+	const FirmwareScanTuning& tuning, uint64_t codeDataBoundary, uint32_t minValidInstr, uint32_t minBodyInstr,
+	uint32_t minSpacingBytes, uint32_t maxPerPage, bool requirePrologue, std::set<uint64_t>* addedFunctions, FirmwareScanPlan* plan);
 
 /**
  * Clean up invalid functions (PHASE 5).
@@ -374,3 +375,31 @@ void ClearAutoDataOnCodeReferences(const FirmwareScanContext& ctx);
  */
 void ClearAutoDataInFunctionEntryBlocks(const FirmwareScanContext& ctx,
 	const std::set<uint64_t>* seededFunctions);
+
+/**
+ * Re-enable analysis for important functions that have analysis suppressed.
+ *
+ * Finds seeded functions and complex functions that have analysis suppressed
+ * and re-enables their analysis for proper reverse engineering.
+ */
+void ReEnableAnalysisForImportantFunctions(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
+	const BinaryNinja::Ref<BinaryNinja::Logger>& logger);
+
+/**
+ * Re-enable analysis for functions that have analysis suppressed.
+ *
+ * Finds all functions that have analysis suppressed and re-enables their
+ * analysis to resolve "analysis disabled" alerts.
+ */
+void ReEnableAnalysisForSuppressedFunctions(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
+	const BinaryNinja::Ref<BinaryNinja::Logger>& logger);
+
+/**
+ * Post-analysis cleanup to fix incomplete function analysis caused by
+ * incorrectly marked __noreturn functions.
+ *
+ * Looks for functions with unreachable code after their analyzed end
+ * and forces re-analysis to complete the function boundaries.
+ */
+void PostAnalysisCleanup(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
+	const BinaryNinja::Ref<BinaryNinja::Logger>& logger);

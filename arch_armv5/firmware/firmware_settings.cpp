@@ -123,14 +123,20 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.enableClearAutoDataOnCodeRefs = true;
 	settings.enableVerboseLogging = false;
 	settings.enableInvalidFunctionCleanup = true;
-	settings.disablePointerSweep = false;
-	settings.disableLinearSweep = false;
-	// Partial linear sweep only during initial analysis
-	settings.enablePartialLinearSweep = (mode == FirmwareSettingsMode::Init);
+	// Disable BN's generic pointer sweep for firmware - our ARM-specific scan is more conservative
+	// and avoids false positives from data that looks like pointers
+	settings.disablePointerSweep = true;
+	// Disable BN's linear sweep - function discovery is entirely handled by our ARM-specific scans
+	// (prologues, call targets, pointer tables, orphan code). BN still handles function analysis
+	// (IL lifting, type propagation, etc.) for the functions we discover.
+	settings.disableLinearSweep = true;
+	// Partial linear sweep is disabled by default since we're handling function discovery ourselves
+	// Users can enable this if they want BN's linear sweep as a supplement to our scans
+	settings.enablePartialLinearSweep = false;
 	settings.skipFirmwareScans = false;
-	settings.cleanupMaxSizeBytes = 8;
-	settings.cleanupRequireZeroRefs = true;
-	settings.cleanupRequirePcWriteStart = true;
+	settings.cleanupMaxSizeBytes = 0;        // 0 = no size limit, clean any invalid function
+	settings.cleanupRequireZeroRefs = false;  // Remove even if has callers (caller is wrong)
+	settings.cleanupRequirePcWriteStart = false;  // Don't require PC write - remove data too
 	settings.orphanMinValidInstr = 4;
 	settings.orphanMinBodyInstr = 2;
 	settings.orphanMinSpacingBytes = 0x80;
@@ -138,9 +144,15 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.orphanMaxPerPage = (mode == FirmwareSettingsMode::Init) ? 6 : 8;
 	// Require prologue only during initial analysis
 	settings.orphanRequirePrologue = (mode == FirmwareSettingsMode::Init);
-	settings.maxFunctionAdds = 2000;
+	settings.maxFunctionAdds = 50000;
 	settings.tuning = FirmwareScanTuning{};
 	settings.tuning.scanRawPointerTables = true;
+	// Unified recognizer settings - enabled by default for better function detection
+	// Uses FunctionDetector with linear sweep, switch resolution, and tail call analysis
+	settings.useUnifiedRecognizer = true;
+	settings.recognizerMinScorePct = 30;  // 30% - allow linear sweep candidates to pass
+	settings.recognizerPreset = 0;        // default preset for balanced detection
+	settings.codeDataBoundary = 0;        // 0 = auto-detect based on prologues
 	return settings;
 }
 
@@ -211,14 +223,24 @@ FirmwareSettings LoadFirmwareSettings(const Ref<Settings>& settings, BinaryView*
 		result.tuning.requireCallInFunction = settings->Get<bool>(key(kCallScanRequireInFunction), view);
 	if (settings->Contains(key(kCleanupInvalidFunctions)))
 		result.enableInvalidFunctionCleanup = settings->Get<bool>(key(kCleanupInvalidFunctions), view);
-	if (view && view->GetSegments().empty())
-		result.enableInvalidFunctionCleanup = false;
+	// Note: Don't disable cleanup for raw firmware (no segments) - cleanup is especially
+	// important for raw firmware where we have less type information and more false positives
 	if (settings->Contains(key(kCleanupInvalidMaxSize)))
 		result.cleanupMaxSizeBytes = (uint32_t)settings->Get<uint64_t>(key(kCleanupInvalidMaxSize), view);
 	if (settings->Contains(key(kCleanupInvalidRequireZeroRefs)))
 		result.cleanupRequireZeroRefs = settings->Get<bool>(key(kCleanupInvalidRequireZeroRefs), view);
 	if (settings->Contains(key(kCleanupInvalidRequirePcWrite)))
 		result.cleanupRequirePcWriteStart = settings->Get<bool>(key(kCleanupInvalidRequirePcWrite), view);
+
+	// Unified recognizer settings
+	if (settings->Contains(key(kUseUnifiedRecognizer)))
+		result.useUnifiedRecognizer = settings->Get<bool>(key(kUseUnifiedRecognizer), view);
+	if (settings->Contains(key(kRecognizerMinScore)))
+		result.recognizerMinScorePct = (uint32_t)settings->Get<uint64_t>(key(kRecognizerMinScore), view);
+	if (settings->Contains(key(kRecognizerPreset)))
+		result.recognizerPreset = (uint32_t)settings->Get<uint64_t>(key(kRecognizerPreset), view);
+	if (settings->Contains(key(kCodeDataBoundary)))
+		result.codeDataBoundary = settings->Get<uint64_t>(key(kCodeDataBoundary), view);
 
 	ApplyFirmwareEnvOverrides(result);
 	NormalizeFirmwareSettings(result);
@@ -290,9 +312,10 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 		"Orphan scan max per 4KB page",
 		"Maximum orphan functions to add per 4KB page (0 disables the cap).");
 
-	fw->RegisterBool(settings, kPartialLinearSweep, true,
+	fw->RegisterBool(settings, kPartialLinearSweep, false,
 		"Partial linear sweep",
-		"Enable Binary Ninja's partial linear sweep (no CFG pass) alongside the firmware scans.");
+		"Enable Binary Ninja's partial linear sweep (no CFG pass) as a supplement to our ARM-specific scans. "
+		"Disabled by default since function discovery is handled by our scans.");
 
 	fw->RegisterBool(settings, kSkipFirmwareScans, false,
 		"Skip firmware scans",
@@ -322,33 +345,37 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 		"Call scan require in-function",
 		"Restrict call-target scanning to instructions already inside functions.");
 
-	fw->RegisterNumber(settings, kMaxFunctionAdds, 2000, 0, 100000,
+	fw->RegisterNumber(settings, kMaxFunctionAdds, 50000, 0, 100000,
 		"Max firmware function additions",
 		"Cap the number of functions added per firmware scan run (0 disables the cap).");
 
-	fw->RegisterBool(settings, kDisablePointerSweep, false,
+	fw->RegisterBool(settings, kDisablePointerSweep, true,
 		"Disable core pointer sweep",
-		"Disable Binary Ninja's core pointer sweep (analysis.pointerSweep.autorun) to reduce false positives in raw firmware blobs.");
+		"Disable Binary Ninja's generic pointer sweep (analysis.pointerSweep.autorun). "
+		"Recommended for firmware because our ARM-specific pointer scan is more conservative "
+		"and avoids false positives from data that resembles pointers.");
 
-	fw->RegisterBool(settings, kDisableLinearSweep, false,
+	fw->RegisterBool(settings, kDisableLinearSweep, true,
 		"Disable core linear sweep",
-		"Disable Binary Ninja's core linear sweep so firmware scans drive function discovery.");
+		"Disable Binary Ninja's linear sweep so function discovery is entirely handled by our "
+		"ARM-specific scans (prologues, call targets, pointer tables, orphan code). BN still "
+		"handles function analysis (IL lifting, type propagation) for discovered functions.");
 
 	fw->RegisterBool(settings, kCleanupInvalidFunctions, true,
 		"Cleanup invalid functions",
 		"Remove tiny auto-discovered functions that fail ARMv5 validation checks after analysis.");
 
-	fw->RegisterNumber(settings, kCleanupInvalidMaxSize, 8, 4, 32,
+	fw->RegisterNumber(settings, kCleanupInvalidMaxSize, 0, 0, 10000,
 		"Cleanup invalid max size",
-		"Maximum size (bytes) for functions eligible for invalid cleanup.");
+		"Maximum size (bytes) for functions eligible for invalid cleanup. 0 means no limit.");
 
-	fw->RegisterBool(settings, kCleanupInvalidRequireZeroRefs, true,
+	fw->RegisterBool(settings, kCleanupInvalidRequireZeroRefs, false,
 		"Cleanup invalid require zero refs",
 		"Only remove invalid functions with zero incoming references.");
 
-	fw->RegisterBool(settings, kCleanupInvalidRequirePcWrite, true,
+	fw->RegisterBool(settings, kCleanupInvalidRequirePcWrite, false,
 		"Cleanup invalid require PC write",
-		"Only remove invalid functions whose first instruction writes PC.");
+		"Only remove invalid functions whose first instruction writes PC. Disable to also remove data-as-code.");
 
 	fw->RegisterBool(settings, kTypeLiteralPools, true,
 		"Type literal pool entries",
@@ -373,4 +400,32 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 	fw->RegisterNumber(settings, kScanMaxLiteralRun, 2, 0, 16,
 		"Scan max literal run",
 		"Maximum consecutive PC-relative literal loads allowed in the validation window.");
+
+	// Unified recognizer settings - enabled by default for better function detection
+	fw->RegisterBool(settings, kUseUnifiedRecognizer, true,
+		"Use unified function recognizer",
+		"Use the advanced FunctionRecognizer instead of legacy scan functions. "
+		"The recognizer combines linear sweep, switch table resolution, and tail call analysis "
+		"with configurable weights for better function detection.");
+
+	// Register min score as integer percentage (0-100) - balanced default
+	fw->RegisterNumber(settings, kRecognizerMinScore, 45, 0, 100,
+		"Recognizer minimum score (%)",
+		"Minimum confidence percentage (0-100) for the unified recognizer to accept a function candidate. "
+		"Lower values allow more candidates but may include false positives; higher values require stronger evidence.");
+
+	// Register preset as enum (0=default, 1=aggressive, 2=conservative, 3=prologue, 4=calls)
+	// Default to default (0) for balanced detection
+	fw->RegisterNumber(settings, kRecognizerPreset, 0, 0, 4,
+		"Recognizer preset",
+		"Function detection preset: 0=default (balanced), 1=aggressive, 2=conservative, 3=prologue-only, 4=call-targets-only.");
+
+	fw->RegisterNumber(settings, kCodeDataBoundary, 0, 0, UINT64_MAX,
+		"Code-data boundary address",
+		"Address where code ends and data begins. 0 = auto-detect based on prologue locations. "
+		"Set to a specific address to manually define the boundary for binaries where automatic detection fails.");
+
+	fw->RegisterNumber(settings, kRecognizerPreset, 0, 0, 4,
+		"Recognizer preset",
+		"Preset configuration: 0=default, 1=aggressive, 2=conservative, 3=prologue-only, 4=call-targets-only.");
 }
