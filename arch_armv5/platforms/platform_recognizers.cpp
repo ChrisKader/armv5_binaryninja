@@ -391,6 +391,15 @@ static Ref<Platform> RawArmv5PlatformRecognize(BinaryView* view, Metadata* metad
 
 void RegisterArmv5PlatformRecognizers(BNEndianness endian)
 {
+  // Guard against double registration
+  static bool s_leRegistered = false;
+  static bool s_beRegistered = false;
+
+  bool& registered = (endian == LittleEndian) ? s_leRegistered : s_beRegistered;
+  if (registered)
+    return;
+  registered = true;
+
   Ref<BinaryViewType> elf = BinaryViewType::GetByName("ELF");
   if (elf)
     elf->RegisterPlatformRecognizer(0x28, endian, ElfArmv5PlatformRecognize);

@@ -355,7 +355,43 @@ std::vector<uint32_t> ArmCommonArchitecture::GetAllRegisters()
       REG_D14,
       REG_D15,
 
-      /* special registers */
+      /* CPSR variants (used by MSR/MRS lifting) */
+      REGS_CPSR,
+      REGS_CPSR_C,
+      REGS_CPSR_X,
+      REGS_CPSR_XC,
+      REGS_CPSR_S,
+      REGS_CPSR_SC,
+      REGS_CPSR_SX,
+      REGS_CPSR_SXC,
+      REGS_CPSR_F,
+      REGS_CPSR_FC,
+      REGS_CPSR_FX,
+      REGS_CPSR_FXC,
+      REGS_CPSR_FS,
+      REGS_CPSR_FSC,
+      REGS_CPSR_FSX,
+      REGS_CPSR_FSXC,
+
+      /* SPSR variants */
+      REGS_SPSR,
+      REGS_SPSR_C,
+      REGS_SPSR_X,
+      REGS_SPSR_XC,
+      REGS_SPSR_S,
+      REGS_SPSR_SC,
+      REGS_SPSR_SX,
+      REGS_SPSR_SXC,
+      REGS_SPSR_F,
+      REGS_SPSR_FC,
+      REGS_SPSR_FX,
+      REGS_SPSR_FXC,
+      REGS_SPSR_FS,
+      REGS_SPSR_FSC,
+      REGS_SPSR_FSX,
+      REGS_SPSR_FSXC,
+
+      /* VFP system registers */
       REGS_FPSID,
       REGS_FPSCR,
       REGS_FPEXC,
@@ -449,8 +485,48 @@ BNRegisterInfo ArmCommonArchitecture::GetRegisterInfo(uint32_t reg)
   case REG_D14:
   case REG_D15:
     return RegisterInfo(reg, 0, 8);
-  default:
+  case REGS_CPSR:
+  case REGS_CPSR_C:
+  case REGS_CPSR_X:
+  case REGS_CPSR_XC:
+  case REGS_CPSR_S:
+  case REGS_CPSR_SC:
+  case REGS_CPSR_SX:
+  case REGS_CPSR_SXC:
+  case REGS_CPSR_F:
+  case REGS_CPSR_FC:
+  case REGS_CPSR_FX:
+  case REGS_CPSR_FXC:
+  case REGS_CPSR_FS:
+  case REGS_CPSR_FSC:
+  case REGS_CPSR_FSX:
+  case REGS_CPSR_FSXC:
+  case REGS_SPSR:
+  case REGS_SPSR_C:
+  case REGS_SPSR_X:
+  case REGS_SPSR_XC:
+  case REGS_SPSR_S:
+  case REGS_SPSR_SC:
+  case REGS_SPSR_SX:
+  case REGS_SPSR_SXC:
+  case REGS_SPSR_F:
+  case REGS_SPSR_FC:
+  case REGS_SPSR_FX:
+  case REGS_SPSR_FXC:
+  case REGS_SPSR_FS:
+  case REGS_SPSR_FSC:
+  case REGS_SPSR_FSX:
+  case REGS_SPSR_FSXC:
+  case REGS_FPSID:
+  case REGS_FPSCR:
+  case REGS_FPEXC:
     return RegisterInfo(reg, 0, 4);
+  default:
+    // Return invalid register info for unknown register IDs.
+    // This matches the official ARMv7 behavior and prevents issues
+    // during undo/redo when Binary Ninja tries to translate saved
+    // register references that may use internal ID formats.
+    return RegisterInfo(0, 0, 0);
   }
 }
 

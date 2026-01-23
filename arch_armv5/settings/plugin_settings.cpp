@@ -102,6 +102,9 @@ void SettingsComponent::RegisterBool(const Ref<Settings>& settings,
 		return;
 
 	std::string key = GetKey(name);
+	if (settings->Contains(key))
+		return;
+
 	std::string json = R"({
 		"title" : ")" + std::string(title) + R"(",
 		"type" : "boolean",
@@ -119,6 +122,9 @@ void SettingsComponent::RegisterNumber(const Ref<Settings>& settings,
 		return;
 
 	std::string key = GetKey(name);
+	if (settings->Contains(key))
+		return;
+
 	std::string json = R"({
 		"title" : ")" + std::string(title) + R"(",
 		"type" : "number",

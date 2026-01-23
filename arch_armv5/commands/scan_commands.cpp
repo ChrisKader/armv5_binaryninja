@@ -940,6 +940,12 @@ static bool RunCleanupPassIsValid(BinaryView* view)
  */
 void RegisterScanCommands()
 {
+	// Guard against double registration
+	static bool s_registered = false;
+	if (s_registered)
+		return;
+	s_registered = true;
+
 	// Run All Firmware Scans
 	PluginCommand::Register(
 		"ARMv5\\Run All Firmware Scans",

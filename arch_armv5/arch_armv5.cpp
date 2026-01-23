@@ -83,6 +83,15 @@ using namespace BinaryNinja;
  */
 static void RegisterArmv5Architecture(const char* armName, const char* thumbName, BNEndianness endian)
 {
+  // Guard against double registration (can happen if plugin is loaded multiple ways)
+  static bool s_leRegistered = false;
+  static bool s_beRegistered = false;
+
+  bool& registered = (endian == LittleEndian) ? s_leRegistered : s_beRegistered;
+  if (registered)
+    return;
+  registered = true;
+
   /*
    * Create architecture objects.
    * These are separate classes that share a common base (ArmCommonArchitecture).
