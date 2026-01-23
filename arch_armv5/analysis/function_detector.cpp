@@ -8,6 +8,7 @@
 #include "linear_sweep.h"
 #include "prologue_patterns.h"
 #include "switch_resolver.h"
+#include "common/armv5_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2008,6 +2009,14 @@ size_t FunctionDetector::ApplyCandidates(const std::vector<FunctionCandidate>& c
 				if (thumbPlat)
 					platform = thumbPlat;
 			}
+		}
+
+		// Validate the function start (checks for strings, padding, etc.)
+		if (!armv5::IsValidFunctionStart(m_view, platform, funcAddr, m_logger.GetPtr(), "FunctionDetector"))
+		{
+			m_logger->LogDebug("FunctionDetector: Rejected 0x%llx - failed validation",
+				(unsigned long long)funcAddr);
+			continue;
 		}
 		
 		m_view->CreateUserFunction(platform, funcAddr);

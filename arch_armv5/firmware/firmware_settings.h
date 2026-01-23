@@ -102,3 +102,33 @@ FirmwareSettings LoadFirmwareSettings(const BinaryNinja::Ref<BinaryNinja::Settin
 void LogFirmwareSettingsSummary(const BinaryNinja::Ref<BinaryNinja::Logger>& logger,
 	const FirmwareSettings& settings);
 void RegisterFirmwareSettings(const BinaryNinja::Ref<BinaryNinja::Settings>& settings);
+
+/**
+ * Get the effective code-data boundary for a binary view.
+ *
+ * This centralizes the logic for determining where code ends and data begins.
+ * The boundary is used to prevent creating functions in known data regions.
+ *
+ * Resolution order:
+ * 1. If settings.codeDataBoundary is non-zero, use that value
+ * 2. Otherwise, auto-detect based on binary structure:
+ *    - For binaries with sections, use the end of the last executable section
+ *    - For raw firmware, use halfway point as a conservative heuristic
+ *
+ * @param view The BinaryView to analyze
+ * @param settings Firmware settings (may contain explicit boundary)
+ * @return The effective code-data boundary address
+ */
+uint64_t GetEffectiveCodeDataBoundary(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
+	const FirmwareSettings& settings);
+
+/**
+ * Check if an address is in the data region (past the code-data boundary).
+ *
+ * @param view The BinaryView
+ * @param settings Firmware settings
+ * @param addr Address to check
+ * @return true if the address is in the data region
+ */
+bool IsAddressInDataRegion(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view,
+	const FirmwareSettings& settings, uint64_t addr);

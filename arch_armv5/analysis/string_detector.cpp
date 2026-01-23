@@ -54,6 +54,143 @@ const char* StringDetector::CategoryToString(StringCategory cat)
 	}
 }
 
+bool StringDetector::LooksLikeNullTerminatedString(const uint8_t* data, size_t len,
+	size_t minLen, double minRatio)
+{
+	if (!data || len < 2)
+		return false;
+
+	// Helper to check if a byte is printable (including common control chars)
+	auto isPrintable = [](uint8_t c) -> bool {
+		return (c >= 0x20 && c <= 0x7E) || c == 0x09 || c == 0x0A || c == 0x0D;
+	};
+
+	// Check 1: Standard null-terminated string starting at this address
+	// Any sequence of printable characters followed by null is likely string data
+	{
+		size_t nullPos = 0;
+		bool foundNull = false;
+		for (size_t i = 0; i < len; i++)
+		{
+			if (data[i] == 0x00)
+			{
+				nullPos = i;
+				foundNull = true;
+				break;
+			}
+		}
+
+		if (foundNull && nullPos >= minLen)
+		{
+			size_t printableCount = 0;
+			for (size_t i = 0; i < nullPos; i++)
+			{
+				if (isPrintable(data[i]))
+					printableCount++;
+			}
+
+			double ratio = static_cast<double>(printableCount) / static_cast<double>(nullPos);
+			// Just require high printable ratio - separator strings like "------" are valid
+			if (ratio >= minRatio)
+				return true;
+		}
+	}
+
+	// Check 2: We're at a string table boundary (null + printable string follows)
+	// This catches addresses that land at the null terminator of a previous string
+	if (data[0] == 0x00 && len > 1 && isPrintable(data[1]))
+	{
+		// Find the null terminator of the NEXT string
+		size_t nullPos = 0;
+		bool foundNull = false;
+		for (size_t i = 1; i < len; i++)
+		{
+			if (data[i] == 0x00)
+			{
+				nullPos = i;
+				foundNull = true;
+				break;
+			}
+		}
+
+		// Check if the string after the leading null is valid
+		if (foundNull && (nullPos - 1) >= minLen)
+		{
+			size_t printableCount = 0;
+			for (size_t i = 1; i < nullPos; i++)
+			{
+				if (isPrintable(data[i]))
+					printableCount++;
+			}
+
+			size_t strLen = nullPos - 1;
+			double ratio = static_cast<double>(printableCount) / static_cast<double>(strLen);
+			if (ratio >= minRatio)
+				return true;
+		}
+	}
+
+	// Check 3: Short strings (2-3 chars) that are clearly text
+	// For very short strings, require 100% printable
+	{
+		size_t nullPos = 0;
+		bool foundNull = false;
+		for (size_t i = 0; i < len && i < 8; i++)
+		{
+			if (data[i] == 0x00)
+			{
+				nullPos = i;
+				foundNull = true;
+				break;
+			}
+		}
+
+		// Short string: 2-3 printable chars followed by null
+		if (foundNull && nullPos >= 2 && nullPos < minLen)
+		{
+			bool allPrintable = true;
+			for (size_t i = 0; i < nullPos; i++)
+			{
+				if (!isPrintable(data[i]))
+				{
+					allPrintable = false;
+					break;
+				}
+			}
+			if (allPrintable)
+				return true;
+		}
+	}
+
+	// Check 4: Embedded in a string region - high printable ratio in first 16 bytes
+	// Even without finding a null, if the data is mostly printable, it's likely string data
+	{
+		constexpr size_t kQuickCheck = 16;
+		size_t checkLen = (len < kQuickCheck) ? len : kQuickCheck;
+		size_t printableCount = 0;
+		size_t nullCount = 0;
+
+		for (size_t i = 0; i < checkLen; i++)
+		{
+			if (isPrintable(data[i]))
+				printableCount++;
+			else if (data[i] == 0x00)
+				nullCount++;
+		}
+
+		// If >= 80% printable (excluding nulls) and we have at least one null, likely string data
+		size_t nonNullLen = checkLen - nullCount;
+		if (nonNullLen >= 4 && nullCount >= 1 && nullCount <= 4)
+		{
+			double ratio = static_cast<double>(printableCount) / static_cast<double>(nonNullLen);
+			if (ratio >= 0.80)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 bool StringDetector::isPrintableAscii(uint8_t c) const
 {
 	return (c >= 0x20 && c <= 0x7E) || c == '\t' || c == '\n' || c == '\r';
@@ -355,11 +492,16 @@ bool StringDetector::isValidString(const std::vector<uint8_t>& data, StringEncod
 				foundNull = true;
 				break;
 			}
-		charCount++;
-		if (wc >= 0x20 && wc < 0x7F)
-			printableCount++;
-		else if (wc >= 0x80)
-			printableCount++;  // Extended chars are often ok
+			charCount++;
+			// For firmware, be strict: only count ASCII-range characters
+			// High byte should be 0x00 for valid ASCII-as-UTF16
+			if (wc >= 0x20 && wc <= 0x7E)
+				printableCount++;
+			// Also allow common Latin-1 supplement (accented chars) 0x00A0-0x00FF
+			else if (wc >= 0x00A0 && wc <= 0x00FF)
+				printableCount++;
+			// Reject Private Use Area, Specials, and other suspicious ranges
+			// Characters in 0xE000-0xF8FF or 0xFFF0-0xFFFF are likely garbage
 		}
 		break;
 		
@@ -440,6 +582,302 @@ bool StringDetector::isInsideExistingString(uint64_t addr) const
 	return false;
 }
 
+// Check for consecutive non-printable characters (reject strings with too many in a row)
+bool StringDetector::hasConsecutiveNonPrintable(const uint8_t* data, size_t len, size_t maxConsec) const
+{
+	size_t consecutive = 0;
+	for (size_t i = 0; i < len; i++)
+	{
+		uint8_t c = data[i];
+		if (c == 0)
+			break;  // Stop at null terminator
+		
+		bool isPrintable = (c >= 0x20 && c <= 0x7E) || c == '\t' || c == '\n' || c == '\r';
+		if (!isPrintable)
+		{
+			consecutive++;
+			if (consecutive > maxConsec)
+				return true;  // Found too many consecutive non-printable
+		}
+		else
+		{
+			consecutive = 0;
+		}
+	}
+	return false;
+}
+
+// Check if this is an ANSI escape sequence (ESC [ ...)
+bool StringDetector::isAnsiEscapeSequence(const uint8_t* data, size_t len) const
+{
+	// ANSI escape sequences start with ESC (0x1B) followed by '[' (0x5B)
+	if (len >= 3 && data[0] == 0x1B && data[1] == 0x5B)
+		return true;
+	return false;
+}
+
+// Check if data looks like UTF-16 via alternating printable/null patterns
+// This is a strict check to avoid false positives on binary data
+bool StringDetector::looksLikeUtf16Pattern(const uint8_t* data, size_t len, bool& isLittleEndian) const
+{
+	// Require at least 8 bytes (4 UTF-16 characters) for reliable detection
+	if (len < 8 || (len % 2) != 0)
+		return false;
+	
+	size_t charCount = len / 2;
+	
+	// Check for two patterns:
+	// Pattern 1 (LE): ASCII char + null byte (e.g., 'H' 0x00 'e' 0x00 'l' 0x00 'l' 0x00)
+	// Pattern 2 (BE): null byte + ASCII char (e.g., 0x00 'H' 0x00 'e' 0x00 'l' 0x00 'l')
+	
+	size_t leAsciiCount = 0;
+	size_t beAsciiCount = 0;
+	size_t leAlphaNumCount = 0;
+	size_t beAlphaNumCount = 0;
+	size_t consecutiveLeAlphaNum = 0;
+	size_t consecutiveBeAlphaNum = 0;
+	size_t maxLeConsecutive = 0;
+	size_t maxBeConsecutive = 0;
+	
+	for (size_t i = 0; i + 1 < len; i += 2)
+	{
+		uint8_t c1 = data[i];
+		uint8_t c2 = data[i + 1];
+		
+		// Little-endian: c1 is the character, c2 should be null for ASCII range
+		if (c2 == 0x00 && c1 >= 0x20 && c1 <= 0x7E)
+		{
+			leAsciiCount++;
+			if ((c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z') || (c1 >= '0' && c1 <= '9'))
+			{
+				leAlphaNumCount++;
+				consecutiveLeAlphaNum++;
+				if (consecutiveLeAlphaNum > maxLeConsecutive)
+					maxLeConsecutive = consecutiveLeAlphaNum;
+			}
+			else
+			{
+				consecutiveLeAlphaNum = 0;
+			}
+		}
+		else
+		{
+			consecutiveLeAlphaNum = 0;
+		}
+		
+		// Big-endian: c1 should be null for ASCII range, c2 is the character
+		if (c1 == 0x00 && c2 >= 0x20 && c2 <= 0x7E)
+		{
+			beAsciiCount++;
+			if ((c2 >= 'A' && c2 <= 'Z') || (c2 >= 'a' && c2 <= 'z') || (c2 >= '0' && c2 <= '9'))
+			{
+				beAlphaNumCount++;
+				consecutiveBeAlphaNum++;
+				if (consecutiveBeAlphaNum > maxBeConsecutive)
+					maxBeConsecutive = consecutiveBeAlphaNum;
+			}
+			else
+			{
+				consecutiveBeAlphaNum = 0;
+			}
+		}
+		else
+		{
+			consecutiveBeAlphaNum = 0;
+		}
+	}
+	
+	// Strict requirements:
+	// 1. At least 80% of characters must be ASCII (null + printable)
+	// 2. At least 50% must be alphanumeric
+	// 3. Must have at least 3 consecutive alphanumeric (a word-like sequence)
+	
+	double leAsciiRatio = static_cast<double>(leAsciiCount) / static_cast<double>(charCount);
+	double beAsciiRatio = static_cast<double>(beAsciiCount) / static_cast<double>(charCount);
+	double leAlphaRatio = static_cast<double>(leAlphaNumCount) / static_cast<double>(charCount);
+	double beAlphaRatio = static_cast<double>(beAlphaNumCount) / static_cast<double>(charCount);
+	
+	bool leValid = (leAsciiRatio >= 0.80 && leAlphaRatio >= 0.50 && maxLeConsecutive >= 3);
+	bool beValid = (beAsciiRatio >= 0.80 && beAlphaRatio >= 0.50 && maxBeConsecutive >= 3);
+	
+	if (leValid && leAsciiRatio >= beAsciiRatio)
+	{
+		isLittleEndian = true;
+		return true;
+	}
+	if (beValid)
+	{
+		isLittleEndian = false;
+		return true;
+	}
+	
+	return false;
+}
+
+// Validate proper null termination based on encoding
+bool StringDetector::validateNullTermination(const uint8_t* data, size_t len, StringEncoding encoding) const
+{
+	switch (encoding)
+	{
+	case StringEncoding::ASCII:
+	case StringEncoding::UTF8:
+		// Single null byte
+		return len > 0 && data[len] == 0x00;
+		
+	case StringEncoding::UTF16_LE:
+	case StringEncoding::UTF16_BE:
+		// Two null bytes
+		return len >= 2 && data[len] == 0x00 && data[len + 1] == 0x00;
+		
+	case StringEncoding::UTF32_LE:
+		// Four null bytes
+		return len >= 4 && data[len] == 0x00 && data[len + 1] == 0x00 &&
+			   data[len + 2] == 0x00 && data[len + 3] == 0x00;
+		
+	default:
+		return data[len] == 0x00;
+	}
+}
+
+// Check for word-like alphanumeric sequences in raw data
+bool StringDetector::hasWordLikeSequenceRaw(const uint8_t* data, size_t len, StringEncoding encoding, size_t minWordLen) const
+{
+	size_t consecutiveAlphaNum = 0;
+	
+	switch (encoding)
+	{
+	case StringEncoding::UTF16_LE:
+		for (size_t i = 0; i + 1 < len; i += 2)
+		{
+			uint16_t wc = data[i] | (data[i + 1] << 8);
+			if (wc == 0)
+				break;
+			
+			if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+			{
+				consecutiveAlphaNum++;
+				if (consecutiveAlphaNum >= minWordLen)
+					return true;
+			}
+			else
+			{
+				consecutiveAlphaNum = 0;
+			}
+		}
+		break;
+		
+	case StringEncoding::UTF16_BE:
+		for (size_t i = 0; i + 1 < len; i += 2)
+		{
+			uint16_t wc = (data[i] << 8) | data[i + 1];
+			if (wc == 0)
+				break;
+			
+			if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+			{
+				consecutiveAlphaNum++;
+				if (consecutiveAlphaNum >= minWordLen)
+					return true;
+			}
+			else
+			{
+				consecutiveAlphaNum = 0;
+			}
+		}
+		break;
+		
+	case StringEncoding::UTF32_LE:
+		for (size_t i = 0; i + 3 < len; i += 4)
+		{
+			uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+			if (wc == 0)
+				break;
+			
+			if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+			{
+				consecutiveAlphaNum++;
+				if (consecutiveAlphaNum >= minWordLen)
+					return true;
+			}
+			else
+			{
+				consecutiveAlphaNum = 0;
+			}
+		}
+		break;
+		
+	default:  // ASCII, UTF8
+		for (size_t i = 0; i < len; i++)
+		{
+			uint8_t c = data[i];
+			if (c == 0)
+				break;
+			
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+			{
+				consecutiveAlphaNum++;
+				if (consecutiveAlphaNum >= minWordLen)
+					return true;
+			}
+			else
+			{
+				consecutiveAlphaNum = 0;
+			}
+		}
+		break;
+	}
+	
+	return false;
+}
+
+// Scan for pointers to detected strings and create char* data variables
+void StringDetector::scanForStringPointers(const std::vector<DetectedString>& strings,
+	const StringDetectionSettings& settings)
+{
+	if (!settings.scanStringPointers || strings.empty())
+		return;
+	
+	// Build set of string addresses for fast lookup
+	std::set<uint64_t> stringAddresses;
+	for (const auto& str : strings)
+		stringAddresses.insert(str.address);
+	
+	// Merge with existing BN strings
+	for (const auto& existing : m_view->GetStrings())
+		stringAddresses.insert(existing.start);
+	
+	uint64_t startAddr = m_view->GetStart();
+	uint64_t endAddr = m_view->GetEnd();
+	
+	// Scan for 4-byte aligned pointers that reference strings
+	for (uint64_t addr = startAddr; addr + 4 <= endAddr; addr += 4)
+	{
+		DataBuffer entryBuffer = m_view->ReadBuffer(addr, 4);
+		if (entryBuffer.GetLength() < 4)
+			continue;
+		
+		const uint8_t* entryData = static_cast<const uint8_t*>(entryBuffer.GetData());
+		uint64_t pointedAddr = entryData[0] | (entryData[1] << 8) | (entryData[2] << 16) | (entryData[3] << 24);
+		
+		// Check if this points to a known string
+		if (stringAddresses.count(pointedAddr) == 0)
+			continue;
+		
+		// Check if already has a data variable
+		DataVariable existingVar;
+		if (m_view->GetDataVariableAtAddress(addr, existingVar))
+			continue;
+		
+		// Create char* pointer type
+		if (settings.typeStringPointers)
+		{
+			Ref<Type> stringPtrType = Type::PointerType(4, Type::IntegerType(1, true));  // char*
+			m_view->DefineUserDataVariable(addr, stringPtrType);
+			m_stats.stringPointers++;
+		}
+	}
+}
+
 void StringDetector::scanRegion(uint64_t start, uint64_t end, bool isCode,
 	const StringDetectionSettings& settings, std::vector<DetectedString>& results)
 {
@@ -483,7 +921,7 @@ void StringDetector::scanRegion(uint64_t start, uint64_t end, bool isCode,
 	// Sort function ranges for efficient lookup
 	std::sort(funcRanges.begin(), funcRanges.end());
 	
-	// Scan for ASCII/UTF-8 strings
+	// Scan for ASCII/UTF-8 strings with enhanced validation
 	if (settings.detectAscii || settings.detectUtf8)
 	{
 		size_t i = 0;
@@ -505,82 +943,146 @@ void StringDetector::scanRegion(uint64_t start, uint64_t end, bool isCode,
 				continue;
 			}
 			
-			// Look for string start - must be a letter or common start char
-			uint8_t c = data[i];
-			if (!isPrintableAscii(c) || (c < 'A' && c != ' ' && c != '"' && c != '/' && c != '.' && c != '\\' && c != '[' && c != '(' && c != '%'))
+			// Skip null bytes
+			if (data[i] == 0x00)
 			{
 				i++;
 				continue;
 			}
 			
-			// Find string end
-			size_t strStart = i;
-			size_t printable = 0;
-			size_t alphaNum = 0;
-			while (i < dataLen && data[i] != 0)
+			// Look for valid string start character
+			uint8_t firstByte = data[i];
+			bool validStart = (firstByte >= 0x20 && firstByte <= 0x7E) ||  // Printable ASCII
+				(settings.detectAnsiEscapes && firstByte == 0x1B) ||       // ESC for ANSI sequences
+				(firstByte == 0x0A) || (firstByte == 0x0D);                // LF, CR
+			
+			if (!validStart)
 			{
-				if (isPrintableAscii(data[i]))
-					printable++;
-				if ((data[i] >= 'A' && data[i] <= 'Z') || (data[i] >= 'a' && data[i] <= 'z') || (data[i] >= '0' && data[i] <= '9'))
-					alphaNum++;
 				i++;
-				
-				if (i - strStart > settings.maxLength)
-					break;
+				continue;
 			}
 			
+			// Find string end (null terminator)
+			size_t strStart = i;
+			while (i < dataLen && data[i] != 0x00)
+				i++;
+			
+			if (i >= dataLen)
+				break;  // No null terminator found
+			
 			size_t strLen = i - strStart;
-			bool nullTerm = (i < dataLen && data[i] == 0);
+			i++;  // Skip the null terminator
 			
-			// Require decent alphanumeric ratio to filter out garbage
-			double alphaRatio = strLen > 0 ? static_cast<double>(alphaNum) / strLen : 0;
+			// Validate string length
+			if (strLen < settings.minLength || strLen > settings.maxLength)
+				continue;
 			
-			if (strLen >= settings.minLength && 
-				static_cast<double>(printable) / strLen >= settings.minPrintableRatio &&
-				alphaRatio >= settings.minAlphanumericRatio)
+			// Count printable and alphanumeric characters
+			size_t printableCount = 0;
+			size_t alphaNumCount = 0;
+			bool hasConsecutiveNonPrint = false;
+			size_t consecutiveNonPrint = 0;
+			
+			for (size_t j = 0; j < strLen; ++j)
 			{
-				if (!settings.requireNullTerminator || nullTerm)
+				uint8_t c = data[strStart + j];
+				bool isPrint = (c >= 0x20 && c <= 0x7E);
+				
+				if (isPrint)
 				{
-					std::vector<uint8_t> strData(data + strStart, data + strStart + strLen);
-					std::string strContent = decodeString(strData, StringEncoding::ASCII);
-					
-					// Additional gibberish filtering
-					if (isLikelyGibberish(strContent, settings))
-					{
-						// Skip gibberish strings
-						if (nullTerm) i++;
-						continue;
-					}
-					
-					DetectedString ds;
-					ds.address = start + strStart;
-					ds.length = strLen;
-					ds.content = strContent;
-					ds.encoding = StringEncoding::ASCII;
-					ds.isNullTerminated = nullTerm;
-					ds.isInCode = isCode;
-					ds.hasXrefs = m_referencedAddresses.count(ds.address) > 0;
-					
-					// Get xrefs
-					auto refs = m_view->GetCodeReferences(ds.address);
-					for (const auto& ref : refs)
-						ds.xrefAddresses.push_back(ref.addr);
-					
-					// Categorize
-					ds.category = categorizeString(ds.content, ds.categoryReason);
-					ds.confidence = calculateConfidence(ds, settings);
-					
-					if (ds.confidence >= settings.minConfidence)
-					{
-						if (!settings.findUnreferenced || !ds.hasXrefs || settings.findUnreferenced)
-						{
-							results.push_back(ds);
-						}
-					}
+					printableCount++;
+					consecutiveNonPrint = 0;
+				}
+				else
+				{
+					consecutiveNonPrint++;
+					if (settings.rejectConsecutiveNonPrintable && 
+						consecutiveNonPrint > settings.maxConsecutiveNonPrintable)
+						hasConsecutiveNonPrint = true;
+				}
+				
+				if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+					alphaNumCount++;
+			}
+			
+			double printableRatio = static_cast<double>(printableCount) / strLen;
+			double alphaNumRatio = static_cast<double>(alphaNumCount) / strLen;
+			
+			// Check for ANSI escape sequence (special case with relaxed requirements)
+			bool isAnsiSeq = settings.detectAnsiEscapes && isAnsiEscapeSequence(data + strStart, strLen);
+			
+			// Apply validation criteria
+			bool passesValidation = false;
+			if (isAnsiSeq && printableRatio >= 0.6)
+			{
+				passesValidation = true;
+				m_stats.ansiSequences++;
+			}
+			else if (printableRatio >= settings.minPrintableRatio && 
+					 alphaNumRatio >= settings.minAlphanumericRatio && 
+					 !hasConsecutiveNonPrint)
+			{
+				passesValidation = true;
+			}
+			
+			if (!passesValidation)
+			{
+				if (hasConsecutiveNonPrint)
+					m_stats.rejectedConsecutive++;
+				continue;
+			}
+			
+			// Require word-like sequence (2+ consecutive alphanumeric)
+			if (!hasWordLikeSequenceRaw(data + strStart, strLen, StringEncoding::ASCII, 2))
+			{
+				m_stats.rejectedNoWord++;
+				continue;
+			}
+			
+			// Check for UTF-16 pattern (alternating printable/null)
+			bool isUtf16 = false;
+			bool isLE = true;
+			if (settings.detectUtf16Patterns && strLen >= 4 && (strLen % 2) == 0)
+			{
+				if (looksLikeUtf16Pattern(data + strStart, strLen, isLE))
+				{
+					isUtf16 = true;
+					m_stats.utf16Patterns++;
 				}
 			}
 			
-			if (nullTerm) i++;  // Skip null terminator
+			std::vector<uint8_t> strData(data + strStart, data + strStart + strLen);
+			std::string strContent = decodeString(strData, isUtf16 ? 
+				(isLE ? StringEncoding::UTF16_LE : StringEncoding::UTF16_BE) : StringEncoding::ASCII);
+			
+			// Additional gibberish filtering
+			if (!isAnsiSeq && isLikelyGibberish(strContent, settings))
+				continue;
+			
+			DetectedString ds;
+			ds.address = start + strStart;
+			ds.length = strLen;
+			ds.content = strContent;
+			ds.encoding = isUtf16 ? (isLE ? StringEncoding::UTF16_LE : StringEncoding::UTF16_BE) : StringEncoding::ASCII;
+			ds.isNullTerminated = true;  // We found the null terminator
+			ds.isInCode = isCode;
+			ds.hasXrefs = m_referencedAddresses.count(ds.address) > 0;
+			
+			// Get xrefs
+			auto refs = m_view->GetCodeReferences(ds.address);
+			for (const auto& ref : refs)
+				ds.xrefAddresses.push_back(ref.addr);
+			
+			// Categorize
+			ds.category = categorizeString(ds.content, ds.categoryReason);
+			ds.confidence = calculateConfidence(ds, settings);
+			
+			// ANSI sequences get a confidence boost
+			if (isAnsiSeq)
+				ds.confidence = std::min(1.0, ds.confidence + 0.1);
+			
+			if (ds.confidence >= settings.minConfidence)
+				results.push_back(ds);
 		}
 	}
 	
@@ -612,14 +1114,17 @@ void StringDetector::scanRegion(uint64_t start, uint64_t end, bool isCode,
 			size_t charCount = 0;
 			while (i + 1 < dataLen)
 			{
-			wc = data[i] | (data[i + 1] << 8);
-			if (wc == 0) break;
-			if (wc >= 0x20 && wc <= 0x7E)
-				charCount++;
-			else if (wc >= 0x80)
-				charCount++;  // Extended char
-			else
-				break;  // Invalid
+				wc = data[i] | (data[i + 1] << 8);
+				if (wc == 0) break;
+				// Accept ASCII printable range
+				if (wc >= 0x20 && wc <= 0x7E)
+					charCount++;
+				// Accept Latin-1 Supplement (accented characters)
+				else if (wc >= 0x00A0 && wc <= 0x00FF)
+					charCount++;
+				// Reject everything else (including Private Use Area, high Unicode, etc.)
+				else
+					break;
 				i += 2;
 				
 				if (charCount > settings.maxLength)
@@ -744,6 +1249,12 @@ std::vector<DetectedString> StringDetector::Detect(const StringDetectionSettings
 		}
 	}
 	results = std::move(deduped);
+	
+	// Scan for string pointers and create char* data variables
+	if (settings.scanStringPointers)
+	{
+		scanForStringPointers(results, settings);
+	}
 	
 	// Compute stats
 	m_stats.totalFound = results.size();

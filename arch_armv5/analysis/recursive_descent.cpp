@@ -3,6 +3,7 @@
  */
 
 #include "recursive_descent.h"
+#include "common/armv5_utils.h"
 
 #include <algorithm>
 
@@ -562,12 +563,11 @@ size_t RecursiveDescentAnalyzer::applyToView(double minConfidence)
 		if (m_view->GetAnalysisFunction(platform, funcAddr))
 			continue;
 
-		// HARD BOUNDARY: Don't create functions in known data regions
-		const uint64_t DATA_REGION_START = 0x1127e638;
-		if (funcAddr >= DATA_REGION_START)
+		// Validate the function start (checks for strings, data regions, padding, etc.)
+		if (!armv5::IsValidFunctionStart(m_view, platform, funcAddr, m_logger.GetPtr(), "RecursiveDescent"))
 		{
-			m_logger->LogDebug("RecursiveDescent: Skipping function at 0x%llx - in data region (>= 0x%llx)",
-				(unsigned long long)funcAddr, (unsigned long long)DATA_REGION_START);
+			m_logger->LogDebug("RecursiveDescent: Rejected 0x%llx - failed validation",
+				(unsigned long long)funcAddr);
 			continue;
 		}
 

@@ -3,6 +3,8 @@
  */
 
 #include "function_recognizer.h"
+#include "common/armv5_utils.h"
+#include "firmware/firmware_settings.h"
 
 #include <chrono>
 #include <unordered_map>
@@ -184,6 +186,13 @@ size_t FunctionRecognizer::ApplyResults(const RecognitionResult& results, double
 
 	Ref<Architecture> baseArch = m_view->GetDefaultArchitecture();
 
+	// Get effective code-data boundary using centralized logic
+	FirmwareSettings fwSettings = DefaultFirmwareSettings(FirmwareSettingsMode::Workflow);
+	Ref<Settings> viewSettings = m_view->GetLoadSettings(m_view->GetTypeName());
+	if (viewSettings)
+		fwSettings = LoadFirmwareSettings(viewSettings, m_view.GetPtr(), FirmwareSettingsMode::Workflow);
+	uint64_t codeDataBoundary = GetEffectiveCodeDataBoundary(m_view, fwSettings);
+
 	for (const auto& candidate : results.candidates)
 	{
 		if (candidate.score < minScore)
@@ -200,12 +209,20 @@ size_t FunctionRecognizer::ApplyResults(const RecognitionResult& results, double
 		if (m_view->GetAnalysisFunction(platform, funcAddr))
 			continue;
 
-		// HARD BOUNDARY: Don't create functions in known data regions
-		const uint64_t DATA_REGION_START = 0x1127e638;
-		if (funcAddr >= DATA_REGION_START)
+		// Check code-data boundary using centralized logic
+		if (codeDataBoundary != 0 && funcAddr >= codeDataBoundary)
 		{
 			m_logger->LogDebug("FunctionRecognizer: Skipping function at 0x%llx - in data region (>= 0x%llx)",
-				(unsigned long long)funcAddr, (unsigned long long)DATA_REGION_START);
+				(unsigned long long)funcAddr, (unsigned long long)codeDataBoundary);
+			continue;
+		}
+
+		// Skip if address is inside a detected string
+		BNStringReference strRef;
+		if (m_view->GetStringAtAddress(funcAddr, strRef) && strRef.length > 0)
+		{
+			m_logger->LogDebug("FunctionRecognizer: Skipping function at 0x%llx - inside string at 0x%llx (len=%zu)",
+				(unsigned long long)funcAddr, (unsigned long long)strRef.start, strRef.length);
 			continue;
 		}
 
@@ -222,6 +239,14 @@ size_t FunctionRecognizer::ApplyResults(const RecognitionResult& results, double
 				if (thumbPlat)
 					targetPlat = thumbPlat;
 			}
+		}
+
+		// Validate before creating function (check for strings, padding, etc.)
+		if (!armv5::IsValidFunctionStart(m_view, targetPlat, funcAddr, m_logger.GetPtr(), "FunctionRecognizer"))
+		{
+			m_logger->LogDebug("FunctionRecognizer: Rejected 0x%llx - failed validation",
+				(unsigned long long)funcAddr);
+			continue;
 		}
 
 		// Create the function

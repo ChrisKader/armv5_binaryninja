@@ -914,6 +914,9 @@ size_t ScanForFunctionPrologues(const Ref<BinaryView>& view, const uint8_t* data
 						(unsigned long long)cleanAddr, (unsigned long long)dataBoundary);
 				continue;
 			}
+			// Validate function start (checks for strings, padding, etc.)
+			if (!armv5::IsValidFunctionStart(view, targetPlat, cleanAddr, log, "flushPendingAdds"))
+				continue;
 			if (view->AddFunctionForAnalysis(targetPlat, cleanAddr, true))
 			{
 				if (seededFunctions)
@@ -2526,6 +2529,39 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		{
 			skipNoData++;
 			continue;
+		}
+
+		/*
+		 * Check if function is at a string address or looks like null-terminated ASCII string data.
+		 * This catches functions created by BN's core analysis in string regions.
+		 * Uses the centralized StringDetector logic for consistency.
+		 */
+		{
+			// First check BN's detected strings
+			BNStringReference strRef;
+			if (view->GetStringAtAddress(start, strRef) && strRef.length > 0)
+			{
+				if (verboseLog && logger)
+					logger->LogInfo("Cleanup: removing function at 0x%llx - inside string at 0x%llx (len=%zu)",
+						(unsigned long long)start, (unsigned long long)strRef.start, strRef.length);
+				toRemove.push_back(start);
+				removed++;
+				continue;
+			}
+
+			// Use centralized string detection from StringDetector module
+			// Use permissive settings: minLen=2, minRatio=70% to catch more string patterns
+			constexpr size_t kMaxStringSearch = 256;
+			size_t searchLen = (offset + kMaxStringSearch <= dataLen) ? kMaxStringSearch : (size_t)(dataLen - offset);
+			if (Armv5Analysis::StringDetector::LooksLikeNullTerminatedString(data + offset, searchLen, 2, 0.70))
+			{
+				if (verboseLog && logger)
+					logger->LogInfo("Cleanup: removing function at 0x%llx - looks like null-terminated string",
+						(unsigned long long)start);
+				toRemove.push_back(start);
+				removed++;
+				continue;
+			}
 		}
 
 		uint32_t firstWord = 0;

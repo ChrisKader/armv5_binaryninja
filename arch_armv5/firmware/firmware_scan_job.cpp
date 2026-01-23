@@ -490,19 +490,12 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			{
 				uint64_t addr = userAddrs[j];
 
-				// HARD BOUNDARY: Don't create functions in known data regions
-				uint64_t dataBoundary = fwSettings.codeDataBoundary;
-				if (dataBoundary == 0)
-				{
-					// Auto-detect: skip addresses that are very high in the binary
-					// Use a conservative heuristic - halfway point in the view
-					dataBoundary = view->GetStart() + (view->GetLength() / 2);
-				}
-				if (addr >= dataBoundary)
+				// Check code-data boundary using centralized logic
+				if (IsAddressInDataRegion(view, fwSettings, addr))
 				{
 					if (logger)
-						logger->LogDebug("Plan apply: Skipping user function at 0x%llx - in data region (>= 0x%llx)",
-							(unsigned long long)addr, (unsigned long long)dataBoundary);
+						logger->LogDebug("Plan apply: Skipping user function at 0x%llx - in data region",
+							(unsigned long long)addr);
 					continue;
 				}
 
@@ -574,19 +567,12 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			{
 				uint64_t addr = addrs[j];
 
-				// HARD BOUNDARY: Don't create functions in known data regions
-				uint64_t dataBoundary = fwSettings.codeDataBoundary;
-				if (dataBoundary == 0)
-				{
-					// Auto-detect: skip addresses that are very high in the binary
-					// Use a conservative heuristic - halfway point in the view
-					dataBoundary = view->GetStart() + (view->GetLength() / 2);
-				}
-				if (addr >= dataBoundary)
+				// Check code-data boundary using centralized logic
+				if (IsAddressInDataRegion(view, fwSettings, addr))
 				{
 					if (logger)
-						logger->LogDebug("Plan apply: Skipping analysis function at 0x%llx - in data region (>= 0x%llx)",
-							(unsigned long long)addr, (unsigned long long)dataBoundary);
+						logger->LogDebug("Plan apply: Skipping analysis function at 0x%llx - in data region",
+							(unsigned long long)addr);
 					continue;
 				}
 
@@ -833,10 +819,16 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				logger->LogInfo("Firmware workflow timing: %s took %.3f s", label, seconds);
 		};
 
+		// Build function range cache for fast containment queries
+		FunctionRangeCache functionRangeCache;
+		functionRangeCache.Build(view);
+		if (logger)
+			logger->LogInfo("Firmware scan: built function range cache with %zu ranges", functionRangeCache.Size());
+
 		FirmwareScanContext scanCtx{
 			reader, fileData, fileDataLen, view->GetDefaultEndianness(), imageBase, length,
 			view->GetDefaultArchitecture(), view->GetDefaultPlatform(),
-			logger, fwSettings.enableVerboseLogging, view, &plan
+			logger, fwSettings.enableVerboseLogging, view, &plan, &functionRangeCache
 		};
 		auto refreshViewForPhase = [&]() -> bool {
 			if (!view || !view->GetObject())
@@ -847,6 +839,8 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			scanCtx.arch = view->GetDefaultArchitecture();
 			scanCtx.plat = view->GetDefaultPlatform();
 			scanCtx.endian = view->GetDefaultEndianness();
+			// Rebuild cache if functions changed significantly
+			functionRangeCache.Build(view);
 			return true;
 		};
 
@@ -878,12 +872,25 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		// a single pass with configurable weights. When enabled, it replaces
 		// the legacy prologue/call/pointer/orphan scan functions.
 		//
-		// DARM APPROACH: When using the unified recognizer, we suppress BN's
-		// automatic function creation at call targets. This prevents false
-		// positives where BN creates functions at epilogue stubs (e.g., BX LR).
-		// Our recognizer explicitly validates each candidate before adding it.
+		// =====================================================================
+		// FUNCTION DETECTION PATH SELECTION
+		// =====================================================================
+		// Two paths are available for function detection:
+		// 1. Unified recognizer: Modern approach using FunctionDetector with
+		//    linear sweep, switch resolution, and scoring. Preferred path.
+		// 2. Legacy scans: Traditional approach using separate prologue, call
+		//    target, pointer target, and orphan code scans.
+
 		if (fwSettings.useUnifiedRecognizer)
 		{
+			// -----------------------------------------------------------------
+			// UNIFIED RECOGNIZER PATH
+			// -----------------------------------------------------------------
+			// When using the unified recognizer, we suppress BN's automatic
+			// function creation at call targets. This prevents false positives
+			// where BN creates functions at epilogue stubs (e.g., BX LR).
+			// Our recognizer explicitly validates each candidate before adding it.
+
 			if (!refreshViewForPhase())
 			{
 				finishTask();
@@ -928,9 +935,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					return;
 				}
 
-				// Use lower threshold to match ARMv7's function discovery capability
-				// ARMv7 finds 2813 mostly valid functions, so ARMv5 should be able to find more
-				double minScore = std::min(0.15, fwSettings.recognizerMinScorePct / 100.0);  // 15% minimum
+				// Use the configured minimum score threshold
+				// If user configured a higher threshold, respect it; otherwise use 15% minimum
+				// to ensure reasonable function discovery (too low = false positives)
+				double minScore = std::max(0.15, fwSettings.recognizerMinScorePct / 100.0);
 
 				// Add candidates to the plan
 				auto candidateAddrs = recognizer->GetCandidateAddresses(result, minScore);
@@ -949,123 +957,124 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 						result.lowConfidenceCount);
 				}
 			});
+		}
+		else
+		{
+			// -----------------------------------------------------------------
+			// LEGACY SCAN PATH (prologue, call targets, pointer targets, orphan)
+			// -----------------------------------------------------------------
 
-			// Skip legacy scans when unified recognizer is enabled
-			goto after_legacy_scans;
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enablePrologueScan)
+			{
+				Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
+				timePass("Function prologue scan", [&]() {
+					ScanForFunctionPrologues(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+						imageBase, length, view->GetDefaultArchitecture(), thumbArch, view->GetDefaultPlatform(),
+						logger, fwSettings.enableVerboseLogging, tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
+				});
+			}
+
+			if (ScanCancelled(view))
+			{
+				finishTask();
+				return;
+			}
+
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enableClearAutoDataOnCodeRefs)
+			{
+				timePass("Clear auto data in function entry blocks", [&]() {
+					ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
+				});
+			}
+
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enableCallTargetScan)
+			{
+				timePass("Call target scan", [&]() {
+					ScanForCallTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+						imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
+						tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
+				});
+			}
+
+			if (ScanCancelled(view))
+			{
+				finishTask();
+				return;
+			}
+
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enablePointerTargetScan)
+			{
+				timePass("Pointer target scan", [&]() {
+					ScanForPointerTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+						imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
+						tuning, fwSettings.codeDataBoundary, &addedFunctions, &plan);
+				});
+			}
+
+			if (ScanCancelled(view))
+			{
+				finishTask();
+				return;
+			}
+
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enableOrphanCodeScan)
+			{
+				timePass("Orphan code block scan", [&]() {
+					ScanForOrphanCodeBlocks(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+						imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
+						tuning, fwSettings.codeDataBoundary, fwSettings.orphanMinValidInstr, fwSettings.orphanMinBodyInstr,
+						fwSettings.orphanMinSpacingBytes, fwSettings.orphanMaxPerPage,
+						fwSettings.orphanRequirePrologue, &addedFunctions, &plan);
+				});
+			}
+
+			if (!addedFunctions.empty())
+				seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
+
+			if (!refreshViewForPhase())
+			{
+				finishTask();
+				return;
+			}
+			if (fwSettings.enableClearAutoDataOnCodeRefs && !addedFunctions.empty())
+			{
+				timePass("Clear auto data in new function entry blocks", [&]() {
+					ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
+				});
+			}
 		}
 
 		// =====================================================================
-		// LEGACY SCAN PATH (prologue, call targets, pointer targets, orphan)
+		// COMMON POST-PROCESSING (after function detection)
 		// =====================================================================
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enablePrologueScan)
-		{
-			Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
-			timePass("Function prologue scan", [&]() {
-				ScanForFunctionPrologues(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, view->GetDefaultArchitecture(), thumbArch, view->GetDefaultPlatform(),
-					logger, fwSettings.enableVerboseLogging, tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
-			});
-		}
-
-		if (ScanCancelled(view))
-		{
-			finishTask();
-			return;
-		}
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enableClearAutoDataOnCodeRefs)
-		{
-			timePass("Clear auto data in function entry blocks", [&]() {
-				ClearAutoDataInFunctionEntryBlocks(scanCtx, &seededFunctions);
-			});
-		}
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enableCallTargetScan)
-		{
-			timePass("Call target scan", [&]() {
-				ScanForCallTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, fwSettings.codeDataBoundary, &seededFunctions, &plan);
-			});
-		}
-
-		if (ScanCancelled(view))
-		{
-			finishTask();
-			return;
-		}
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enablePointerTargetScan)
-		{
-			timePass("Pointer target scan", [&]() {
-				ScanForPointerTargets(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, fwSettings.codeDataBoundary, &addedFunctions, &plan);
-			});
-		}
-
-		if (ScanCancelled(view))
-		{
-			finishTask();
-			return;
-		}
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enableOrphanCodeScan)
-		{
-			timePass("Orphan code block scan", [&]() {
-				ScanForOrphanCodeBlocks(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, view->GetDefaultPlatform(), logger, fwSettings.enableVerboseLogging,
-					tuning, fwSettings.codeDataBoundary, fwSettings.orphanMinValidInstr, fwSettings.orphanMinBodyInstr,
-					fwSettings.orphanMinSpacingBytes, fwSettings.orphanMaxPerPage,
-					fwSettings.orphanRequirePrologue, &addedFunctions, &plan);
-			});
-		}
-
-		if (!addedFunctions.empty())
-			seededFunctions.insert(addedFunctions.begin(), addedFunctions.end());
-
-		if (!refreshViewForPhase())
-		{
-			finishTask();
-			return;
-		}
-		if (fwSettings.enableClearAutoDataOnCodeRefs && !addedFunctions.empty())
-		{
-			timePass("Clear auto data in new function entry blocks", [&]() {
-				ClearAutoDataInFunctionEntryBlocks(scanCtx, &addedFunctions);
-			});
-		}
-
-		// Cleanup is now performed after plan application (see below after_legacy_scans)
-		// This allows it to catch functions created by BN's core analysis too
-
-	after_legacy_scans:  // Jump target for unified recognizer path
+		// This section runs for both the unified recognizer and legacy scan paths.
+		// Cleanup is performed after plan application to catch functions created
+		// by BN's core analysis too.
 
 		if (logger)
 		{
@@ -1228,671 +1237,85 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		}
 		*/
 
-		// Ensure string references are properly typed as data variables
-		// Core string analysis creates string references but may not create typed data variables
+		// Enhanced string detection using the StringDetector module
+		// This replaces the inline 700-line string detection code with a clean modular approach
 		if (!ScanCancelled(view))
 		{
-			auto strings = view->GetStrings();
+			UpdateTaskText(task, instanceId, "ARMv5 firmware scans: string detection");
 
-			// Also scan for null-terminated strings that Binary Ninja missed
-			std::vector<BNStringReference> additionalStrings;
-			const size_t scanChunkSize = 1024 * 1024; // 1MB chunks
-			uint64_t startAddr = view->GetStart();
-			uint64_t endAddr = view->GetEnd();
+			// Use the existing StringDetector for advanced string detection
+			// Settings match the original inline code behavior
+			Armv5Analysis::StringDetectionSettings stringSettings;
+			stringSettings.minLength = 2;               // Match original: strLen >= 2
+			stringSettings.maxLength = 256;             // Match original: strLen <= 256
+			stringSettings.minPrintableRatio = 0.80;    // Match original initial scan
+			stringSettings.minAlphanumericRatio = 0.40; // Match original initial scan
+			stringSettings.minWordLength = 2;           // Match original: 2+ consecutive alphanumeric
+			stringSettings.requireNullTerminator = true;
+			stringSettings.rejectConsecutiveNonPrintable = true;  // NEW: reject 2+ consecutive non-printable
+			stringSettings.maxConsecutiveNonPrintable = 1;
+			stringSettings.detectAscii = true;
+			stringSettings.detectUtf8 = true;
+			stringSettings.detectUtf16 = true;
+			stringSettings.detectUtf16Patterns = true;  // NEW: detect alternating printable/null patterns
+			stringSettings.detectAnsiEscapes = true;    // NEW: allow ANSI escape sequences
+			stringSettings.searchDataSections = true;
+			stringSettings.searchCodeSections = true;   // Literal pools
+			stringSettings.skipExisting = true;
+			stringSettings.skipInsideFunctions = true;
+			stringSettings.categorizeStrings = true;
+			stringSettings.minConfidence = 0.5;
+			stringSettings.scanStringPointers = true;   // NEW: scan for pointers to strings
+			stringSettings.typeStringPointers = true;   // NEW: create char* data variables
+			stringSettings.validateNullTermination = true;
+
+			Armv5Analysis::StringDetector detector(view.GetPtr());
+			auto detectedStrings = detector.Detect(stringSettings);
+			const auto& stats = detector.GetStats();
 
 			if (logger)
 			{
-				logger->LogInfo("Scanning address range 0x%llx - 0x%llx for additional strings", startAddr, endAddr);
+				logger->LogInfo("StringDetector: found %zu strings (%zu new, %zu unreferenced)",
+					stats.totalFound, stats.newStrings, stats.unreferenced);
+				if (stats.formatStrings > 0 || stats.interestingStrings > 0)
+					logger->LogInfo("StringDetector: %zu format strings, %zu interesting strings",
+						stats.formatStrings, stats.interestingStrings);
+				if (stats.ansiSequences > 0 || stats.utf16Patterns > 0)
+					logger->LogInfo("StringDetector: %zu ANSI sequences, %zu UTF-16 patterns",
+						stats.ansiSequences, stats.utf16Patterns);
+				if (stats.stringPointers > 0)
+					logger->LogInfo("StringDetector: %zu string pointers typed", stats.stringPointers);
+				if (stats.rejectedConsecutive > 0 || stats.rejectedNoWord > 0)
+					logger->LogDebug("StringDetector: rejected %zu consecutive, %zu no-word",
+						stats.rejectedConsecutive, stats.rejectedNoWord);
 			}
 
-			for (uint64_t addr = startAddr; addr < endAddr; addr += scanChunkSize)
-			{
-				if (ScanCancelled(view))
-					break;
-
-				uint64_t chunkEnd = std::min(addr + scanChunkSize, endAddr);
-				DataBuffer buffer = view->ReadBuffer(addr, chunkEnd - addr);
-				if (buffer.GetLength() == 0)
-					continue;
-
-				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
-				size_t length = buffer.GetLength();
-
-				// Scan for null-terminated ASCII/UTF-8 strings
-				for (size_t i = 0; i < length; )
-				{
-					// Skip null bytes
-					if (data[i] == 0x00)
-					{
-						i++;
-						continue;
-					}
-
-					// Start at printable character or specific allowed non-printable
-					uint8_t firstByte = data[i];
-					bool validStart = (firstByte >= 0x20 && firstByte <= 0x7E) || // Printable ASCII
-					                 (firstByte == 0x1B) || // ESC for ANSI sequences
-					                 (firstByte == 0x0A) || // \n (LF)
-					                 (firstByte == 0x0D);   // \r (CR)
-
-					if (!validStart)
-					{
-						i++;
-						continue;
-					}
-
-					size_t start = i;
-
-					// Find null terminator
-					while (i < length && data[i] != 0x00)
-						i++;
-
-					if (i >= length)
-						break; // No null terminator found
-
-					size_t strLen = i - start;
-					i++; // Skip the null terminator
-
-					// Validate the string
-					if (strLen >= 2 && strLen <= 256) // Reasonable length limits
-					{
-						size_t printableCount = 0;
-						size_t alphaNumCount = 0;
-						bool hasConsecutiveNonPrintable = false;
-						size_t consecutiveNonPrintable = 0;
-
-						for (size_t j = 0; j < strLen; ++j)
-						{
-							uint8_t c = data[start + j];
-							bool isPrintable = (c >= 0x20 && c <= 0x7E);
-
-							// Count printable characters (space to ~)
-							if (isPrintable)
-							{
-								printableCount++;
-								consecutiveNonPrintable = 0; // Reset consecutive counter
-							}
-							else
-							{
-								consecutiveNonPrintable++;
-								if (consecutiveNonPrintable >= 2)
-									hasConsecutiveNonPrintable = true;
-							}
-
-							// Count alphanumeric characters
-							if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-								alphaNumCount++;
-						}
-
-						// Accept strings with good printable and alphanumeric ratios
-						double printableRatio = static_cast<double>(printableCount) / strLen;
-						double alphaNumRatio = static_cast<double>(alphaNumCount) / strLen;
-
-						// Special case: allow ANSI escape sequences (start with ESC, may have some non-printable)
-						bool isAnsiSequence = (strLen >= 3 && data[start] == 0x1B && data[start + 1] == 0x5B);
-
-						// Require high quality: most characters printable, some alphanumeric, no consecutive non-printable
-						if ((printableRatio >= 0.8 && alphaNumRatio >= 0.4 && !hasConsecutiveNonPrintable) ||
-							(isAnsiSequence && printableRatio >= 0.6))
-						{
-							// Check if this string is already detected by Binary Ninja
-							bool alreadyDetected = false;
-							for (const auto& existing : strings)
-							{
-								if (existing.start == addr + start && existing.length == strLen)
-								{
-									alreadyDetected = true;
-									break;
-								}
-							}
-
-							if (!alreadyDetected)
-							{
-						// Check if this looks like UTF-16 or UTF-32
-						bool looksLikeUtf16 = false;
-						bool looksLikeUtf32 = false;
-
-						// Check UTF-16 patterns (decode actual UTF-16 characters)
-						if (strLen >= 4 && (strLen % 2) == 0)
-						{
-							bool isValidUtf16 = true;
-							bool hasNullTerminator = false;
-
-							for (size_t j = 0; j < strLen && isValidUtf16; j += 2)
-							{
-								// Decode UTF-16 character (assuming little-endian byte order)
-								uint16_t wc = data[start + j] | (data[start + j + 1] << 8);
-
-								if (wc == 0)
-								{
-									hasNullTerminator = true;
-									break; // Null terminator found
-								}
-
-								if (wc < 0x20 || wc > 0x7E)
-								{
-									isValidUtf16 = false;
-								}
-							}
-
-							// If we have a valid UTF-16 sequence, check for null termination
-							if (isValidUtf16)
-							{
-								looksLikeUtf16 = true;
-
-								// Check if null terminator exists in the buffer
-								if (!hasNullTerminator && buffer.GetLength() >= strLen + 2)
-								{
-									uint16_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8);
-									if (nullCheck == 0)
-									{
-										hasNullTerminator = true;
-										strLen += 2; // Include null terminator in length
-									}
-								}
-							}
-						}
-
-						// Check UTF-32 patterns (4 bytes per char) - little endian
-						if (!looksLikeUtf16 && strLen >= 8 && (strLen % 4) == 0)
-						{
-							bool isValidUtf32 = true;
-							bool hasNullTerminator = false;
-
-							for (size_t j = 0; j < strLen && isValidUtf32; j += 4)
-							{
-								uint32_t wc = data[start + j] | (data[start + j + 1] << 8) |
-											 (data[start + j + 2] << 16) | (data[start + j + 3] << 24);
-
-								if (wc == 0)
-								{
-									hasNullTerminator = true;
-									break; // Null terminator found
-								}
-
-								// For ASCII characters in UTF-32: should be 0x000000XX where XX is printable
-								if (wc < 0x20 || wc > 0x7E)
-								{
-									isValidUtf32 = false;
-								}
-							}
-
-							// If we have a valid UTF-32 sequence, check for null termination
-							if (isValidUtf32)
-							{
-								looksLikeUtf32 = true;
-
-								// Check if null terminator exists in the buffer
-								if (!hasNullTerminator && buffer.GetLength() >= strLen + 4)
-								{
-									uint32_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8) |
-														(data[start + strLen + 2] << 16) | (data[start + strLen + 3] << 24);
-									if (nullCheck == 0)
-									{
-										hasNullTerminator = true;
-										strLen += 4; // Include null terminator in length
-									}
-								}
-							}
-						}
-
-						// Adjust length for null-terminated strings
-						size_t adjustedLength = strLen;
-						if (looksLikeUtf16)
-						{
-							if (buffer.GetLength() >= strLen + 2)
-							{
-								uint16_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8);
-								if (logger)
-								{
-									logger->LogInfo("UTF-16 null check at 0x%llx: 0x%04x (buffer len %zu, strLen %zu)",
-										addr + start + strLen, nullCheck, buffer.GetLength(), strLen);
-								}
-								if (nullCheck == 0)
-								{
-									adjustedLength += 2; // Include UTF-16 null terminator
-									if (logger)
-									{
-										logger->LogInfo("UTF-16 null terminator found, adjusted length: %zu -> %zu",
-											strLen, adjustedLength);
-									}
-								}
-							}
-							else if (logger)
-							{
-								logger->LogInfo("UTF-16 null check failed: buffer too short (need %zu, have %zu)",
-									strLen + 2, buffer.GetLength());
-							}
-						}
-						else if (looksLikeUtf32)
-						{
-							if (buffer.GetLength() >= strLen + 4)
-							{
-								uint32_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8) |
-													(data[start + strLen + 2] << 16) | (data[start + strLen + 3] << 24);
-								if (nullCheck == 0)
-								{
-									adjustedLength += 4; // Include UTF-32 null terminator
-								}
-							}
-						}
-
-						BNStringReference newStr;
-						newStr.start = addr + start;
-						newStr.length = adjustedLength;
-
-						if (looksLikeUtf32)
-						{
-							newStr.type = Utf32String; // Assuming BN supports this
-							size_t utf32Length = adjustedLength / 4;
-
-							if (logger)
-							{
-								logger->LogInfo("Found additional UTF-32 string at 0x%llx: length=%zu bytes (%zu chars)",
-									newStr.start, newStr.length, utf32Length);
-							}
-						}
-						else if (looksLikeUtf16)
-						{
-							newStr.type = Utf16String;
-							size_t utf16Length = adjustedLength / 2;
-
-							if (logger)
-							{
-								logger->LogInfo("Found additional UTF-16 string at 0x%llx: length=%zu bytes (%zu chars)",
-									newStr.start, newStr.length, utf16Length);
-							}
-						}
-						else
-						{
-							newStr.type = AsciiString;
-
-							if (logger)
-							{
-								logger->LogInfo("Found additional ASCII string at 0x%llx: length=%zu (printable=%.1f%%, alpha=%.1f%%)",
-									newStr.start, newStr.length, printableRatio * 100, alphaNumRatio * 100);
-							}
-						}
-
-						additionalStrings.push_back(newStr);
-							}
-						}
-					}
-				}
-			}
-
-			// Create individual string pointer variables for pointers that point to strings
-			std::set<uint64_t> stringAddresses;
-			for (const auto& str : strings)
-			{
-				stringAddresses.insert(str.start);
-			}
-			for (const auto& str : additionalStrings)
-			{
-				stringAddresses.insert(str.start);
-			}
-
-			// Scan for individual pointers that reference our strings
-			for (uint64_t addr = startAddr; addr < endAddr; addr += 4) // 4-byte aligned
-			{
-				if (ScanCancelled(view))
-					break;
-
-				DataBuffer entryBuffer = view->ReadBuffer(addr, 4);
-				if (entryBuffer.GetLength() < 4)
-					continue;
-
-				const uint8_t* entryData = static_cast<const uint8_t*>(entryBuffer.GetData());
-				uint64_t pointedAddr = entryData[0] | (entryData[1] << 8) | (entryData[2] << 16) | (entryData[3] << 24);
-
-				// Check if this points to a known string
-				if (stringAddresses.find(pointedAddr) != stringAddresses.end())
-				{
-					// This is a pointer to a string - create a char* variable
-					Ref<Type> stringPtrType = Type::PointerType(4, Type::IntegerType(1, true)); // char*
-
-					// Ensure the pointed-to string is properly typed first
-					DataVariable stringVar;
-					if (!view->GetDataVariableAtAddress(pointedAddr, stringVar))
-					{
-						// Find the string in our lists to get its type
-						bool found = false;
-						for (const auto& str : strings)
-						{
-							if (str.start == pointedAddr)
-							{
-								// For proper display in main view, try creating named types that Binary Ninja recognizes
-								Ref<Type> stringType;
-								if (str.type == Utf32String)
-								{
-									Ref<Type> elementType = Type::IntegerType(4, false); // uint32_t
-									size_t arrayLength = str.length / 4; // Include null terminator in array
-									stringType = Type::ArrayType(elementType, arrayLength);
-								}
-								else if (str.type == Utf16String)
-								{
-									// Try using a wide char type for better display
-									Ref<Type> elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
-									size_t arrayLength = str.length / 2; // Include null terminator in array
-									stringType = Type::ArrayType(elementType, arrayLength);
-								}
-								else
-								{
-									Ref<Type> elementType = Type::IntegerType(1, true); // char
-									size_t arrayLength = (str.length + 1 - 1) / 1; // elementSize = 1
-									stringType = Type::ArrayType(elementType, arrayLength);
-								}
-								view->DefineUserDataVariable(pointedAddr, stringType);
-								found = true;
-								break;
-							}
-						}
-						if (!found)
-						{
-							for (const auto& str : additionalStrings)
-							{
-								if (str.start == pointedAddr)
-								{
-									// Create appropriate array type for the string using wide char types for proper display
-									Ref<Type> stringType;
-									if (str.type == Utf32String)
-									{
-										Ref<Type> elementType = Type::WideCharType(4); // UTF-32 wide char
-										size_t arrayLength = str.length / 4; // Include null terminator in array
-										stringType = Type::ArrayType(elementType, arrayLength);
-									}
-									else if (str.type == Utf16String)
-									{
-										Ref<Type> elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
-										size_t arrayLength = str.length / 2; // Include null terminator in array
-										stringType = Type::ArrayType(elementType, arrayLength);
-									}
-									else
-									{
-										Ref<Type> elementType = Type::IntegerType(1, true); // char
-										size_t arrayLength = (str.length + 1 - 1) / 1; // elementSize = 1
-										stringType = Type::ArrayType(elementType, arrayLength);
-									}
-									view->DefineUserDataVariable(pointedAddr, stringType);
-									found = true;
-									break;
-								}
-							}
-						}
-					}
-
-					// Create the pointer variable if not already typed
-					DataVariable existingVar;
-					if (!view->GetDataVariableAtAddress(addr, existingVar))
-					{
-						view->DefineUserDataVariable(addr, stringPtrType);
-
-						if (logger)
-						{
-							logger->LogInfo("Created string pointer at 0x%llx -> 0x%llx", addr, pointedAddr);
-						}
-					}
-				}
-			}
-
-			// Add detected strings to the list
-			strings.insert(strings.end(), additionalStrings.begin(), additionalStrings.end());
-
+			// Type the detected strings as data variables
 			size_t typed = 0;
-			size_t skipped = 0;
-
-			for (const auto& str : strings)
+			for (const auto& str : detectedStrings)
 			{
-				// Additional validation to filter out obviously invalid strings
-				if (str.length < 2)
-				{
-					skipped++;
-					continue; // Too short
-				}
-
-				// Read the actual string data to validate it (including potential null terminators)
-				// Need up to 4 extra bytes for UTF-32 null terminator
-				DataBuffer buffer = view->ReadBuffer(str.start, str.length + 4);
-				if (buffer.GetLength() <= str.length)
-				{
-					skipped++;
-					continue; // Can't read the data
-				}
-
-				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
-				size_t printable = 0;
-				size_t alphaNum = 0;
-				size_t totalChars = 0;
-
-				// Count printable and alphanumeric characters
-				for (size_t i = 0; i < str.length; )
-				{
-					uint8_t c = data[i];
-
-					// Handle different encodings
-					if (str.type == Utf16String && i + 1 < str.length)
-					{
-						// UTF-16: check if it's a valid character (skip null bytes)
-						uint16_t wc = data[i] | (data[i + 1] << 8);
-						if (wc == 0) break; // Null terminator
-
-						// Count as printable if it's a reasonable Unicode character
-						if (wc >= 0x20 && wc < 0x7F)
-						{
-							printable++;
-							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
-								(wc >= '0' && wc <= '9'))
-							{
-								alphaNum++;
-							}
-						}
-						else if (wc >= 0x80 && wc <= 0xFFFD) // Extended Unicode range
-						{
-							printable++; // Accept extended characters
-						}
-						totalChars++;
-						i += 2;
-					}
-					else if (str.type == Utf32String && i + 3 < str.length)
-					{
-						// UTF-32: similar logic
-						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
-						if (wc == 0) break;
-
-						if ((wc >= 0x20 && wc <= 0x7F) || (wc >= 0x80 && wc <= 0x10FFFF))
-						{
-							printable++;
-							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
-								(wc >= '0' && wc <= '9'))
-							{
-								alphaNum++;
-							}
-						}
-						totalChars++;
-						i += 4;
-					}
-					else
-					{
-						// ASCII/UTF-8
-						if (c == 0) break; // Null terminator
-						if (c >= 0x20 && c <= 0x7E)
-						{
-							printable++;
-							if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-								(c >= '0' && c <= '9'))
-							{
-								alphaNum++;
-							}
-						}
-						else if (c >= 0x80 && str.type == Utf8String)
-						{
-							printable++; // Accept UTF-8 multi-byte sequences
-						}
-						totalChars++;
-						i++;
-					}
-				}
-
-				if (totalChars == 0)
-				{
-					skipped++;
-					continue; // No valid characters
-				}
-
-				// Require at least 50% printable characters and 20% alphanumeric
-				double printableRatio = static_cast<double>(printable) / totalChars;
-				double alphaNumRatio = static_cast<double>(alphaNum) / totalChars;
-
-				if (printableRatio < 0.5 || alphaNumRatio < 0.2)
-				{
-					skipped++;
-					continue; // Not enough valid characters
-				}
-
-				// Require at least one alphanumeric sequence of 2+ characters
-				bool hasWord = false;
-				int consecutiveAlphaNum = 0;
-				for (size_t i = 0; i < str.length && !hasWord; )
-				{
-					uint8_t c = data[i];
-					if (str.type == Utf16String && i + 1 < str.length)
-					{
-						uint16_t wc = data[i] | (data[i + 1] << 8);
-						if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
-							(wc >= '0' && wc <= '9'))
-						{
-							consecutiveAlphaNum++;
-							if (consecutiveAlphaNum >= 2) hasWord = true;
-						}
-						else
-						{
-							consecutiveAlphaNum = 0;
-						}
-						i += 2;
-					}
-					else if (str.type == Utf32String && i + 3 < str.length)
-					{
-						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
-						if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') ||
-							(wc >= '0' && wc <= '9'))
-						{
-							consecutiveAlphaNum++;
-							if (consecutiveAlphaNum >= 2) hasWord = true;
-						}
-						else
-						{
-							consecutiveAlphaNum = 0;
-						}
-						i += 4;
-					}
-					else
-					{
-						if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-							(c >= '0' && c <= '9'))
-						{
-							consecutiveAlphaNum++;
-							if (consecutiveAlphaNum >= 2) hasWord = true;
-						}
-						else
-						{
-							consecutiveAlphaNum = 0;
-						}
-						i++;
-					}
-				}
-
-				if (!hasWord)
-				{
-					skipped++;
-					continue; // No word-like sequences
-				}
-
-				// Determine element size for null termination check
-				size_t elementSize = 1;
-				switch (str.type)
-				{
-				case AsciiString:
-				case Utf8String:
-					elementSize = 1;
+				if (ScanCancelled(view))
 					break;
-				case Utf16String:
+
+				// Create appropriate type based on encoding
+				Ref<Type> elementType;
+				size_t elementSize = 1;
+
+				switch (str.encoding)
+				{
+				case Armv5Analysis::StringEncoding::UTF16_LE:
+				case Armv5Analysis::StringEncoding::UTF16_BE:
+					elementType = Type::WideCharType(2);
 					elementSize = 2;
 					break;
-				case Utf32String:
+				case Armv5Analysis::StringEncoding::UTF32_LE:
+				case Armv5Analysis::StringEncoding::Wide:
+					elementType = Type::WideCharType(4);
 					elementSize = 4;
 					break;
-				default:
+				default:  // ASCII, UTF8
+					elementType = Type::IntegerType(1, true);  // char
 					elementSize = 1;
-					break;
-				}
-
-				// All strings that pass our validation must be null terminated
-				// If we're checking for printable characters, we expect proper string formatting
-
-				// Check for proper null termination (look 1 byte past the detected string length)
-				bool isNullTerminated = false;
-				size_t nullTerminatorSize = 1;
-				switch (str.type)
-				{
-				case AsciiString:
-				case Utf8String:
-					nullTerminatorSize = 1;
-					break;
-				case Utf16String:
-					nullTerminatorSize = 2;
-					break;
-				case Utf32String:
-					nullTerminatorSize = 4;
-					break;
-				default:
-					nullTerminatorSize = 1;
-					break;
-				}
-
-				if (buffer.GetLength() >= str.length + nullTerminatorSize)
-				{
-					switch (str.type)
-					{
-					case AsciiString:
-					case Utf8String:
-						isNullTerminated = (data[str.length] == 0x00);
-						break;
-					case Utf16String:
-						isNullTerminated = (data[str.length] == 0x00 && data[str.length + 1] == 0x00);
-						break;
-					case Utf32String:
-						isNullTerminated = (data[str.length] == 0x00 && data[str.length + 1] == 0x00 &&
-										   data[str.length + 2] == 0x00 && data[str.length + 3] == 0x00);
-						break;
-					default:
-						isNullTerminated = (data[str.length] == 0x00);
-						break;
-					}
-				}
-
-				if (!isNullTerminated)
-				{
-					skipped++;
-					continue; // Not properly null-terminated
-				}
-
-				// String passed validation - now type it
-				// Create a string array type with the correct encoding
-				Ref<Type> elementType;
-				switch (str.type)
-				{
-				case AsciiString:
-				case Utf8String:
-					elementType = Type::IntegerType(1, true);  // char (signed 8-bit)
-					break;
-				case Utf16String:
-					elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
-					break;
-				case Utf32String:
-					elementType = Type::WideCharType(4); // UTF-32 wide char
-					break;
-				default:
-					elementType = Type::IntegerType(1, true);  // Default to char
 					break;
 				}
 
@@ -1900,20 +1323,222 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				size_t arrayLength = (str.length + elementSize - 1) / elementSize + 1;
 				Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
 
-				// Use DefineUserDataVariable to ensure our string typing takes precedence
-				// This will override any existing auto-detected types
-				view->DefineUserDataVariable(str.start, stringType);
+				// Define the string as a user data variable
+				view->DefineUserDataVariable(str.address, stringType);
 				typed++;
 			}
 
-			if (logger)
+			if (logger && typed > 0)
+				logger->LogInfo("StringDetector: typed %zu string data variables", typed);
+
+			// Also validate and type BN's existing strings (like the original code did)
+			// This ensures consistent typing across all detected strings
+			auto bnStrings = view->GetStrings();
+			size_t bnTyped = 0;
+			size_t bnSkipped = 0;
+
+			for (const auto& str : bnStrings)
 			{
-				logger->LogInfo("String validation: %zu total strings detected", strings.size());
-				if (typed > 0)
-					logger->LogInfo("Typed %zu string data variables", typed);
-				if (skipped > 0)
-					logger->LogInfo("Skipped %zu invalid string candidates", skipped);
+				if (ScanCancelled(view))
+					break;
+
+				// Skip very short strings
+				if (str.length < 2)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				// Read string data for validation (need extra bytes for null terminator check)
+				size_t extraBytes = 4;  // Max for UTF-32 null terminator
+				DataBuffer buffer = view->ReadBuffer(str.start, str.length + extraBytes);
+				if (buffer.GetLength() <= str.length)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
+
+				// Verify null termination based on encoding
+				bool isNullTerminated = false;
+				size_t elementSize = 1;
+
+				if (str.type == Utf16String)
+				{
+					elementSize = 2;
+					// Check for UTF-16 null terminator (two zero bytes)
+					if (str.length >= 2 && buffer.GetLength() >= str.length + 2)
+					{
+						size_t nullPos = str.length;
+						isNullTerminated = (data[nullPos] == 0x00 && data[nullPos + 1] == 0x00);
+					}
+				}
+				else if (str.type == Utf32String)
+				{
+					elementSize = 4;
+					// Check for UTF-32 null terminator (four zero bytes)
+					if (str.length >= 4 && buffer.GetLength() >= str.length + 4)
+					{
+						size_t nullPos = str.length;
+						isNullTerminated = (data[nullPos] == 0x00 && data[nullPos + 1] == 0x00 &&
+						                   data[nullPos + 2] == 0x00 && data[nullPos + 3] == 0x00);
+					}
+				}
+				else
+				{
+					// ASCII/UTF-8 - single null byte
+					if (buffer.GetLength() > str.length)
+						isNullTerminated = (data[str.length] == 0x00);
+				}
+
+				// Skip strings that are not properly null-terminated
+				if (!isNullTerminated)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				// Count printable and alphanumeric characters based on encoding
+				// Be strict about what counts as "printable" to avoid garbage
+				size_t printable = 0;
+				size_t alphaNum = 0;
+				size_t totalChars = 0;
+
+				if (str.type == Utf16String)
+				{
+					for (size_t i = 0; i + 1 < str.length; i += 2)
+					{
+						uint16_t wc = data[i] | (data[i + 1] << 8);
+						if (wc == 0) break;
+						totalChars++;
+						// Only count ASCII range and Latin-1 Supplement as printable
+						if (wc >= 0x20 && wc <= 0x7E)
+						{
+							printable++;
+							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+								alphaNum++;
+						}
+						else if (wc >= 0x00A0 && wc <= 0x00FF)
+						{
+							printable++;  // Latin-1 Supplement (accented chars)
+						}
+						// Reject Private Use Area (0xE000-0xF8FF) and other suspicious ranges
+					}
+				}
+				else if (str.type == Utf32String)
+				{
+					for (size_t i = 0; i + 3 < str.length; i += 4)
+					{
+						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+						if (wc == 0) break;
+						totalChars++;
+						// Only count ASCII range and Latin-1 Supplement as printable
+						if (wc >= 0x20 && wc <= 0x7E)
+						{
+							printable++;
+							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+								alphaNum++;
+						}
+						else if (wc >= 0x00A0 && wc <= 0x00FF)
+						{
+							printable++;  // Latin-1 Supplement
+						}
+					}
+				}
+				else
+				{
+					// ASCII/UTF-8
+					for (size_t i = 0; i < str.length; i++)
+					{
+						uint8_t c = data[i];
+						if (c == 0) break;
+						totalChars++;
+						if (c >= 0x20 && c <= 0x7E)
+						{
+							printable++;
+							if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+								alphaNum++;
+						}
+						// For UTF-8, only count valid continuation bytes
+						else if (c >= 0xC0 && c <= 0xFE && str.type == Utf8String)
+						{
+							printable++;  // UTF-8 multi-byte lead byte
+						}
+					}
+				}
+
+				if (totalChars == 0)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				// Lower thresholds for final validation (50%/20%) like original
+				double printableRatio = static_cast<double>(printable) / totalChars;
+				double alphaNumRatio = static_cast<double>(alphaNum) / totalChars;
+
+				if (printableRatio < 0.5 || alphaNumRatio < 0.2)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				// Check for word-like sequence (2+ consecutive alphanumeric)
+				bool hasWord = false;
+				size_t consecutiveAlphaNum = 0;
+				for (size_t i = 0; i < str.length && !hasWord; i += elementSize)
+				{
+					uint32_t wc = 0;
+					if (str.type == Utf16String && i + 1 < str.length)
+						wc = data[i] | (data[i + 1] << 8);
+					else if (str.type == Utf32String && i + 3 < str.length)
+						wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
+					else
+						wc = data[i];
+
+					if (wc == 0) break;
+					if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
+					{
+						consecutiveAlphaNum++;
+						if (consecutiveAlphaNum >= 2) hasWord = true;
+					}
+					else
+					{
+						consecutiveAlphaNum = 0;
+					}
+				}
+
+				if (!hasWord)
+				{
+					bnSkipped++;
+					continue;
+				}
+
+				// Create typed data variable with appropriate element type
+				Ref<Type> elementType;
+				switch (str.type)
+				{
+				case Utf16String:
+					elementType = Type::WideCharType(2);
+					break;
+				case Utf32String:
+					elementType = Type::WideCharType(4);
+					break;
+				default:  // ASCII, UTF-8
+					elementType = Type::IntegerType(1, true);  // char
+					break;
+				}
+
+				size_t arrayLength = (str.length + elementSize - 1) / elementSize + 1;
+				Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
+
+				view->DefineUserDataVariable(str.start, stringType);
+				bnTyped++;
 			}
+
+			if (logger && (bnTyped > 0 || bnSkipped > 0))
+				logger->LogInfo("BN string validation: typed %zu, skipped %zu invalid", bnTyped, bnSkipped);
 		}
 
 		if (logger)

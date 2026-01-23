@@ -217,6 +217,13 @@ if(BUILD_UI_PLUGIN)
                 ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.cpp
                 ${ARCH_ARMV5_DIR}/analysis/entropy_analyzer.h
                 ${ARCH_ARMV5_DIR}/analysis/prologue_patterns.cpp
+                # Firmware settings needed by function_recognizer for code-data boundary
+                ${ARCH_ARMV5_DIR}/firmware/firmware_settings.cpp
+                ${ARCH_ARMV5_DIR}/firmware/firmware_settings.h
+                ${ARCH_ARMV5_DIR}/settings/plugin_settings.cpp
+                ${ARCH_ARMV5_DIR}/settings/plugin_settings.h
+                ${ARCH_ARMV5_DIR}/settings/env_config.cpp
+                ${ARCH_ARMV5_DIR}/settings/env_config.h
                 ${ARCH_ARMV5_DIR}/analysis/prologue_patterns.h
                 ${ARCH_ARMV5_DIR}/analysis/recursive_descent.cpp
                 ${ARCH_ARMV5_DIR}/analysis/recursive_descent.h
