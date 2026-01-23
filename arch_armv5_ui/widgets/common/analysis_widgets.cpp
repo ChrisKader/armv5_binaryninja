@@ -3,6 +3,7 @@
  */
 
 #include "analysis_widgets.h"
+#include "armv5_theme.h"
 #include "viewframe.h"
 
 #include <QtWidgets/QStyle>
@@ -11,6 +12,7 @@
 #include <QtWidgets/QScrollArea>
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QGridLayout>
+#include <QtWidgets/QSplitter>
 #include <QtGui/QTextCursor>
 
 using namespace BinaryNinja;
@@ -673,12 +675,29 @@ void AnalysisStatusBar::setupUI()
 	m_statusLabel = new QLabel("Ready", this);
 	layout->addWidget(m_statusLabel);
 
+	// Phase indicator (e.g., "2/8")
+	m_phaseLabel = new QLabel(this);
+	m_phaseLabel->setStyleSheet("QLabel { color: #888888; font-size: 10px; }");
+	m_phaseLabel->hide();
+	layout->addWidget(m_phaseLabel);
+
 	m_progress = new QProgressBar(this);
 	m_progress->setMaximumWidth(120);
 	m_progress->setMaximumHeight(14);
 	m_progress->setTextVisible(false);
 	m_progress->hide();
 	layout->addWidget(m_progress);
+
+	// Cancel button
+	m_cancelButton = new QToolButton(this);
+	m_cancelButton->setIcon(QIcon::fromTheme("process-stop",
+		style()->standardIcon(QStyle::SP_BrowserStop)));
+	m_cancelButton->setToolTip("Cancel analysis");
+	m_cancelButton->setAutoRaise(true);
+	m_cancelButton->setIconSize(QSize(12, 12));
+	m_cancelButton->hide();
+	connect(m_cancelButton, &QToolButton::clicked, this, &AnalysisStatusBar::cancelClicked);
+	layout->addWidget(m_cancelButton);
 
 	layout->addStretch();
 
@@ -702,6 +721,35 @@ void AnalysisStatusBar::setProgress(int percent)
 	{
 		m_progress->setValue(percent);
 		m_progress->show();
+	}
+}
+
+void AnalysisStatusBar::setPhase(int current, int total, const QString& phaseName)
+{
+	if (current > 0 && total > 0)
+	{
+		m_phaseLabel->setText(QString("%1/%2: %3").arg(current).arg(total).arg(phaseName));
+		m_phaseLabel->show();
+	}
+	else
+	{
+		m_phaseLabel->hide();
+	}
+}
+
+void AnalysisStatusBar::setCancelVisible(bool visible)
+{
+	m_cancelButton->setVisible(visible);
+}
+
+void AnalysisStatusBar::setRunning(bool running)
+{
+	m_running = running;
+	m_cancelButton->setVisible(running);
+	if (!running)
+	{
+		m_phaseLabel->hide();
+		m_progress->hide();
 	}
 }
 
@@ -1495,6 +1543,280 @@ void DetectorSettingsWidget::onSettingChanged()
 }
 
 // ============================================================================
+// HighlightingItemDelegate - Highlight search matches in tree cells
+// ============================================================================
+
+HighlightingItemDelegate::HighlightingItemDelegate(QObject* parent)
+	: QStyledItemDelegate(parent)
+	, m_highlightColor(getThemeColor(YellowStandardHighlightColor))
+{
+}
+
+void HighlightingItemDelegate::setSearchTerm(const QString& term)
+{
+	m_searchTerm = term;
+}
+
+void HighlightingItemDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option,
+	const QModelIndex& index) const
+{
+	// If no search term or column 0 (checkbox), use default painting
+	if (m_searchTerm.isEmpty() || index.column() == 0)
+	{
+		QStyledItemDelegate::paint(painter, option, index);
+		return;
+	}
+
+	QString text = index.data(Qt::DisplayRole).toString();
+	int matchIndex = text.indexOf(m_searchTerm, 0, Qt::CaseInsensitive);
+
+	if (matchIndex < 0)
+	{
+		QStyledItemDelegate::paint(painter, option, index);
+		return;
+	}
+
+	// Draw background
+	QStyleOptionViewItem opt = option;
+	initStyleOption(&opt, index);
+
+	painter->save();
+
+	// Draw selection/hover background
+	if (opt.state & QStyle::State_Selected)
+		painter->fillRect(opt.rect, opt.palette.highlight());
+	else if (opt.state & QStyle::State_MouseOver)
+		painter->fillRect(opt.rect, opt.palette.alternateBase());
+
+	// Draw text with highlighting
+	QRect textRect = opt.rect.adjusted(4, 0, -4, 0);
+	QFontMetrics fm(opt.font);
+
+	QString before = text.left(matchIndex);
+	QString match = text.mid(matchIndex, m_searchTerm.length());
+	QString after = text.mid(matchIndex + m_searchTerm.length());
+
+	int xPos = textRect.left();
+
+	// Draw before match
+	if (!before.isEmpty())
+	{
+		painter->setPen(opt.palette.text().color());
+		painter->drawText(xPos, textRect.top(), fm.horizontalAdvance(before), textRect.height(),
+			Qt::AlignVCenter, before);
+		xPos += fm.horizontalAdvance(before);
+	}
+
+	// Draw match with highlight
+	if (!match.isEmpty())
+	{
+		int matchWidth = fm.horizontalAdvance(match);
+		painter->fillRect(xPos, textRect.top() + 2, matchWidth, textRect.height() - 4,
+			m_highlightColor);
+		painter->setPen(Qt::black);
+		painter->drawText(xPos, textRect.top(), matchWidth, textRect.height(),
+			Qt::AlignVCenter, match);
+		xPos += matchWidth;
+	}
+
+	// Draw after match
+	if (!after.isEmpty())
+	{
+		painter->setPen(opt.palette.text().color());
+		painter->drawText(xPos, textRect.top(), textRect.right() - xPos, textRect.height(),
+			Qt::AlignVCenter, after);
+	}
+
+	painter->restore();
+}
+
+// ============================================================================
+// ColumnSettings - Persist column widths and sort order
+// ============================================================================
+
+ColumnSettings& ColumnSettings::instance()
+{
+	static ColumnSettings inst;
+	return inst;
+}
+
+void ColumnSettings::saveColumnWidths(const QString& widgetId, const QHeaderView* header)
+{
+	if (!header) return;
+
+	QStringList widths;
+	for (int i = 0; i < header->count(); i++)
+		widths << QString::number(header->sectionSize(i));
+
+	m_settings.setValue(widgetId + "/columnWidths", widths.join(","));
+}
+
+void ColumnSettings::restoreColumnWidths(const QString& widgetId, QHeaderView* header)
+{
+	if (!header) return;
+
+	QString saved = m_settings.value(widgetId + "/columnWidths").toString();
+	if (saved.isEmpty()) return;
+
+	QStringList widths = saved.split(",");
+	for (int i = 0; i < qMin(widths.size(), header->count()); i++)
+	{
+		bool ok;
+		int w = widths[i].toInt(&ok);
+		if (ok && w > 0)
+			header->resizeSection(i, w);
+	}
+}
+
+void ColumnSettings::saveSortColumn(const QString& widgetId, int column, Qt::SortOrder order)
+{
+	m_settings.setValue(widgetId + "/sortColumn", column);
+	m_settings.setValue(widgetId + "/sortOrder", static_cast<int>(order));
+}
+
+std::pair<int, Qt::SortOrder> ColumnSettings::loadSortColumn(const QString& widgetId)
+{
+	int col = m_settings.value(widgetId + "/sortColumn", -1).toInt();
+	int order = m_settings.value(widgetId + "/sortOrder", 0).toInt();
+	return {col, static_cast<Qt::SortOrder>(order)};
+}
+
+// ============================================================================
+// ContextMenuHelper - Build context menus for tree views
+// ============================================================================
+
+ContextMenuHelper::ContextMenuHelper(QTreeView* treeView, TreeResultsModel* model,
+	QWidget* parent)
+	: QObject(parent)
+	, m_treeView(treeView)
+	, m_model(model)
+{
+	if (treeView)
+	{
+		treeView->setContextMenuPolicy(Qt::CustomContextMenu);
+		connect(treeView, &QTreeView::customContextMenuRequested,
+			this, &ContextMenuHelper::showContextMenu);
+	}
+}
+
+void ContextMenuHelper::setNavigationCallback(std::function<void(uint64_t)> callback)
+{
+	m_navigateCallback = callback;
+}
+
+void ContextMenuHelper::setCreateFunctionCallback(std::function<void(uint64_t, bool)> callback)
+{
+	m_createFunctionCallback = callback;
+}
+
+void ContextMenuHelper::setApplyCallback(std::function<void()> callback)
+{
+	m_applyCallback = callback;
+}
+
+void ContextMenuHelper::showContextMenu(const QPoint& pos)
+{
+	if (!m_treeView || !m_model) return;
+
+	QModelIndex index = m_treeView->indexAt(pos);
+	QMenu menu(m_treeView);
+
+	// Selection actions
+	QAction* selectAllAction = menu.addAction("Select All");
+	connect(selectAllAction, &QAction::triggered, m_model, &TreeResultsModel::selectAll);
+
+	QAction* selectNoneAction = menu.addAction("Select None");
+	connect(selectNoneAction, &QAction::triggered, m_model, &TreeResultsModel::selectNone);
+
+	QAction* invertAction = menu.addAction("Invert Selection");
+	connect(invertAction, &QAction::triggered, m_model, &TreeResultsModel::invertSelection);
+
+	menu.addSeparator();
+
+	// Copy actions
+	QAction* copyAddrAction = menu.addAction("Copy Address(es)");
+	connect(copyAddrAction, &QAction::triggered, this, &ContextMenuHelper::copyAddresses);
+
+	QAction* copyDataAction = menu.addAction("Copy Row Data");
+	connect(copyDataAction, &QAction::triggered, this, &ContextMenuHelper::copyRowData);
+
+	if (index.isValid())
+	{
+		menu.addSeparator();
+
+		// Navigation
+		QAction* navAction = menu.addAction("Navigate to Address");
+		connect(navAction, &QAction::triggered, [this, index]() {
+			uint64_t addr = m_model->itemAddress(index.row());
+			if (m_navigateCallback)
+				m_navigateCallback(addr);
+			emit navigateRequested(addr);
+		});
+
+		// Create function
+		if (m_createFunctionCallback)
+		{
+			QAction* createAction = menu.addAction("Create Function Here");
+			connect(createAction, &QAction::triggered, [this, index]() {
+				uint64_t addr = m_model->itemAddress(index.row());
+				// TODO: Determine if Thumb from model data
+				m_createFunctionCallback(addr, false);
+				emit createFunctionRequested(addr, false);
+			});
+		}
+	}
+
+	// Apply action
+	if (m_applyCallback && m_model->selectedCount() > 0)
+	{
+		menu.addSeparator();
+		QAction* applyAction = menu.addAction(QString("Apply Selected (%1)")
+			.arg(m_model->selectedCount()));
+		connect(applyAction, &QAction::triggered, [this]() {
+			if (m_applyCallback) m_applyCallback();
+			emit applyRequested();
+		});
+	}
+
+	menu.exec(m_treeView->viewport()->mapToGlobal(pos));
+}
+
+void ContextMenuHelper::copyAddresses()
+{
+	if (!m_model) return;
+
+	auto addresses = m_model->getSelectedAddresses();
+	if (addresses.empty()) return;
+
+	QStringList lines;
+	for (uint64_t addr : addresses)
+		lines << QString("0x%1").arg(addr, 8, 16, QChar('0'));
+
+	QApplication::clipboard()->setText(lines.join("\n"));
+}
+
+void ContextMenuHelper::copyRowData()
+{
+	if (!m_treeView || !m_model) return;
+
+	QStringList lines;
+	for (int row = 0; row < m_model->itemCount(); row++)
+	{
+		if (!m_model->isItemSelected(row)) continue;
+
+		QStringList cols;
+		for (int col = 0; col < m_model->columnCount(); col++)
+		{
+			QModelIndex idx = m_model->index(row, col);
+			cols << idx.data(Qt::DisplayRole).toString();
+		}
+		lines << cols.join("\t");
+	}
+
+	QApplication::clipboard()->setText(lines.join("\n"));
+}
+
+// ============================================================================
 // KeyboardShortcutMixin
 // ============================================================================
 
@@ -1517,6 +1839,40 @@ void KeyboardShortcutMixin::setupStandardShortcuts(QWidget* widget, TreeResultsM
 	m_copyShortcut = new QShortcut(QKeySequence::Copy, widget);
 	QObject::connect(m_copyShortcut, &QShortcut::activated, [copyCallback]() {
 		if (copyCallback) copyCallback();
+	});
+}
+
+void KeyboardShortcutMixin::setupTreeShortcuts(QWidget* widget, QTreeView* treeView,
+	TreeResultsModel* model, std::function<void(uint64_t)> navigateCallback)
+{
+	// Enter/Return: Navigate to selected item
+	m_enterShortcut = new QShortcut(QKeySequence(Qt::Key_Return), widget);
+	QObject::connect(m_enterShortcut, &QShortcut::activated, [treeView, model, navigateCallback]() {
+		if (!treeView || !model) return;
+		QModelIndex current = treeView->currentIndex();
+		if (current.isValid() && current.internalId() == 0)
+		{
+			uint64_t addr = model->itemAddress(current.row());
+			if (navigateCallback) navigateCallback(addr);
+		}
+	});
+
+	// Space: Toggle selection on current item
+	m_spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), widget);
+	QObject::connect(m_spaceShortcut, &QShortcut::activated, [treeView, model]() {
+		if (!treeView || !model) return;
+		QModelIndex current = treeView->currentIndex();
+		if (current.isValid() && current.internalId() == 0)
+		{
+			bool selected = model->isItemSelected(current.row());
+			model->setItemSelected(current.row(), !selected);
+		}
+	});
+
+	// Escape: Clear selection
+	m_escapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), widget);
+	QObject::connect(m_escapeShortcut, &QShortcut::activated, [model]() {
+		if (model) model->selectNone();
 	});
 }
 

@@ -258,12 +258,22 @@ public:
 
 /*
  * RTOS Task Entry Calling Convention
- * Many RTOS task entry points are invoked with:
- * - r0 = argc (or task parameter)
- * - r1 = argv (or additional parameter)
- * - lr = task exit stub
- * - sp = task stack top
- * Tasks generally do not return normally.
+ *
+ * Most RTOS task entry points receive 2 arguments:
+ *   r0 = argc or parameter1 (UNSIGNED, uint32_t)
+ *   r1 = argv or parameter2 (VOID pointer)
+ *
+ * Examples:
+ *   Nucleus PLUS: void task_entry(UNSIGNED argc, VOID *argv)
+ *   FreeRTOS: void task_entry(void *pvParameters)
+ *   ThreadX: void task_entry(ULONG thread_input)
+ *   uC/OS-II: void task_entry(void *p_arg)
+ *
+ * LR typically points to a task exit stub.
+ * SP is set to the task dedicated stack.
+ * Tasks generally run in infinite loops and do not return normally.
+ *
+ * Apply this convention to detected RTOS task entry functions.
  */
 class Armv5TaskEntryCallingConvention : public CallingConvention
 {

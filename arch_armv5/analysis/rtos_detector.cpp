@@ -75,12 +75,51 @@ static const std::vector<std::string> kNucleusPLUSSymbols = {
 	"NU_Change_Priority",
 	"NU_Task_Information",
 	"NU_Create_Queue",
-	"NU_Create_Semaphore"
+	"NU_Create_Semaphore",
+	"NU_Allocate_Memory",
+	"NU_Deallocate_Memory",
+	"NU_Create_Event_Group",
+	"NU_Set_Events",
+	"NU_Retrieve_Events",
+	"TCD_Current_Thread",
+	"TCD_Execute_Task"
 };
 
 static const std::vector<std::string> kNucleusPLUSStrings = {
-	"Nucleus",
-	"NU_TASK"
+	"Nucleus PLUS",
+	"Nucleus_PLUS",
+	"NU_TASK",
+	"NU_SUCCESS",
+	"NU_INVALID_TASK",
+	"NU_INVALID_POINTER",
+	"NU_INVALID_PRIORITY",
+	"NU_INVALID_PREEMPT",
+	"NU_INVALID_SIZE",
+	"NU_INVALID_SUSPEND",
+	"NU_NOT_PRESENT",
+	"Mentor Graphics",
+	"Accelerated Technology",  // Original Nucleus creator
+	"TCD_Created_Tasks_List",
+	"TMD_Timer",
+	"QUD_Created_Queues_List",
+	// Common Nucleus error/status messages (found in TI-Nspire and other firmware)
+	"No Nucleus Timers",
+	"No Nucleus Tasks",
+	"No Nucleus HISRs",
+	"No Nucleus Pipes",
+	"No Nucleus Mailboxes",
+	"No Nucleus Semaphores",
+	"No Nucleus Queues",
+	"No Nucleus Event Groups",
+	"No Nucleus Memory Pools",
+	"No Nucleus Partition Pools",
+	"Cannot start Nucleus",
+	"Unable to load Nucleus",
+	"Unable to init Nucleus",
+	"Nucleus 802.11",
+	"Nucleus Edition",
+	"Copyright MGC",  // Mentor Graphics Corporation copyright
+	"Nucleus NET"
 };
 
 /*
@@ -202,10 +241,19 @@ RTOSDetectionResult RTOSDetector::DetectRTOS(BinaryView* view)
 	{
 		result.type = RTOSType::NucleusPLUS;
 		result.confidence = 200;
-		result.reason = "Detected Nucleus PLUS symbols (NU_Create_Task, etc.)";
+		// Check what triggered detection for better logging
+		auto nuSymbols = FindSymbolsMatching(view, kNucleusPLUSSymbols);
+		auto nuStrings = FindStringsMatching(view, kNucleusPLUSStrings);
+		if (nuSymbols.size() >= 2)
+			result.reason = "Detected Nucleus PLUS symbols (NU_Create_Task, etc.)";
+		else if (nuStrings.size() >= 3)
+			result.reason = "Detected Nucleus PLUS via string patterns";
+		else
+			result.reason = "Detected Nucleus PLUS via symbol and string combination";
 		result.tasks = FindNucleusPLUSTasks(view);
 		if (logger)
-			logger->LogInfo("RTOSDetector: Detected %s (%zu tasks)", RTOSTypeToString(result.type), result.tasks.size());
+			logger->LogInfo("RTOSDetector: Detected %s (%zu tasks, %zu symbols, %zu strings)",
+				RTOSTypeToString(result.type), result.tasks.size(), nuSymbols.size(), nuStrings.size());
 		return result;
 	}
 
@@ -556,8 +604,24 @@ struct TX_THREAD {
 
 bool RTOSDetector::DetectNucleusPLUS(BinaryView* view)
 {
+	// Check for symbols first (best case - not stripped)
 	auto symbols = FindSymbolsMatching(view, kNucleusPLUSSymbols);
-	return symbols.size() >= 2;
+	if (symbols.size() >= 2)
+		return true;
+
+	// For stripped binaries, rely on string matching
+	// Nucleus PLUS has distinctive error messages and internal strings
+	auto strings = FindStringsMatching(view, kNucleusPLUSStrings);
+
+	// If we find multiple Nucleus-specific strings, it's likely Nucleus PLUS
+	if (strings.size() >= 3)
+		return true;
+
+	// If we have at least one symbol and one string, still count as detection
+	if (symbols.size() >= 1 && strings.size() >= 1)
+		return true;
+
+	return false;
 }
 
 std::vector<RTOSTask> RTOSDetector::FindNucleusPLUSTasks(BinaryView* view)
@@ -581,54 +645,219 @@ std::vector<RTOSTask> RTOSDetector::FindNucleusPLUSTasks(BinaryView* view)
 
 void RTOSDetector::DefineNucleusPLUSTypes(BinaryView* view)
 {
-	// NU_TASK structure based on Nucleus PLUS documentation
+	// TC_TCB (Task Control Block) - the internal structure used by Nucleus PLUS
+	// This is the actual kernel structure, NU_TASK is just a typedef/wrapper
+	// Based on Nucleus PLUS v1.x for ARM (used in TI-Nspire, etc.)
 	std::string nuTaskDef = R"(
-struct NU_TASK {
-    // Linked list pointers for kernel queues
-    struct NU_TASK* tq_ready_prev;
-    struct NU_TASK* tq_ready_next;
-    struct NU_TASK* tq_suspended_prev;
-    struct NU_TASK* tq_suspended_next;
-    struct NU_TASK* tq_created_prev;
-    struct NU_TASK* tq_created_next;
+// Nucleus PLUS status codes
+#define NU_SUCCESS              0
+#define NU_INVALID_TASK         -1
+#define NU_INVALID_POINTER      -2
+#define NU_INVALID_SIZE         -3
+#define NU_INVALID_PRIORITY     -6
+#define NU_INVALID_PREEMPT      -7
 
-    // CPU context (saved registers)
-    void* cpu_context;
+// Task status values
+#define NU_READY                0
+#define NU_PURE_SUSPEND         1
+#define NU_SLEEP_SUSPEND        2
+#define NU_FINISHED             11
+#define NU_TERMINATED           12
+
+// Preemption options
+#define NU_PREEMPT              0
+#define NU_NO_PREEMPT           1
+
+// Common list node used throughout Nucleus
+struct CS_NODE {
+    struct CS_NODE* cs_previous;
+    struct CS_NODE* cs_next;
+    uint8_t cs_priority;
+    uint8_t cs_padding[3];
+};
+
+// Task Control Block - TC_TCB (internal kernel structure)
+// NU_TASK is typically a pointer to this structure
+struct TC_TCB {
+    // Created tasks list linkage
+    struct TC_TCB* tc_created_prev;
+    struct TC_TCB* tc_created_next;
+
+    // Ready/suspend list linkage (uses CS_NODE pattern)
+    struct TC_TCB* tc_ready_prev;
+    struct TC_TCB* tc_ready_next;
 
     // Task identification
-    char task_name[8];  // 7 chars + null (NU_MAX_NAME)
+    uint32_t tc_id;                    // Should be TC_TASK_ID (0x5441534BUL = "TASK")
+    char tc_name[8];                   // NU_MAX_NAME = 8 (7 chars + null)
 
-    // Entry point and arguments
-    void (*task_entry)(uint32_t argc, void* argv);
-    uint32_t argc;
-    void* argv;
+    // Task state
+    uint8_t tc_status;                 // NU_READY, NU_PURE_SUSPEND, etc.
+    uint8_t tc_delayed_suspend;        // Delayed suspension flag
+    uint8_t tc_priority;               // Current priority (0 = highest, 255 = lowest)
+    uint8_t tc_preempt;                // NU_PREEMPT or NU_NO_PREEMPT
+    uint32_t tc_scheduled;             // Times task has been scheduled
+    uint32_t tc_time_slice;            // Time slice in ticks (0 = disabled)
+    uint32_t tc_cur_time_slice;        // Current remaining time slice
 
     // Stack management
-    void* stack_base;
-    uint32_t stack_size;
-    uint32_t min_stack_remaining;
+    void* tc_stack_start;              // Start of stack memory
+    void* tc_stack_end;                // End of stack memory (stack_start + stack_size)
+    void* tc_stack_pointer;            // Current saved stack pointer
+    uint32_t tc_stack_size;            // Stack size in bytes
+    uint32_t tc_stack_minimum;         // Minimum stack remaining (high water mark)
 
-    // Scheduling parameters
-    uint8_t priority;      // 0-255 (0 = highest)
-    uint8_t preempt;       // NU_PREEMPT or NU_NO_PREEMPT
-    uint32_t time_slice;   // Ticks (0 = no time slice)
+    // Entry point and arguments (passed to task when started)
+    void (*tc_entry)(uint32_t argc, void* argv);
+    uint32_t tc_argc;                  // First argument (UNSIGNED)
+    void* tc_argv;                     // Second argument (VOID*)
 
-    // Runtime state
-    uint8_t task_status;   // READY, SUSPENDED, EXECUTING, etc.
-    uint32_t scheduled_count;
+    // Protect/unprotect count
+    uint32_t tc_protect_count;         // Protection nesting count
 
     // Signal handling
-    uint32_t signal_mask;
-    void (*signal_handler)(uint32_t signals);
-    uint32_t pending_signals;
+    uint32_t tc_signals;               // Pending signals
+    uint32_t tc_enabled_signals;       // Signal enable mask
+    void (*tc_signal_handler)(uint32_t signals);
+    void* tc_saved_stack_ptr;          // Stack pointer before signal handler
 
-    // Timing and blocking
-    uint32_t sleep_ticks;
-    void* wait_object;
+    // Suspension/blocking info
+    uint8_t tc_suspend_type;           // Type of suspension
+    uint8_t tc_padding[3];             // Alignment padding
+    void* tc_suspend_info;             // Pointer to suspension info structure
 
-    // Debug ID
-    uint32_t task_id;
+    // Timer for sleep/timeout
+    struct TC_TCB* tc_timer_prev;      // Timer list linkage
+    struct TC_TCB* tc_timer_next;
+    uint32_t tc_timer_count;           // Remaining timer ticks
 };
+
+// Public handle type (users see this)
+typedef struct TC_TCB NU_TASK;
+
+// Nucleus PLUS Queue Control Block
+struct QU_QCB {
+    struct QU_QCB* qu_created_prev;
+    struct QU_QCB* qu_created_next;
+    uint32_t qu_id;                    // QU_QUEUE_ID
+    char qu_name[8];
+    uint8_t qu_fixed_size;             // Fixed or variable message size
+    uint8_t qu_fifo_suspend;           // FIFO or priority suspension
+    uint8_t qu_padding[2];
+    uint32_t qu_message_size;          // Size of each message
+    uint32_t qu_available;             // Available messages
+    uint32_t qu_messages;              // Current message count
+    void* qu_start;                    // Start of queue memory
+    void* qu_end;                      // End of queue memory
+    void* qu_read;                     // Read pointer
+    void* qu_write;                    // Write pointer
+    struct TC_TCB* qu_suspension_list; // Suspended tasks list
+    uint32_t qu_tasks_waiting;         // Number of waiting tasks
+};
+
+typedef struct QU_QCB NU_QUEUE;
+
+// Nucleus PLUS Semaphore Control Block
+struct SM_SCB {
+    struct SM_SCB* sm_created_prev;
+    struct SM_SCB* sm_created_next;
+    uint32_t sm_id;                    // SM_SEMAPHORE_ID
+    char sm_name[8];
+    uint32_t sm_semaphore_count;       // Current count
+    uint8_t sm_fifo_suspend;           // FIFO or priority suspension
+    uint8_t sm_padding[3];
+    struct TC_TCB* sm_suspension_list; // Suspended tasks list
+    uint32_t sm_tasks_waiting;         // Number of waiting tasks
+};
+
+typedef struct SM_SCB NU_SEMAPHORE;
+
+// Nucleus PLUS Event Group Control Block
+struct EV_GCB {
+    struct EV_GCB* ev_created_prev;
+    struct EV_GCB* ev_created_next;
+    uint32_t ev_id;                    // EV_EVENT_ID
+    char ev_name[8];
+    uint32_t ev_current_events;        // Current event flags
+    struct TC_TCB* ev_suspension_list; // Suspended tasks list
+    uint32_t ev_tasks_waiting;         // Number of waiting tasks
+};
+
+typedef struct EV_GCB NU_EVENT_GROUP;
+
+// Nucleus PLUS Timer Control Block
+struct TM_TCB {
+    struct TM_TCB* tm_created_prev;
+    struct TM_TCB* tm_created_next;
+    uint32_t tm_id;                    // TM_TIMER_ID
+    char tm_name[8];
+    void (*tm_expiration_routine)(uint32_t id);
+    uint32_t tm_expiration_id;         // ID passed to expiration routine
+    uint32_t tm_initial_time;          // Initial time in ticks
+    uint32_t tm_reschedule_time;       // Reschedule time (0 = one-shot)
+    uint32_t tm_actual_time;           // Remaining time
+    uint8_t tm_enabled;                // Timer enabled flag
+    uint8_t tm_paused;                 // Timer paused flag
+    uint8_t tm_padding[2];
+};
+
+typedef struct TM_TCB NU_TIMER;
+
+// Nucleus PLUS Memory Pool Control Block
+struct DM_PCB {
+    struct DM_PCB* dm_created_prev;
+    struct DM_PCB* dm_created_next;
+    uint32_t dm_id;                    // DM_DYNAMIC_ID
+    char dm_name[8];
+    void* dm_start_address;            // Pool start
+    uint32_t dm_pool_size;             // Total pool size
+    uint32_t dm_min_allocation;        // Minimum allocation unit
+    uint32_t dm_available;             // Available bytes
+    void* dm_memory_list;              // Free block list
+    uint8_t dm_fifo_suspend;
+    uint8_t dm_padding[3];
+    struct TC_TCB* dm_suspension_list;
+    uint32_t dm_tasks_waiting;
+};
+
+typedef struct DM_PCB NU_MEMORY_POOL;
+
+// Nucleus PLUS Partition Pool Control Block
+struct PM_PCB {
+    struct PM_PCB* pm_created_prev;
+    struct PM_PCB* pm_created_next;
+    uint32_t pm_id;                    // PM_PARTITION_ID
+    char pm_name[8];
+    void* pm_start_address;            // Pool start
+    uint32_t pm_pool_size;             // Total pool size
+    uint32_t pm_partition_size;        // Size of each partition
+    uint32_t pm_available;             // Available partitions
+    void* pm_available_list;           // Free partition list
+    uint8_t pm_fifo_suspend;
+    uint8_t pm_padding[3];
+    struct TC_TCB* pm_suspension_list;
+    uint32_t pm_tasks_waiting;
+};
+
+typedef struct PM_PCB NU_PARTITION_POOL;
+
+// HISR (High-Level Interrupt Service Routine) Control Block
+struct TC_HCB {
+    struct TC_HCB* tc_created_prev;
+    struct TC_HCB* tc_created_next;
+    uint32_t tc_id;                    // TC_HISR_ID
+    char tc_name[8];
+    void (*tc_entry)(void);            // HISR entry point
+    uint8_t tc_priority;               // 0, 1, or 2 (0 = highest)
+    uint8_t tc_activation_count;       // Pending activations
+    uint8_t tc_padding[2];
+    void* tc_stack_start;
+    void* tc_stack_end;
+    void* tc_stack_pointer;
+    uint32_t tc_stack_size;
+};
+
+typedef struct TC_HCB NU_HISR;
 )";
 
 	ParseAndDefineTypes(view, nuTaskDef, "nucleus_plus_types.h");

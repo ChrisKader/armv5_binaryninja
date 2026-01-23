@@ -1348,47 +1348,173 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 							if (!alreadyDetected)
 							{
-								// Check if this looks like UTF-16 (alternating printable/null or null/printable)
-								bool looksLikeUtf16 = false;
-								if (strLen >= 4 && (strLen % 2) == 0) // Must be even length for UTF-16
+						// Check if this looks like UTF-16 or UTF-32
+						bool looksLikeUtf16 = false;
+						bool looksLikeUtf32 = false;
+
+						// Check UTF-16 patterns (decode actual UTF-16 characters)
+						if (strLen >= 4 && (strLen % 2) == 0)
+						{
+							bool isValidUtf16 = true;
+							bool hasNullTerminator = false;
+
+							for (size_t j = 0; j < strLen && isValidUtf16; j += 2)
+							{
+								// Decode UTF-16 character (assuming little-endian byte order)
+								uint16_t wc = data[start + j] | (data[start + j + 1] << 8);
+
+								if (wc == 0)
 								{
-									bool pattern1 = true; // printable + null + printable + null + ...
-									bool pattern2 = true; // null + printable + null + printable + ...
-
-									for (size_t j = 0; j < strLen; j += 2)
-									{
-										uint8_t c1 = data[start + j];
-										uint8_t c2 = data[start + j + 1];
-
-										// Pattern 1: printable, null
-										if (!(c1 >= 0x20 && c1 <= 0x7E && c2 == 0x00))
-											pattern1 = false;
-
-										// Pattern 2: null, printable
-										if (!(c1 == 0x00 && c2 >= 0x20 && c2 <= 0x7E))
-											pattern2 = false;
-
-										if (!pattern1 && !pattern2)
-											break;
-									}
-
-									if (pattern1 || pattern2)
-									{
-										looksLikeUtf16 = true;
-									}
+									hasNullTerminator = true;
+									break; // Null terminator found
 								}
 
-								BNStringReference newStr;
-								newStr.start = addr + start;
-								newStr.length = strLen;
-								newStr.type = looksLikeUtf16 ? Utf16String : AsciiString;
-								additionalStrings.push_back(newStr);
+								if (wc < 0x20 || wc > 0x7E)
+								{
+									isValidUtf16 = false;
+								}
+							}
 
+							// If we have a valid UTF-16 sequence, check for null termination
+							if (isValidUtf16)
+							{
+								looksLikeUtf16 = true;
+
+								// Check if null terminator exists in the buffer
+								if (!hasNullTerminator && buffer.GetLength() >= strLen + 2)
+								{
+									uint16_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8);
+									if (nullCheck == 0)
+									{
+										hasNullTerminator = true;
+										strLen += 2; // Include null terminator in length
+									}
+								}
+							}
+						}
+
+						// Check UTF-32 patterns (4 bytes per char) - little endian
+						if (!looksLikeUtf16 && strLen >= 8 && (strLen % 4) == 0)
+						{
+							bool isValidUtf32 = true;
+							bool hasNullTerminator = false;
+
+							for (size_t j = 0; j < strLen && isValidUtf32; j += 4)
+							{
+								uint32_t wc = data[start + j] | (data[start + j + 1] << 8) |
+											 (data[start + j + 2] << 16) | (data[start + j + 3] << 24);
+
+								if (wc == 0)
+								{
+									hasNullTerminator = true;
+									break; // Null terminator found
+								}
+
+								// For ASCII characters in UTF-32: should be 0x000000XX where XX is printable
+								if (wc < 0x20 || wc > 0x7E)
+								{
+									isValidUtf32 = false;
+								}
+							}
+
+							// If we have a valid UTF-32 sequence, check for null termination
+							if (isValidUtf32)
+							{
+								looksLikeUtf32 = true;
+
+								// Check if null terminator exists in the buffer
+								if (!hasNullTerminator && buffer.GetLength() >= strLen + 4)
+								{
+									uint32_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8) |
+														(data[start + strLen + 2] << 16) | (data[start + strLen + 3] << 24);
+									if (nullCheck == 0)
+									{
+										hasNullTerminator = true;
+										strLen += 4; // Include null terminator in length
+									}
+								}
+							}
+						}
+
+						// Adjust length for null-terminated strings
+						size_t adjustedLength = strLen;
+						if (looksLikeUtf16)
+						{
+							if (buffer.GetLength() >= strLen + 2)
+							{
+								uint16_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8);
 								if (logger)
 								{
-									logger->LogInfo("Found additional %s string at 0x%llx: length=%zu (printable=%.1f%%, alpha=%.1f%%)",
-										looksLikeUtf16 ? "UTF-16" : "ASCII", newStr.start, newStr.length, printableRatio * 100, alphaNumRatio * 100);
+									logger->LogInfo("UTF-16 null check at 0x%llx: 0x%04x (buffer len %zu, strLen %zu)",
+										addr + start + strLen, nullCheck, buffer.GetLength(), strLen);
 								}
+								if (nullCheck == 0)
+								{
+									adjustedLength += 2; // Include UTF-16 null terminator
+									if (logger)
+									{
+										logger->LogInfo("UTF-16 null terminator found, adjusted length: %zu -> %zu",
+											strLen, adjustedLength);
+									}
+								}
+							}
+							else if (logger)
+							{
+								logger->LogInfo("UTF-16 null check failed: buffer too short (need %zu, have %zu)",
+									strLen + 2, buffer.GetLength());
+							}
+						}
+						else if (looksLikeUtf32)
+						{
+							if (buffer.GetLength() >= strLen + 4)
+							{
+								uint32_t nullCheck = data[start + strLen] | (data[start + strLen + 1] << 8) |
+													(data[start + strLen + 2] << 16) | (data[start + strLen + 3] << 24);
+								if (nullCheck == 0)
+								{
+									adjustedLength += 4; // Include UTF-32 null terminator
+								}
+							}
+						}
+
+						BNStringReference newStr;
+						newStr.start = addr + start;
+						newStr.length = adjustedLength;
+
+						if (looksLikeUtf32)
+						{
+							newStr.type = Utf32String; // Assuming BN supports this
+							size_t utf32Length = adjustedLength / 4;
+
+							if (logger)
+							{
+								logger->LogInfo("Found additional UTF-32 string at 0x%llx: length=%zu bytes (%zu chars)",
+									newStr.start, newStr.length, utf32Length);
+							}
+						}
+						else if (looksLikeUtf16)
+						{
+							newStr.type = Utf16String;
+							size_t utf16Length = adjustedLength / 2;
+
+							if (logger)
+							{
+								logger->LogInfo("Found additional UTF-16 string at 0x%llx: length=%zu bytes (%zu chars)",
+									newStr.start, newStr.length, utf16Length);
+							}
+						}
+						else
+						{
+							newStr.type = AsciiString;
+
+							if (logger)
+							{
+								logger->LogInfo("Found additional ASCII string at 0x%llx: length=%zu (printable=%.1f%%, alpha=%.1f%%)",
+									newStr.start, newStr.length, printableRatio * 100, alphaNumRatio * 100);
+							}
+						}
+
+						additionalStrings.push_back(newStr);
 							}
 						}
 					}
@@ -1435,21 +1561,27 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 						{
 							if (str.start == pointedAddr)
 							{
-								// Create appropriate array type for the string
-								Ref<Type> elementType;
-								size_t elementSize;
-								if (str.type == Utf16String)
+								// For proper display in main view, try creating named types that Binary Ninja recognizes
+								Ref<Type> stringType;
+								if (str.type == Utf32String)
 								{
-									elementType = Type::IntegerType(2, false); // uint16_t
-									elementSize = 2;
+									Ref<Type> elementType = Type::IntegerType(4, false); // uint32_t
+									size_t arrayLength = str.length / 4; // Include null terminator in array
+									stringType = Type::ArrayType(elementType, arrayLength);
+								}
+								else if (str.type == Utf16String)
+								{
+									// Try using a wide char type for better display
+									Ref<Type> elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
+									size_t arrayLength = str.length / 2; // Include null terminator in array
+									stringType = Type::ArrayType(elementType, arrayLength);
 								}
 								else
 								{
-									elementType = Type::IntegerType(1, true); // char
-									elementSize = 1;
+									Ref<Type> elementType = Type::IntegerType(1, true); // char
+									size_t arrayLength = (str.length + 1 - 1) / 1; // elementSize = 1
+									stringType = Type::ArrayType(elementType, arrayLength);
 								}
-								size_t arrayLength = (str.length + elementSize - 1) / elementSize;
-								Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
 								view->DefineUserDataVariable(pointedAddr, stringType);
 								found = true;
 								break;
@@ -1461,21 +1593,26 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 							{
 								if (str.start == pointedAddr)
 								{
-									// Create appropriate array type for the string
-									Ref<Type> elementType;
-									size_t elementSize;
-									if (str.type == Utf16String)
+									// Create appropriate array type for the string using wide char types for proper display
+									Ref<Type> stringType;
+									if (str.type == Utf32String)
 									{
-										elementType = Type::IntegerType(2, false); // uint16_t
-										elementSize = 2;
+										Ref<Type> elementType = Type::WideCharType(4); // UTF-32 wide char
+										size_t arrayLength = str.length / 4; // Include null terminator in array
+										stringType = Type::ArrayType(elementType, arrayLength);
+									}
+									else if (str.type == Utf16String)
+									{
+										Ref<Type> elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
+										size_t arrayLength = str.length / 2; // Include null terminator in array
+										stringType = Type::ArrayType(elementType, arrayLength);
 									}
 									else
 									{
-										elementType = Type::IntegerType(1, true); // char
-										elementSize = 1;
+										Ref<Type> elementType = Type::IntegerType(1, true); // char
+										size_t arrayLength = (str.length + 1 - 1) / 1; // elementSize = 1
+										stringType = Type::ArrayType(elementType, arrayLength);
 									}
-									size_t arrayLength = (str.length + elementSize - 1) / elementSize;
-									Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
 									view->DefineUserDataVariable(pointedAddr, stringType);
 									found = true;
 									break;
@@ -1506,13 +1643,6 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 			for (const auto& str : strings)
 			{
-				// Debug: log specific addresses we're interested in
-				if (str.start == 0x11280020 || str.start == 0x11280027 || str.start == 0x11280033 ||
-					str.start == 0x11280074 || str.start == 0x112800b3)
-				{
-					logger->LogInfo("Processing string at 0x%llx (length %zu)", str.start, str.length);
-				}
-
 				// Additional validation to filter out obviously invalid strings
 				if (str.length < 2)
 				{
@@ -1520,12 +1650,13 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					continue; // Too short
 				}
 
-				// Read the actual string data to validate it (including potential null terminator)
-				DataBuffer buffer = view->ReadBuffer(str.start, str.length + 1);
+				// Read the actual string data to validate it (including potential null terminators)
+				// Need up to 4 extra bytes for UTF-32 null terminator
+				DataBuffer buffer = view->ReadBuffer(str.start, str.length + 4);
 				if (buffer.GetLength() <= str.length)
 				{
 					skipped++;
-					continue; // Can't read the extra byte for null termination check
+					continue; // Can't read the data
 				}
 
 				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
@@ -1755,10 +1886,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					elementType = Type::IntegerType(1, true);  // char (signed 8-bit)
 					break;
 				case Utf16String:
-					elementType = Type::IntegerType(2, false); // uint16_t (unsigned 16-bit)
+					elementType = Type::WideCharType(2); // UTF-16 wide char (wchar16)
 					break;
 				case Utf32String:
-					elementType = Type::IntegerType(4, false); // uint32_t (unsigned 32-bit)
+					elementType = Type::WideCharType(4); // UTF-32 wide char
 					break;
 				default:
 					elementType = Type::IntegerType(1, true);  // Default to char

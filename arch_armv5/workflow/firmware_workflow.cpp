@@ -194,7 +194,7 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 			]
 		},
 		"dependencies": {
-			"downstream": ["core.module.update"]
+			"downstream": ["core.module.loadDebugInfo"]
 		}
 	})~", &RunArmv5FirmwareWorkflow);
 	if (!activity)
@@ -208,7 +208,7 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 	 * 2. Then our firmware scans run
 	 * 3. Then the update pass finalizes everything
 	 */
-	firmwareWorkflow->InsertAfter("core.module.extendedAnalysis", "analysis.armv5.firmwareScan");
+	firmwareWorkflow->Insert("core.module.loadDebugInfo", "analysis.armv5.firmwareScan");
 
 	/*
 	 * Register the workflow.

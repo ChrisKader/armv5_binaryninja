@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include "binaryninjaapi.h"
+
+#include <QtCore/QObject>
 #include <QtCore/QString>
 #include <QtCore/QMap>
 #include <QtGui/QColor>
@@ -68,8 +71,10 @@ enum class ThemeColor
 	SelectionBorder
 };
 
-class Theme
+class Theme : public QObject
 {
+	Q_OBJECT
+
 public:
 	static Theme& instance();
 
@@ -78,6 +83,9 @@ public:
 
 	// Get color for current theme
 	QColor color(ThemeColor id) const;
+
+	// Direct access to BN's native colors (for Default theme consistency)
+	static QColor bnColor(BNThemeColor bnColor);
 
 	// Get complete stylesheet for a widget type
 	QString controlBarStyle() const;
@@ -94,6 +102,12 @@ public:
 	QString applyButtonStyle() const;
 	QString warningButtonStyle() const;
 	QString dangerButtonStyle() const;
+
+	// Refresh theme colors from BN (call when BN theme changes)
+	void refreshFromBinaryNinja();
+
+Q_SIGNALS:
+	void themeChanged();
 
 private:
 	Theme();

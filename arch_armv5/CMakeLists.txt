@@ -46,6 +46,8 @@ file(GLOB SOURCES CONFIGURE_DEPENDS
     *.h
     analysis/*.cpp
     analysis/*.h
+    analysis/cfg/*.cpp
+    analysis/cfg/*.h
     arch/*.cpp
     arch/*.h
     commands/*.cpp
