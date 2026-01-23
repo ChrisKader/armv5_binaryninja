@@ -594,6 +594,12 @@ static void RegisterFirmwareViewDestructionCallbacks()
 
 void BinaryNinja::InitArmv5FirmwareViewType()
 {
+	// Guard against double registration (can happen if plugin is loaded multiple ways)
+	static bool s_registered = false;
+	if (s_registered)
+		return;
+	s_registered = true;
+
 	static Armv5FirmwareViewType type;
 	BinaryViewType::Register(&type);
 	g_armv5FirmwareViewType = &type;

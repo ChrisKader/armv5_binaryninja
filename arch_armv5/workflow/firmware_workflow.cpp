@@ -146,6 +146,12 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
  */
 void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 {
+	// Guard against double registration
+	static bool s_registered = false;
+	if (s_registered)
+		return;
+	s_registered = true;
+
 	/*
 	 * Get the base workflow to extend.
 	 * "core.module.metaAnalysis" is the standard module analysis workflow.
