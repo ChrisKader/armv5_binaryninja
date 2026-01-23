@@ -183,7 +183,7 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 		"role": "action",
 		"description": "Run ARMv5 firmware discovery passes (prologue/call/pointer/orphan scans and cleanup).",
 		"eligibility": {
-			"runOnce": true,
+			"runOnce": false,
 			"auto": {},
 			"predicates": [
 				{
@@ -208,7 +208,8 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 	 * 2. Then our firmware scans run
 	 * 3. Then the update pass finalizes everything
 	 */
-	firmwareWorkflow->Insert("core.module.loadDebugInfo", "analysis.armv5.firmwareScan");
+	std::vector<std::string> inserted = { "analysis.armv5.firmwareScan" };
+	firmwareWorkflow->Insert("core.module.loadDebugInfo", inserted);
 
 	/*
 	 * Register the workflow.

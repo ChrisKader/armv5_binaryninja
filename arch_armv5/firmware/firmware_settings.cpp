@@ -272,6 +272,74 @@ void LogFirmwareSettingsSummary(const Ref<Logger>& logger, const FirmwareSetting
 		settings.tuning.maxLiteralRun);
 }
 
+uint64_t GetEffectiveCodeDataBoundary(const Ref<BinaryView>& view, const FirmwareSettings& settings)
+{
+	if (!view || !view->GetObject())
+		return 0;
+
+	// If explicitly configured, use that value
+	if (settings.codeDataBoundary != 0)
+		return settings.codeDataBoundary;
+
+	// Auto-detect based on binary structure
+	uint64_t imageStart = view->GetStart();
+	uint64_t imageEnd = view->GetEnd();
+	uint64_t length = imageEnd - imageStart;
+
+	// For binaries with sections, find the end of the last executable section
+	auto sections = view->GetSections();
+	if (!sections.empty())
+	{
+		uint64_t lastCodeEnd = 0;
+		for (const auto& section : sections)
+		{
+			// ReadOnlyCodeSectionSemantics is the only code section semantic
+			if (section->GetSemantics() == ReadOnlyCodeSectionSemantics)
+			{
+				uint64_t sectionEnd = section->GetStart() + section->GetLength();
+				if (sectionEnd > lastCodeEnd)
+					lastCodeEnd = sectionEnd;
+			}
+		}
+		if (lastCodeEnd > 0)
+			return lastCodeEnd;
+	}
+
+	// For binaries with segments, find the end of the last executable segment
+	auto segments = view->GetSegments();
+	if (!segments.empty())
+	{
+		uint64_t lastExecEnd = 0;
+		for (const auto& segment : segments)
+		{
+			if (segment->GetFlags() & SegmentExecutable)
+			{
+				uint64_t segEnd = segment->GetStart() + segment->GetLength();
+				if (segEnd > lastExecEnd)
+					lastExecEnd = segEnd;
+			}
+		}
+		if (lastExecEnd > 0)
+			return lastExecEnd;
+	}
+
+	// For raw firmware without segments/sections, use halfway point
+	// This is a conservative heuristic - most ARM firmware has code in the
+	// first half and data/constants in the second half
+	return imageStart + (length / 2);
+}
+
+bool IsAddressInDataRegion(const Ref<BinaryView>& view, const FirmwareSettings& settings, uint64_t addr)
+{
+	uint64_t boundary = GetEffectiveCodeDataBoundary(view, settings);
+	if (boundary == 0)
+		return false;  // No boundary detected, allow all addresses
+
+	// Clear Thumb bit for comparison
+	uint64_t cleanAddr = addr & ~1ULL;
+	return cleanAddr >= boundary;
+}
+
 void RegisterFirmwareSettings(const Ref<Settings>& settings)
 {
 	if (!settings)

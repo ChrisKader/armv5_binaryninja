@@ -51,6 +51,7 @@
 #include <cstring>
 #include <set>
 #include <vector>
+#include <algorithm>
 
 /*
  * NOTE: Swap32 and ReadU32At have been moved to common/armv5_utils.h
@@ -58,6 +59,144 @@
  */
 using armv5::Swap32;
 using armv5::ReadU32At;
+
+/*
+ * ============================================================================
+ * FUNCTION RANGE CACHE
+ * ============================================================================
+ *
+ * Provides O(log n) lookup for "is address inside a function?" queries.
+ * This replaces repeated GetAnalysisFunctionsContainingAddress() calls
+ * which are O(n) in the number of functions.
+ */
+
+/**
+ * Cache of function address ranges for fast containment queries.
+ *
+ * Build this once before scanning, then use Contains() for O(log n) lookups.
+ * Much faster than calling GetAnalysisFunctionsContainingAddress() repeatedly.
+ */
+class FunctionRangeCache
+{
+public:
+	struct Range
+	{
+		uint64_t start;
+		uint64_t end;  // Exclusive
+
+		bool operator<(const Range& other) const
+		{
+			return start < other.start;
+		}
+	};
+
+	FunctionRangeCache() = default;
+
+	/**
+	 * Build the cache from a BinaryView's function list.
+	 */
+	void Build(const BinaryNinja::Ref<BinaryNinja::BinaryView>& view)
+	{
+		m_ranges.clear();
+		if (!view || !view->GetObject())
+			return;
+
+		auto funcs = view->GetAnalysisFunctionList();
+		m_ranges.reserve(funcs.size());
+
+		for (const auto& func : funcs)
+		{
+			if (!func)
+				continue;
+			uint64_t start = func->GetStart();
+			uint64_t highest = func->GetHighestAddress();
+			// GetHighestAddress returns the address of the last instruction
+			// Add instruction size to get the exclusive end
+			BinaryNinja::Ref<BinaryNinja::Architecture> arch = func->GetArchitecture();
+			size_t instrSize = arch ? arch->GetDefaultIntegerSize() : 4;
+			uint64_t end = (highest >= start) ? (highest + instrSize) : (start + instrSize);
+			m_ranges.push_back({start, end});
+		}
+
+		// Sort ranges by start address
+		std::sort(m_ranges.begin(), m_ranges.end());
+
+		// Merge overlapping ranges
+		if (m_ranges.size() > 1)
+		{
+			std::vector<Range> merged;
+			merged.reserve(m_ranges.size());
+			merged.push_back(m_ranges[0]);
+
+			for (size_t i = 1; i < m_ranges.size(); i++)
+			{
+				Range& last = merged.back();
+				const Range& curr = m_ranges[i];
+
+				if (curr.start <= last.end)
+				{
+					// Overlapping or adjacent - merge
+					if (curr.end > last.end)
+						last.end = curr.end;
+				}
+				else
+				{
+					merged.push_back(curr);
+				}
+			}
+
+			m_ranges = std::move(merged);
+		}
+	}
+
+	/**
+	 * Check if an address is inside any cached function range.
+	 * O(log n) complexity.
+	 */
+	bool Contains(uint64_t addr) const
+	{
+		if (m_ranges.empty())
+			return false;
+
+		// Binary search for the range that might contain addr
+		// Find the first range with start > addr, then check the previous range
+		Range searchKey{addr, addr};
+		auto it = std::upper_bound(m_ranges.begin(), m_ranges.end(), searchKey);
+
+		if (it == m_ranges.begin())
+			return false;  // All ranges start after addr
+
+		--it;  // Now it points to the last range with start <= addr
+		return addr >= it->start && addr < it->end;
+	}
+
+	/**
+	 * Check if an address is the start of a function (not inside, but at start).
+	 * O(log n) complexity.
+	 */
+	bool IsStart(uint64_t addr) const
+	{
+		if (m_ranges.empty())
+			return false;
+
+		Range searchKey{addr, addr};
+		auto it = std::lower_bound(m_ranges.begin(), m_ranges.end(), searchKey);
+		return it != m_ranges.end() && it->start == addr;
+	}
+
+	/**
+	 * Get the number of ranges (after merging).
+	 */
+	size_t Size() const { return m_ranges.size(); }
+
+	/**
+	 * Clear the cache.
+	 */
+	void Clear() { m_ranges.clear(); }
+
+private:
+	std::vector<Range> m_ranges;
+};
 
 /*
  * ============================================================================
@@ -189,8 +328,24 @@ struct FirmwareScanContext
 	/* Scan plan to populate with proposed changes */
 	FirmwareScanPlan* plan;
 
+	/* Cached function ranges for fast containment queries */
+	const FunctionRangeCache* functionRangeCache;
+
 	/* Helper: compute end address of the firmware image */
 	uint64_t ImageEnd() const { return imageBase + length; }
+
+	/**
+	 * Check if an address is inside an existing function.
+	 * Uses the cache if available, falls back to view query otherwise.
+	 */
+	bool IsInsideFunction(uint64_t addr) const
+	{
+		if (functionRangeCache)
+			return functionRangeCache->Contains(addr);
+		if (!view || !view->GetObject())
+			return false;
+		return !view->GetAnalysisFunctionsContainingAddress(addr).empty();
+	}
 };
 
 /*

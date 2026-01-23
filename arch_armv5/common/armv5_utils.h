@@ -29,6 +29,7 @@
 
 #include "binaryninjaapi.h"
 #include "armv5_disasm/armv5.h"
+#include "analysis/string_detector.h"
 
 namespace armv5 {
 
@@ -187,6 +188,23 @@ namespace armv5 {
 	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
 		return false;
 
+	/*
+	 * Check 7b: Must not be inside a string detected by Binary Ninja.
+	 *
+	 * BN's string analysis may have found strings at this address but not
+	 * yet typed them as data variables. We check GetStringAtAddress() directly
+	 * to catch these cases and prevent creating functions inside string data.
+	 */
+	BNStringReference strRef;
+	if (view->GetStringAtAddress(checkAddr, strRef) && strRef.length > 0)
+	{
+		if (logger && label)
+			logger->LogDebug("%s: address 0x%llx is inside string at 0x%llx (len=%zu)",
+				label, (unsigned long long)checkAddr, (unsigned long long)strRef.start,
+				strRef.length);
+		return false;
+	}
+
 	/* Check 8: If we have segments, must be executable */
 	if (enforceExecutable && !view->IsOffsetExecutable(checkAddr))
 		return false;
@@ -207,6 +225,28 @@ namespace armv5 {
 		return false;
 
 	const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+
+	/*
+	 * Check 9b: Reject addresses that look like null-terminated ASCII string data.
+	 *
+	 * String regions often decode as valid but nonsensical ARM instructions
+	 * (e.g., "syst" = 0x73797374 = ldrbvc r7, [r3], #-0x973).
+	 * Uses the centralized StringDetector logic for consistency.
+	 */
+	{
+		constexpr size_t kMaxStringSearch = 256;
+		DataBuffer strBuf = view->ReadBuffer(checkAddr, kMaxStringSearch);
+		// Use permissive settings: minLen=2, minRatio=70% to catch more string patterns
+		if (Armv5Analysis::StringDetector::LooksLikeNullTerminatedString(
+				static_cast<const uint8_t*>(strBuf.GetData()), strBuf.GetLength(), 2, 0.70))
+		{
+			if (logger && label)
+				logger->LogDebug("%s: address 0x%llx looks like null-terminated string",
+					label, (unsigned long long)checkAddr);
+			return false;
+		}
+	}
+
 	size_t offset = 0;
 	size_t validCount = 0;
 	
