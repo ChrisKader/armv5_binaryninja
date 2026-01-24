@@ -409,7 +409,7 @@ static bool ValidateFirmwareFunctionCandidate(const Ref<BinaryView>& view, const
 	// and undefined/unpredictable filtering the core uses when accepting code.
 	Ref<Architecture> arch = view->GetDefaultArchitecture();
 	if (!arch)
-		arch = Architecture::GetByName("armv5");
+		arch = Architecture::GetByName("arm");
 	if (!arch)
 		return false;
 

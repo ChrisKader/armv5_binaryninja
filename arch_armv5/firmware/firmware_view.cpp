@@ -484,11 +484,62 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 	// Only process ARMv5 Firmware views
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
-	// Finalization is an analysis event, not a teardown signal. Avoid mutating
-	// lifetime state here; destruction callbacks and the view destructor handle cleanup.
+
 	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
 	if (logger)
 		logger->LogInfo("OnFirmwareViewFinalization: analysis finalization event");
+
+	// Final cleanup pass: Remove any functions that ended up inside data variables
+	// This catches functions that BN created during analysis that our notification
+	// handler flagged for removal but couldn't remove during active analysis.
+	{
+		std::vector<Ref<Function>> toRemove;
+		auto functions = view->GetAnalysisFunctionList();
+
+		for (const auto& func : functions)
+		{
+			if (!func)
+				continue;
+
+			uint64_t funcAddr = func->GetStart();
+
+			// Check if function is inside a data variable
+			DataVariable dataVar;
+			if (view->GetDataVariableAtAddress(funcAddr, dataVar))
+			{
+				uint64_t dataEnd = dataVar.address;
+				if (dataVar.type.GetValue())
+					dataEnd = dataVar.address + dataVar.type.GetValue()->GetWidth();
+
+				if (funcAddr >= dataVar.address && funcAddr < dataEnd)
+				{
+					toRemove.push_back(func);
+					continue;
+				}
+			}
+
+			// Check if function is inside a BN-detected string
+			BNStringReference strRef;
+			if (view->GetStringAtAddress(funcAddr, strRef) && strRef.length > 0)
+			{
+				toRemove.push_back(func);
+			}
+		}
+
+		if (!toRemove.empty())
+		{
+			if (logger)
+				logger->LogInfo("Firmware finalization: removing %zu functions inside data/strings", toRemove.size());
+
+			for (const auto& func : toRemove)
+			{
+				if (logger)
+					logger->LogDebug("Firmware finalization: removing function at 0x%llx",
+						(unsigned long long)func->GetStart());
+				view->RemoveAnalysisFunction(func, false);
+			}
+		}
+	}
 
 	InstanceId instanceId = GetInstanceIdFromView(view);
 	if (instanceId == 0)
@@ -780,9 +831,9 @@ bool Armv5FirmwareView::Init()
 	}
 	else
 	{
-		// Default to ARMv5 platform
-		m_plat = Platform::GetByName("armv5");
-		m_arch = Architecture::GetByName("armv5");
+		// Default to ARM platform (architecture named "arm" for Firmware Ninja compatibility)
+		m_plat = Platform::GetByName("arm");
+		m_arch = Architecture::GetByName("arm");
 	}
 
 	if (!m_arch)

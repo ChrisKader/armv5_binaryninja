@@ -238,6 +238,27 @@ private:
 
 	// Logger
 	BinaryNinja::Ref<BinaryNinja::Logger> m_logger;
+
+	// Interval index for O(log n) range queries
+	// Each interval is (start, end) sorted by start address
+	struct Interval
+	{
+		uint64_t start;
+		uint64_t end;
+		bool operator<(const Interval& other) const { return start < other.start; }
+	};
+	mutable std::vector<Interval> m_functionIntervals;
+	mutable bool m_intervalsBuilt = false;
+
+	/**
+	 * Build or rebuild the interval index for efficient range queries
+	 */
+	void buildIntervalIndex() const;
+
+	/**
+	 * Check if address is inside any interval using binary search (O(log n))
+	 */
+	bool isInsideInterval(uint64_t address) const;
 };
 
 }  // namespace Armv5Analysis

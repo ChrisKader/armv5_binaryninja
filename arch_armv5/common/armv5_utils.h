@@ -183,10 +183,44 @@ namespace armv5 {
 	if (enforceCodeSemantics && !view->IsOffsetCodeSemantics(checkAddr))
 		return false;
 
-	/* Check 7: Must not conflict with existing data variable */
+	/* Check 7: Must not be inside an existing data variable */
 	DataVariable dataVar;
-	if (view->GetDataVariableAtAddress(checkAddr, dataVar) && (dataVar.address == checkAddr))
-		return false;
+	bool foundDataVar = view->GetDataVariableAtAddress(checkAddr, dataVar);
+
+	// Debug: log for addresses in our problem region
+	const bool debugDataVar = (checkAddr >= 0x10b46c00 && checkAddr <= 0x10b50000);
+	if (debugDataVar && logger)
+		logger->LogDebug("%s: GetDataVariableAtAddress(0x%llx) returned %s, dataVar.address=0x%llx",
+			label ? label : "IsValidFunctionStart",
+			(unsigned long long)checkAddr,
+			foundDataVar ? "true" : "false",
+			(unsigned long long)dataVar.address);
+
+	if (foundDataVar)
+	{
+		// GetDataVariableAtAddress returns the data variable containing the address,
+		// not just one starting at the address. Check if checkAddr is inside its range.
+		uint64_t dataEnd = dataVar.address;
+		if (dataVar.type.GetValue())
+			dataEnd = dataVar.address + dataVar.type.GetValue()->GetWidth();
+
+		if (debugDataVar && logger)
+			logger->LogDebug("%s: dataVar range 0x%llx - 0x%llx, checkAddr=0x%llx, inside=%s",
+				label ? label : "IsValidFunctionStart",
+				(unsigned long long)dataVar.address,
+				(unsigned long long)dataEnd,
+				(unsigned long long)checkAddr,
+				(checkAddr >= dataVar.address && checkAddr < dataEnd) ? "YES" : "NO");
+
+		if (checkAddr >= dataVar.address && checkAddr < dataEnd)
+		{
+			if (logger && label)
+				logger->LogDebug("%s: address 0x%llx is inside data variable at 0x%llx (size=%llu)",
+					label, (unsigned long long)checkAddr, (unsigned long long)dataVar.address,
+					(unsigned long long)(dataEnd - dataVar.address));
+			return false;
+		}
+	}
 
 	/*
 	 * Check 7b: Must not be inside a string detected by Binary Ninja.

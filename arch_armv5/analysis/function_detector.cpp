@@ -81,6 +81,30 @@ FunctionDetector::FunctionDetector(Ref<BinaryView> view)
 	m_logger = LogRegistry::CreateLogger("FunctionDetector");
 }
 
+void FunctionDetector::SetProgressCallback(ProgressCallback callback)
+{
+	m_progressCallback = std::move(callback);
+	m_cancellationRequested = false;
+}
+
+bool FunctionDetector::IsCancellationRequested() const
+{
+	return m_cancellationRequested;
+}
+
+bool FunctionDetector::ReportProgress(size_t phase, size_t totalPhases, const std::string& phaseName)
+{
+	if (m_progressCallback)
+	{
+		if (!m_progressCallback(phase, totalPhases, phaseName))
+		{
+			m_cancellationRequested = true;
+			return false;
+		}
+	}
+	return !m_cancellationRequested;
+}
+
 FunctionDetectionSettings FunctionDetector::DefaultSettings()
 {
 	return FunctionDetectionSettings();
@@ -108,9 +132,11 @@ FunctionDetectionSettings FunctionDetector::AggressiveSettings()
 	s.unlikelyPatternPenalty = 0.3;
 	
 	// Enable new detection methods with balanced weights
-	s.useLinearSweep = true;
-	s.linearSweepWeight = 2.5;  // Higher weight so linear sweep candidates can pass threshold
-	s.linearSweepMinConfidence = 0.3;  // Lower confidence threshold for more candidates
+	// Our linear sweep is disabled - BN's built-in is faster and incremental
+	// Our notification handler filters bad functions in real-time
+	s.useLinearSweep = false;
+	s.linearSweepWeight = 2.5;  // Weight if manually enabled
+	s.linearSweepMinConfidence = 0.3;  // Threshold if manually enabled
 	s.useSwitchResolution = true;
 	s.switchTargetWeight = 1.5;
 	s.useTailCallAnalysis = true;
@@ -709,7 +735,7 @@ void FunctionDetector::ScanCrossReferences(std::map<uint64_t, FunctionCandidate>
 	m_logger->LogDebug("FunctionDetector: Scanning cross-references...");
 	
 	// Find addresses with many incoming references
-	for (const auto& func : m_view->GetAnalysisFunctionList())
+	for (const auto& func : m_cachedFunctionList)
 	{
 		size_t xrefs = CountIncomingReferences(func->GetStart());
 		if (xrefs >= 3)  // High xref threshold
@@ -1195,7 +1221,7 @@ void FunctionDetector::ScanRtosPatterns(std::map<uint64_t, FunctionCandidate>& c
 	m_logger->LogDebug("FunctionDetector: Scanning RTOS patterns...");
 	
 	// Look for task entry points by calling convention
-	for (const auto& func : m_view->GetAnalysisFunctionList())
+	for (const auto& func : m_cachedFunctionList)
 	{
 		auto cc = func->GetCallingConvention();
 		if (cc.GetValue() && cc.GetValue()->GetName() == "task-entry")
@@ -1342,7 +1368,7 @@ void FunctionDetector::ScanTailCallTargets(std::map<uint64_t, FunctionCandidate>
 
 	std::set<uint64_t> tailCallTargets;
 
-	for (const auto& func : m_view->GetAnalysisFunctionList())
+	for (const auto& func : m_cachedFunctionList)
 	{
 		uint64_t funcStart = func->GetStart();
 		auto arch = func->GetArchitecture();
@@ -1763,8 +1789,8 @@ DetectedCompiler FunctionDetector::DetectCompilerStyle()
 	// Count patterns to determine compiler
 	size_t gccPatterns = 0;
 	size_t armccPatterns = 0;
-	
-	for (const auto& func : m_view->GetAnalysisFunctionList())
+
+	for (const auto& func : m_cachedFunctionList)
 	{
 		uint64_t addr = func->GetStart();
 		uint32_t instr = ReadInstruction32(addr);
@@ -1811,10 +1837,13 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	m_stats.sourceContributions.clear();
 	
 	m_logger->LogInfo("FunctionDetector: Starting detection...");
-	
-	// Cache existing functions
+
+	// Cache the function list once - calling GetAnalysisFunctionList() is expensive
+	m_cachedFunctionList = m_view->GetAnalysisFunctionList();
+
+	// Cache existing function addresses for O(1) lookup
 	m_existingFunctions.clear();
-	for (const auto& func : m_view->GetAnalysisFunctionList())
+	for (const auto& func : m_cachedFunctionList)
 	{
 		m_existingFunctions.insert(func->GetStart());
 	}
@@ -1823,22 +1852,68 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	EstimateCodeBoundary();
 	m_stats.existingFunctions = m_existingFunctions.size();
 	
-	// Collect candidates from all detectors
+	// Collect candidates from all detectors (14 phases total)
 	std::map<uint64_t, FunctionCandidate> candidates;
-	
+	constexpr size_t kTotalPhases = 14;
+	size_t currentPhase = 0;
+
+	// Reset cancellation state
+	m_cancellationRequested = false;
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning prologue patterns"))
+		return {};
 	ScanProloguePatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning call targets"))
+		return {};
 	ScanCallTargets(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning cross-references"))
+		return {};
 	ScanCrossReferences(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning structural patterns"))
+		return {};
 	ScanStructuralPatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning exception handlers"))
+		return {};
 	ScanExceptionHandlers(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning advanced patterns"))
+		return {};
 	ScanAdvancedPatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning compiler patterns"))
+		return {};
 	ScanCompilerPatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning RTOS patterns"))
+		return {};
 	ScanRtosPatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning statistical patterns"))
+		return {};
 	ScanStatisticalPatterns(candidates);
-	ScanSwitchTargets(candidates);  // Switch table resolution
-	ScanTailCallTargets(candidates);  // Stack-based tail call detection
-	ScanLinearSweep(candidates);    // Nucleus-style basic block grouping
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Resolving switch tables"))
+		return {};
+	ScanSwitchTargets(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Analyzing tail calls"))
+		return {};
+	ScanTailCallTargets(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Running linear sweep"))
+		return {};
+	ScanLinearSweep(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Applying negative patterns"))
+		return {};
 	ApplyNegativePatterns(candidates);
+
+	if (!ReportProgress(++currentPhase, kTotalPhases, "Scoring candidates"))
+		return {};
 	
 	// Estimate code boundary using multiple heuristics
 	// The key insight: data decoded as BL gives false targets, so we need to validate

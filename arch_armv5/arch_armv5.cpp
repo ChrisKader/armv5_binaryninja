@@ -197,8 +197,11 @@ extern "C"
     /* Step 1: Initialize plugin settings (before other registrations) */
     Armv5Settings::InitPluginSettings();
 
-    /* Step 2: Register ARM and Thumb architectures (little-endian) */
-    RegisterArmv5Architecture("armv5", "armv5t", LittleEndian);
+    /* Step 2: Register ARM and Thumb architectures (little-endian)
+     * Architecture names are "arm"/"thumb" for Firmware Ninja compatibility.
+     * Platform name remains "armv5" for user clarity.
+     */
+    RegisterArmv5Architecture("arm", "thumb", LittleEndian);
 
     /* Step 3: Register custom BinaryViewType for firmware analysis */
     InitArmv5FirmwareViewType();

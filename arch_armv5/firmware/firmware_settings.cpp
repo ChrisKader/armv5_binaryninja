@@ -123,15 +123,16 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.enableClearAutoDataOnCodeRefs = true;
 	settings.enableVerboseLogging = false;
 	settings.enableInvalidFunctionCleanup = true;
-	// Disable BN's generic pointer sweep for firmware - our ARM-specific scan is more conservative
-	// and avoids false positives from data that looks like pointers
+	// Disable BN's generic pointer sweep for firmware - causes false positives
 	settings.disablePointerSweep = true;
-	// Disable BN's linear sweep - function discovery is entirely handled by our ARM-specific scans
-	// (prologues, call targets, pointer tables, orphan code). BN still handles function analysis
-	// (IL lifting, type propagation, etc.) for the functions we discover.
+	// Disable ALL linear sweep (both BN's and ours) - too slow on large firmware.
+	// Function discovery relies entirely on targeted methods:
+	// - Vector table entry points (seeded during Init)
+	// - Prologue detection (PUSH {r4-r7,lr}, STMFD, etc.)
+	// - Call target detection (BL/BLX targets)
+	// - Pointer table detection
+	// This is much faster and produces fewer false positives.
 	settings.disableLinearSweep = true;
-	// Partial linear sweep is disabled by default since we're handling function discovery ourselves
-	// Users can enable this if they want BN's linear sweep as a supplement to our scans
 	settings.enablePartialLinearSweep = false;
 	settings.skipFirmwareScans = false;
 	settings.cleanupMaxSizeBytes = 0;        // 0 = no size limit, clean any invalid function

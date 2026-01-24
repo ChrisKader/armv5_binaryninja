@@ -109,7 +109,7 @@ bool IsArmv5View(BinaryView* view)
 		return false;
 
 	std::string archName = arch->GetName();
-	return archName == "armv5" || archName == "armv5t";
+	return archName == "arm" || archName == "thumb";
 }
 
 /*
@@ -587,12 +587,12 @@ static void RunPrologueScan(BinaryView* view)
 			if (armArch)
 			{
 				std::string archName = armArch->GetName();
-				if (archName == "armv5")
-					thumbArch = Architecture::GetByName("armv5t");
-				else if (archName == "armv5t")
+				if (archName == "arm")
+					thumbArch = Architecture::GetByName("thumb");
+				else if (archName == "thumb")
 				{
 					thumbArch = armArch;
-					armArch = Architecture::GetByName("armv5");
+					armArch = Architecture::GetByName("arm");
 				}
 			}
 

@@ -116,10 +116,13 @@ void LinearSweepAnalyzer::scanRegions()
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
 
+	// Cache function list once - expensive to fetch repeatedly
+	auto functionList = m_view->GetAnalysisFunctionList();
+
 	// Build known function ranges if skipping
 	if (m_settings.skipKnownFunctions)
 	{
-		for (auto& func : m_view->GetAnalysisFunctionList())
+		for (auto& func : functionList)
 		{
 			uint64_t funcStart = func->GetStart();
 			// Mark a range around the function start
@@ -143,7 +146,7 @@ void LinearSweepAnalyzer::scanRegions()
 	{
 		// Check existing functions for predominant mode
 		int armCount = 0, thumbCount = 0;
-		for (auto& func : m_view->GetAnalysisFunctionList())
+		for (auto& func : functionList)
 		{
 			auto arch = func->GetArchitecture();
 			if (arch)

@@ -122,8 +122,15 @@ RecognitionResult FunctionRecognizer::RunRecognition(const FunctionDetectionSett
 		m_logger->LogInfo("FunctionRecognizer: Starting detection...");
 		UpdateProgress(0, 100, "Starting function recognition...");
 
-		// Run the detector
+		// Run the detector with progress forwarding
 		m_detector->SetSettings(settings);
+		m_detector->SetProgressCallback([this](size_t phase, size_t total, const std::string& phaseName) {
+			// Map detector phases (1-14) to progress percentage (0-90%)
+			// Reserve last 10% for post-processing
+			size_t progress = (phase * 90) / total;
+			UpdateProgress(progress, 100, phaseName);
+			return !ShouldCancel();
+		});
 		result.candidates = m_detector->Detect();
 		result.stats = m_detector->GetStats();
 

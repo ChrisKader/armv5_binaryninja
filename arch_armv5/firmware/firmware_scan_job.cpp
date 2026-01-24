@@ -948,6 +948,17 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				default: recognizer->UseDefaultSettings(); break;
 				}
 
+				// Set progress callback to update task status
+				recognizer->SetProgressCallback([&task, instanceId](size_t current, size_t total, const std::string& status) -> bool {
+					if (task && !task->IsCancelled())
+					{
+						std::string msg = "ARMv5: " + status;
+						UpdateTaskText(task, instanceId, msg.c_str());
+						return true;
+					}
+					return false;  // Request cancellation if task is cancelled
+				});
+
 				// Run recognition
 				auto result = recognizer->RunRecognition();
 
@@ -1001,7 +1012,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			}
 			if (fwSettings.enablePrologueScan)
 			{
-				Ref<Architecture> thumbArch = Architecture::GetByName("armv5t");
+				Ref<Architecture> thumbArch = Architecture::GetByName("thumb");
 				timePass("Function prologue scan", [&]() {
 					ScanForFunctionPrologues(view, fileData, fileDataLen, view->GetDefaultEndianness(),
 						imageBase, length, view->GetDefaultArchitecture(), thumbArch, view->GetDefaultPlatform(),
@@ -1154,27 +1165,14 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			
 			if (logger)
 				logger->LogInfo("Cleanup invalid functions: removed %zu functions", removed);
-			
+
 			// Update function snapshot after cleanup
 			WaitForAnalysisIdle(instanceId, view, task, logger);
 			afterFunctions = SnapshotFunctionStarts(view);
 
-			// Run an additional cleanup pass to catch late-added functions.
-			// Core analysis can still add functions after the first cleanup.
-			for (int pass = 0; pass < 2; ++pass)
-			{
-				if (ScanCancelled(view))
-					break;
-				size_t removedPass = CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
-					fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
-					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, nullptr);
-				if (logger)
-					logger->LogInfo("Cleanup invalid functions: pass %d removed %zu functions", pass + 2, removedPass);
-				if (removedPass == 0)
-					break;
-				WaitForAnalysisIdle(instanceId, view, task, logger);
-			}
+			// Additional cleanup passes removed - the finalization event
+			// (OnFirmwareViewFinalization) handles late-added functions when
+			// analysis completes, so multiple passes here are unnecessary.
 		}
 		LogFunctionDiff(logger, beforeFunctions, afterFunctions, fwSettings.enableVerboseLogging);
 		StoreFirmwareFunctionSnapshot(instanceId, afterFunctions);
@@ -1267,309 +1265,9 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		}
 		*/
 
-		// Enhanced string detection using the StringDetector module
-		// This replaces the inline 700-line string detection code with a clean modular approach
-		if (!ScanCancelled(view))
-		{
-			UpdateTaskText(task, instanceId, "ARMv5 firmware scans: string detection");
-
-			// Use the existing StringDetector for advanced string detection
-			// Settings match the original inline code behavior
-			Armv5Analysis::StringDetectionSettings stringSettings;
-			stringSettings.minLength = 2;               // Match original: strLen >= 2
-			stringSettings.maxLength = 256;             // Match original: strLen <= 256
-			stringSettings.minPrintableRatio = 0.80;    // Match original initial scan
-			stringSettings.minAlphanumericRatio = 0.40; // Match original initial scan
-			stringSettings.minWordLength = 2;           // Match original: 2+ consecutive alphanumeric
-			stringSettings.requireNullTerminator = true;
-			stringSettings.rejectConsecutiveNonPrintable = true;  // NEW: reject 2+ consecutive non-printable
-			stringSettings.maxConsecutiveNonPrintable = 1;
-			stringSettings.detectAscii = true;
-			stringSettings.detectUtf8 = true;
-			stringSettings.detectUtf16 = true;
-			stringSettings.detectUtf16Patterns = true;  // NEW: detect alternating printable/null patterns
-			stringSettings.detectAnsiEscapes = true;    // NEW: allow ANSI escape sequences
-			stringSettings.searchDataSections = true;
-			stringSettings.searchCodeSections = true;   // Literal pools
-			stringSettings.skipExisting = true;
-			stringSettings.skipInsideFunctions = true;
-			stringSettings.categorizeStrings = true;
-			stringSettings.minConfidence = 0.5;
-			stringSettings.scanStringPointers = true;   // NEW: scan for pointers to strings
-			stringSettings.typeStringPointers = true;   // NEW: create char* data variables
-			stringSettings.validateNullTermination = true;
-
-			Armv5Analysis::StringDetector detector(view.GetPtr());
-			auto detectedStrings = detector.Detect(stringSettings);
-			const auto& stats = detector.GetStats();
-
-			if (logger)
-			{
-				logger->LogInfo("StringDetector: found %zu strings (%zu new, %zu unreferenced)",
-					stats.totalFound, stats.newStrings, stats.unreferenced);
-				if (stats.formatStrings > 0 || stats.interestingStrings > 0)
-					logger->LogInfo("StringDetector: %zu format strings, %zu interesting strings",
-						stats.formatStrings, stats.interestingStrings);
-				if (stats.ansiSequences > 0 || stats.utf16Patterns > 0)
-					logger->LogInfo("StringDetector: %zu ANSI sequences, %zu UTF-16 patterns",
-						stats.ansiSequences, stats.utf16Patterns);
-				if (stats.stringPointers > 0)
-					logger->LogInfo("StringDetector: %zu string pointers typed", stats.stringPointers);
-				if (stats.rejectedConsecutive > 0 || stats.rejectedNoWord > 0)
-					logger->LogDebug("StringDetector: rejected %zu consecutive, %zu no-word",
-						stats.rejectedConsecutive, stats.rejectedNoWord);
-			}
-
-			// Type the detected strings as data variables
-			size_t typed = 0;
-			for (const auto& str : detectedStrings)
-			{
-				if (ScanCancelled(view))
-					break;
-
-				// Create appropriate type based on encoding
-				Ref<Type> elementType;
-				size_t elementSize = 1;
-
-				switch (str.encoding)
-				{
-				case Armv5Analysis::StringEncoding::UTF16_LE:
-				case Armv5Analysis::StringEncoding::UTF16_BE:
-					elementType = Type::WideCharType(2);
-					elementSize = 2;
-					break;
-				case Armv5Analysis::StringEncoding::UTF32_LE:
-				case Armv5Analysis::StringEncoding::Wide:
-					elementType = Type::WideCharType(4);
-					elementSize = 4;
-					break;
-				default:  // ASCII, UTF8
-					elementType = Type::IntegerType(1, true);  // char
-					elementSize = 1;
-					break;
-				}
-
-				// Calculate array length (include null terminator)
-				size_t arrayLength = (str.length + elementSize - 1) / elementSize + 1;
-				Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
-
-				// Define the string as a user data variable
-				view->DefineUserDataVariable(str.address, stringType);
-				typed++;
-			}
-
-			if (logger && typed > 0)
-				logger->LogInfo("StringDetector: typed %zu string data variables", typed);
-
-			// Also validate and type BN's existing strings (like the original code did)
-			// This ensures consistent typing across all detected strings
-			auto bnStrings = view->GetStrings();
-			size_t bnTyped = 0;
-			size_t bnSkipped = 0;
-
-			for (const auto& str : bnStrings)
-			{
-				if (ScanCancelled(view))
-					break;
-
-				// Skip very short strings
-				if (str.length < 2)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				// Read string data for validation (need extra bytes for null terminator check)
-				size_t extraBytes = 4;  // Max for UTF-32 null terminator
-				DataBuffer buffer = view->ReadBuffer(str.start, str.length + extraBytes);
-				if (buffer.GetLength() <= str.length)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				const uint8_t* data = static_cast<const uint8_t*>(buffer.GetData());
-
-				// Verify null termination based on encoding
-				bool isNullTerminated = false;
-				size_t elementSize = 1;
-
-				if (str.type == Utf16String)
-				{
-					elementSize = 2;
-					// Check for UTF-16 null terminator (two zero bytes)
-					if (str.length >= 2 && buffer.GetLength() >= str.length + 2)
-					{
-						size_t nullPos = str.length;
-						isNullTerminated = (data[nullPos] == 0x00 && data[nullPos + 1] == 0x00);
-					}
-				}
-				else if (str.type == Utf32String)
-				{
-					elementSize = 4;
-					// Check for UTF-32 null terminator (four zero bytes)
-					if (str.length >= 4 && buffer.GetLength() >= str.length + 4)
-					{
-						size_t nullPos = str.length;
-						isNullTerminated = (data[nullPos] == 0x00 && data[nullPos + 1] == 0x00 &&
-						                   data[nullPos + 2] == 0x00 && data[nullPos + 3] == 0x00);
-					}
-				}
-				else
-				{
-					// ASCII/UTF-8 - single null byte
-					if (buffer.GetLength() > str.length)
-						isNullTerminated = (data[str.length] == 0x00);
-				}
-
-				// Skip strings that are not properly null-terminated
-				if (!isNullTerminated)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				// Count printable and alphanumeric characters based on encoding
-				// Be strict about what counts as "printable" to avoid garbage
-				size_t printable = 0;
-				size_t alphaNum = 0;
-				size_t totalChars = 0;
-
-				if (str.type == Utf16String)
-				{
-					for (size_t i = 0; i + 1 < str.length; i += 2)
-					{
-						uint16_t wc = data[i] | (data[i + 1] << 8);
-						if (wc == 0) break;
-						totalChars++;
-						// Only count ASCII range and Latin-1 Supplement as printable
-						if (wc >= 0x20 && wc <= 0x7E)
-						{
-							printable++;
-							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
-								alphaNum++;
-						}
-						else if (wc >= 0x00A0 && wc <= 0x00FF)
-						{
-							printable++;  // Latin-1 Supplement (accented chars)
-						}
-						// Reject Private Use Area (0xE000-0xF8FF) and other suspicious ranges
-					}
-				}
-				else if (str.type == Utf32String)
-				{
-					for (size_t i = 0; i + 3 < str.length; i += 4)
-					{
-						uint32_t wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
-						if (wc == 0) break;
-						totalChars++;
-						// Only count ASCII range and Latin-1 Supplement as printable
-						if (wc >= 0x20 && wc <= 0x7E)
-						{
-							printable++;
-							if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
-								alphaNum++;
-						}
-						else if (wc >= 0x00A0 && wc <= 0x00FF)
-						{
-							printable++;  // Latin-1 Supplement
-						}
-					}
-				}
-				else
-				{
-					// ASCII/UTF-8
-					for (size_t i = 0; i < str.length; i++)
-					{
-						uint8_t c = data[i];
-						if (c == 0) break;
-						totalChars++;
-						if (c >= 0x20 && c <= 0x7E)
-						{
-							printable++;
-							if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
-								alphaNum++;
-						}
-						// For UTF-8, only count valid continuation bytes
-						else if (c >= 0xC0 && c <= 0xFE && str.type == Utf8String)
-						{
-							printable++;  // UTF-8 multi-byte lead byte
-						}
-					}
-				}
-
-				if (totalChars == 0)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				// Lower thresholds for final validation (50%/20%) like original
-				double printableRatio = static_cast<double>(printable) / totalChars;
-				double alphaNumRatio = static_cast<double>(alphaNum) / totalChars;
-
-				if (printableRatio < 0.5 || alphaNumRatio < 0.2)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				// Check for word-like sequence (2+ consecutive alphanumeric)
-				bool hasWord = false;
-				size_t consecutiveAlphaNum = 0;
-				for (size_t i = 0; i < str.length && !hasWord; i += elementSize)
-				{
-					uint32_t wc = 0;
-					if (str.type == Utf16String && i + 1 < str.length)
-						wc = data[i] | (data[i + 1] << 8);
-					else if (str.type == Utf32String && i + 3 < str.length)
-						wc = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
-					else
-						wc = data[i];
-
-					if (wc == 0) break;
-					if ((wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z') || (wc >= '0' && wc <= '9'))
-					{
-						consecutiveAlphaNum++;
-						if (consecutiveAlphaNum >= 2) hasWord = true;
-					}
-					else
-					{
-						consecutiveAlphaNum = 0;
-					}
-				}
-
-				if (!hasWord)
-				{
-					bnSkipped++;
-					continue;
-				}
-
-				// Create typed data variable with appropriate element type
-				Ref<Type> elementType;
-				switch (str.type)
-				{
-				case Utf16String:
-					elementType = Type::WideCharType(2);
-					break;
-				case Utf32String:
-					elementType = Type::WideCharType(4);
-					break;
-				default:  // ASCII, UTF-8
-					elementType = Type::IntegerType(1, true);  // char
-					break;
-				}
-
-				size_t arrayLength = (str.length + elementSize - 1) / elementSize + 1;
-				Ref<Type> stringType = Type::ArrayType(elementType, arrayLength);
-
-				view->DefineUserDataVariable(str.start, stringType);
-				bnTyped++;
-			}
-
-			if (logger && (bnTyped > 0 || bnSkipped > 0))
-				logger->LogInfo("BN string validation: typed %zu, skipped %zu invalid", bnTyped, bnSkipped);
-		}
+		// String typing is handled by the workflow activity (analysis.armv5.typeStrings)
+		// which runs early in the pipeline BEFORE function discovery.
+		// Skip duplicate string typing here to avoid slow redundant work.
 
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");

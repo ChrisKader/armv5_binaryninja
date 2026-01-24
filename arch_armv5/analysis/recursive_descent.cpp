@@ -29,6 +29,7 @@ size_t RecursiveDescentAnalyzer::analyze(const RecursiveDescentSettings& setting
 	m_results.clear();
 	m_queued.clear();
 	m_stats = Stats{};
+	m_intervalsBuilt = false;  // Invalidate interval cache
 
 	// Clear work queue
 	while (!m_workQueue.empty())
@@ -296,7 +297,7 @@ void RecursiveDescentAnalyzer::analyzeEntryPoint(uint64_t address, bool isThumb)
 	else
 		m_stats.armFunctions++;
 
-	// Store result
+	// Store result (interval cache only contains BN functions, not m_results)
 	m_results[address] = std::move(func);
 }
 
@@ -422,42 +423,68 @@ double RecursiveDescentAnalyzer::calculateConfidence(const AnalyzedFunction& fun
 
 bool RecursiveDescentAnalyzer::isExecutable(uint64_t address) const
 {
-	for (auto& seg : m_view->GetSegments())
+	// Use BinaryNinja's optimized method instead of iterating segments
+	return m_view->IsOffsetExecutable(address);
+}
+
+void RecursiveDescentAnalyzer::buildIntervalIndex() const
+{
+	m_functionIntervals.clear();
+
+	// Only collect intervals from existing BN functions (built once at analysis start)
+	// Our own m_results are checked separately with a simple loop since they grow
+	// incrementally and rebuilding the index each time would be O(n²)
+	for (auto& func : m_view->GetAnalysisFunctionList())
 	{
-		if (address >= seg->GetStart() && address < seg->GetEnd())
+		for (auto& range : func->GetAddressRanges())
 		{
-			return (seg->GetFlags() & SegmentExecutable) != 0;
+			if (range.start < range.end)
+				m_functionIntervals.push_back({range.start, range.end});
 		}
 	}
+
+	// Sort by start address for binary search
+	std::sort(m_functionIntervals.begin(), m_functionIntervals.end());
+
+	m_intervalsBuilt = true;
+}
+
+bool RecursiveDescentAnalyzer::isInsideInterval(uint64_t address) const
+{
+	if (m_functionIntervals.empty())
+		return false;
+
+	// Binary search: find the first interval with start > address
+	auto it = std::upper_bound(m_functionIntervals.begin(), m_functionIntervals.end(),
+		Interval{address, 0});
+
+	// Check the interval before (if any) - it has the largest start <= address
+	if (it != m_functionIntervals.begin())
+	{
+		--it;
+		if (address >= it->start && address < it->end)
+			return true;
+	}
+
 	return false;
 }
 
 bool RecursiveDescentAnalyzer::isInsideKnownFunction(uint64_t address) const
 {
-	// TODO: Performance optimization - this is O(n) for each call.
-	// For large binaries with many functions, consider using an interval tree
-	// data structure for O(log n) range queries. This would require:
-	// 1. Building the interval tree once from m_results and BN functions
-	// 2. Invalidating/updating when new functions are discovered
-	// See: https://en.wikipedia.org/wiki/Interval_tree
+	// Build BN function interval index once (lazy initialization)
+	if (!m_intervalsBuilt)
+		buildIntervalIndex();
 
-	// Check against results
+	// O(log n) check against existing BN functions
+	if (isInsideInterval(address))
+		return true;
+
+	// O(k) check against our discovered results (k is small and grows incrementally)
+	// This avoids rebuilding the entire index every time we discover a function
 	for (const auto& [entryAddr, func] : m_results)
 	{
 		if (address > func.startAddress && address < func.endAddress)
 			return true;
-	}
-
-	// Check against existing BN functions
-	for (auto& func : m_view->GetAnalysisFunctionList())
-	{
-		uint64_t start = func->GetStart();
-		// Get function ranges
-		for (auto& range : func->GetAddressRanges())
-		{
-			if (address >= range.start && address < range.end)
-				return true;
-		}
 	}
 
 	return false;

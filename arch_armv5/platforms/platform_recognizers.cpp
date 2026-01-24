@@ -275,7 +275,7 @@ static Ref<Platform> ElfArmv5PlatformRecognize(BinaryView* view, Metadata* metad
       const char* archNames[] = {"Pre-v4", "ARMv4", "ARMv4T", "ARMv5T", "ARMv5TE", "ARMv5TEJ"};
       LogInfo("ELF .ARM.attributes Tag_CPU_arch=%d (%s): using armv5 architecture",
               cpuArch, archNames[cpuArch]);
-      return Platform::GetByName("armv5");
+      return Platform::GetByName("arm");
     }
 
     /* ARMv6+ detected, let ARMv7 handle it */
@@ -322,7 +322,7 @@ static Ref<Platform> ElfArmv5PlatformRecognize(BinaryView* view, Metadata* metad
   if (eabiVersion == EF_ARM_EABI_VER1 || eabiVersion == EF_ARM_EABI_VER2)
   {
     LogInfo("ELF e_flags 0x%08" PRIx64 " indicates early ARM EABI: using armv5 architecture", flags);
-    return Platform::GetByName("armv5");
+    return Platform::GetByName("arm");
   }
 
   return nullptr;
@@ -383,7 +383,7 @@ static Ref<Platform> RawArmv5PlatformRecognize(BinaryView* view, Metadata* metad
   if (armPatternCount >= 4)
   {
     LogInfo("Raw binary detected as ARM: vector table pattern found (%d/8 entries), claiming as armv5", armPatternCount);
-    return Platform::GetByName("armv5");
+    return Platform::GetByName("arm");
   }
 
   return nullptr;

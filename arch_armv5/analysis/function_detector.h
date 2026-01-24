@@ -195,8 +195,10 @@ struct FunctionDetectionSettings
 	size_t cfgMaxInstructions = 5000;       // Max instructions per candidate
 
 	// Linear sweep (Nucleus-style basic block grouping)
-	bool useLinearSweep = true;             // Enable linear sweep discovery
-	double linearSweepWeight = 1.8;         // Weight for linear sweep candidates
+	// DISABLED by default - BN's built-in linear sweep is faster and adds functions
+	// incrementally. Our notification handler filters out bad functions in real-time.
+	bool useLinearSweep = false;            // Disable our slow linear sweep
+	double linearSweepWeight = 1.8;         // Weight for linear sweep candidates (if enabled)
 	size_t linearSweepMaxBlocks = 50000;    // Max blocks for linear sweep
 	double linearSweepMinConfidence = 0.3;  // Min confidence from linear sweep
 
@@ -309,7 +311,26 @@ public:
 	 */
 	DetectedCompiler DetectCompilerStyle();
 
+	/**
+	 * Progress callback type
+	 * Parameters: (currentPhase, totalPhases, phaseName)
+	 * Returns false to request cancellation
+	 */
+	using ProgressCallback = std::function<bool(size_t, size_t, const std::string&)>;
+
+	/**
+	 * Set progress callback for long-running detection
+	 */
+	void SetProgressCallback(ProgressCallback callback);
+
+	/**
+	 * Check if cancellation has been requested
+	 */
+	bool IsCancellationRequested() const;
+
 private:
+	// Progress reporting helper
+	bool ReportProgress(size_t phase, size_t totalPhases, const std::string& phaseName);
 	// Individual detector methods
 	void ScanProloguePatterns(std::map<uint64_t, FunctionCandidate>& candidates);
 	void ScanCallTargets(std::map<uint64_t, FunctionCandidate>& candidates);
@@ -353,10 +374,17 @@ private:
 	std::set<uint64_t> m_existingFunctions;
 	std::set<uint64_t> m_callTargets;
 	std::map<uint64_t, size_t> m_xrefCounts;
+
+	// Cached function list (expensive to fetch repeatedly)
+	std::vector<BinaryNinja::Ref<BinaryNinja::Function>> m_cachedFunctionList;
 	
 	// Code region boundary estimation
 	uint64_t m_estimatedCodeEnd = 0;
 	void EstimateCodeBoundary();
+
+	// Progress callback
+	ProgressCallback m_progressCallback;
+	bool m_cancellationRequested = false;
 };
 
 /**
