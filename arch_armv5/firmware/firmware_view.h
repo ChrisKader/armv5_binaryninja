@@ -84,4 +84,10 @@ namespace BinaryNinja
 	void StoreFirmwareFunctionSnapshot(uint64_t instanceId, const std::unordered_set<uint64_t>& snapshot);
 	std::unordered_set<uint64_t> LoadFirmwareFunctionSnapshot(uint64_t instanceId);
 	void ClearFirmwareFunctionSnapshot(uint64_t instanceId);
+
+	// Removed-functions blacklist: prevents BN's call-following from re-creating
+	// functions that cleanup already removed. Scoped per firmware view instance.
+	void AddRemovedFunctionAddress(uint64_t instanceId, uint64_t addr);
+	bool IsRemovedFunctionAddress(uint64_t instanceId, uint64_t addr);
+	void ClearRemovedFunctions(uint64_t instanceId);
 }

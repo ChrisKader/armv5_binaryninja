@@ -5,6 +5,7 @@
  */
 
 #include "linear_sweep.h"
+#include "code_data_classifier.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,7 +24,7 @@ LinearSweepAnalyzer::LinearSweepAnalyzer(Ref<BinaryView> view)
 	: m_view(view)
 	, m_settings(DefaultSettings())
 {
-	m_logger = LogRegistry::CreateLogger("LinearSweepAnalyzer");
+	m_logger = LogRegistry::CreateLogger("ARMv5.LinearSweep");
 }
 
 LinearSweepSettings LinearSweepAnalyzer::DefaultSettings()
@@ -752,9 +753,14 @@ void LinearSweepAnalyzer::propagateGroup(LinearBlock* startBlock, int groupId)
 			uint64_t target = block->successors[0];
 			int64_t distance = static_cast<int64_t>(target) - static_cast<int64_t>(block->start);
 
+			// Compute threshold: adaptive (segment-aware) or fixed
+			int64_t threshold = m_settings.useAdaptiveThresholds
+				? computeAdaptiveThreshold(block->start)
+				: m_settings.tailCallDistanceThreshold;
+
 			// If branch is within threshold, treat as intraprocedural
 			if (!m_settings.treatUnconditionalBranchAsInterprocedural ||
-			    std::abs(distance) <= m_settings.tailCallDistanceThreshold)
+			    std::abs(distance) <= threshold)
 			{
 				auto it = m_blocks.find(target);
 				if (it != m_blocks.end() && it->second->groupId < 0)
@@ -867,10 +873,38 @@ std::vector<LinearFunction> LinearSweepAnalyzer::extractFunctions()
 		if (func.blockCount < m_settings.minimumBlocksPerFunction)
 			continue;
 
-		// For single-block functions, require either a return or a call
-		// Multi-block functions have structural evidence of being functions
-		if (m_settings.requireReturnOrCall && func.blockCount == 1 && !func.hasReturn && !func.hasCall)
-			continue;
+		// For single-block functions without return or call:
+		// - If leaf detection is enabled, check for supplementary evidence
+		// - Otherwise, reject them outright
+		if (func.blockCount == 1 && !func.hasReturn && !func.hasCall)
+		{
+			if (m_settings.detectLeafFunctions)
+			{
+				bool hasLeafEvidence = false;
+
+				// Aligned entry + non-trivial instruction count is evidence
+				bool isAligned = !func.isThumb
+					? (func.entryPoint % 4 == 0)
+					: (func.entryPoint % 2 == 0);
+				if (isAligned && func.instructionCount >= 3)
+					hasLeafEvidence = true;
+
+				// Being called by another function is strong evidence
+				if (func.isReferencedByCall)
+					hasLeafEvidence = true;
+
+				if (!hasLeafEvidence)
+					continue;
+
+				// Apply stricter confidence threshold for leaf functions
+				if (func.confidence < m_settings.leafFunctionMinConfidence)
+					continue;
+			}
+			else if (m_settings.requireReturnOrCall)
+			{
+				continue;
+			}
+		}
 
 		functions.push_back(std::move(func));
 	}
@@ -911,7 +945,78 @@ double LinearSweepAnalyzer::calculateConfidence(const LinearFunction& func)
 	if (func.instructionCount >= 20)
 		score += 0.1;
 
+	// Leaf function bonus: single-block, no return/call, but aligned + called
+	if (!func.hasMultipleBlocks && !func.hasReturn && !func.hasCall)
+	{
+		bool isAligned = !func.isThumb
+			? (func.entryPoint % 4 == 0)
+			: (func.entryPoint % 2 == 0);
+		if (isAligned && func.isReferencedByCall)
+			score += 0.15;
+	}
+
 	return std::min(1.0, score);
+}
+
+// ============================================================================
+// Adaptive Threshold
+// ============================================================================
+
+int64_t LinearSweepAnalyzer::computeAdaptiveThreshold(uint64_t address) const
+{
+	int64_t bestDistance = m_settings.tailCallDistanceThreshold;
+
+	// Check segments: distance to nearest segment boundary
+	auto segments = m_view->GetSegments();
+	if (!segments.empty())
+	{
+		for (const auto& seg : segments)
+		{
+			if (!(seg->GetFlags() & SegmentExecutable))
+				continue;
+
+			uint64_t segStart = seg->GetStart();
+			uint64_t segEnd = segStart + seg->GetLength();
+
+			if (address >= segStart && address < segEnd)
+			{
+				// Inside this executable segment — threshold is distance to its boundary
+				int64_t toEnd = static_cast<int64_t>(segEnd - address);
+				int64_t toStart = static_cast<int64_t>(address - segStart);
+				int64_t minEdge = std::min(toEnd, toStart);
+
+				// Use the smaller of segment-derived and default, but at least 0x200
+				bestDistance = std::max(static_cast<int64_t>(0x200), std::min(bestDistance, minEdge));
+				break;
+			}
+		}
+		return bestDistance;
+	}
+
+	// Check sections as fallback
+	auto sections = m_view->GetSections();
+	if (!sections.empty())
+	{
+		for (const auto& sec : sections)
+		{
+			uint64_t secStart = sec->GetStart();
+			uint64_t secEnd = secStart + sec->GetLength();
+
+			if (address >= secStart && address < secEnd)
+			{
+				if (m_view->IsOffsetCodeSemantics(secStart))
+				{
+					int64_t toEnd = static_cast<int64_t>(secEnd - address);
+					bestDistance = std::max(static_cast<int64_t>(0x200), std::min(bestDistance, toEnd));
+				}
+				break;
+			}
+		}
+		return bestDistance;
+	}
+
+	// No segments or sections: raw binary, keep the fixed default
+	return bestDistance;
 }
 
 // ============================================================================
@@ -939,39 +1044,7 @@ bool LinearSweepAnalyzer::isInsideKnownFunction(uint64_t addr)
 
 bool LinearSweepAnalyzer::isDataRegion(uint64_t addr)
 {
-	// Check if explicitly marked as data
-	DataVariable var;
-	if (m_view->GetDataVariableAtAddress(addr, var))
-		return true;
-
-	// Check section semantics
-	if (!m_view->GetSections().empty() && !m_view->IsOffsetCodeSemantics(addr))
-		return true;
-	
-	// For raw firmware without sections, use heuristics to detect data
-	if (m_view->GetSections().empty())
-	{
-		// Check if this looks like ASCII string data
-		DataBuffer buf = m_view->ReadBuffer(addr, 16);
-		if (buf.GetLength() >= 16)
-		{
-			const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-			int printableCount = 0;
-			bool hasNull = false;
-			for (size_t i = 0; i < 16; i++)
-			{
-				if (bytes[i] == 0)
-					hasNull = true;
-				else if ((bytes[i] >= 0x20 && bytes[i] < 0x7F) || bytes[i] == '\n' || bytes[i] == '\r' || bytes[i] == '\t')
-					printableCount++;
-			}
-			// If mostly printable ASCII with at least one null, likely a string region
-			if (printableCount >= 10 && hasNull)
-				return true;
-		}
-	}
-
-	return false;
+	return CodeDataClassifier::IsDataRegion(m_view, addr);
 }
 
 uint32_t LinearSweepAnalyzer::readInstruction32(uint64_t addr)

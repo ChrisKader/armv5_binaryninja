@@ -15,7 +15,7 @@ namespace Armv5Analysis
 RecursiveDescentAnalyzer::RecursiveDescentAnalyzer(Ref<BinaryView> view)
 	: m_view(view)
 {
-	m_logger = LogRegistry::CreateLogger("RecursiveDescentAnalyzer");
+	m_logger = LogRegistry::CreateLogger("ARMv5.RecursiveDescent");
 }
 
 size_t RecursiveDescentAnalyzer::analyze()
@@ -400,9 +400,13 @@ double RecursiveDescentAnalyzer::calculateConfidence(const AnalyzedFunction& fun
 		}
 	}
 
-	// Leaf functions are common
+	// Leaf functions are common; extra bonus if 4-byte aligned
 	if (func.isLeaf && func.hasReturn)
+	{
 		score += 0.1;
+		if ((func.entryPoint & 3) == 0)
+			score += 0.05;
+	}
 
 	// Tail calls are legitimate
 	if (func.hasTailCall)

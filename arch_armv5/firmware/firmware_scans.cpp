@@ -523,8 +523,10 @@ static bool ValidateFirmwareFunctionCandidate(const Ref<BinaryView>& view, const
 }
 
 static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* data, uint64_t dataLen,
-	BNEndianness endian, uint64_t imageBase, const Ref<Function>& func, uint64_t* invalidAddr = nullptr)
+	BNEndianness endian, uint64_t imageBase, const Ref<Function>& func, uint64_t* invalidAddr = nullptr,
+	const char** failReason = nullptr)
 {
+	if (failReason) *failReason = nullptr;
 	if (!view || !view->GetObject() || !func)
 		return false;
 	if (invalidAddr)
@@ -539,8 +541,11 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 	const uint64_t highest = func->GetHighestAddress();
 	const uint64_t end = (highest >= start) ? (highest + arch->GetDefaultIntegerSize()) : start;
 	if (end <= start)
+	{
+		if (failReason) *failReason = "end <= start";
 		return false;
-	
+	}
+
 	// Quick checks for data-as-code patterns
 	const uint64_t startOffset = start - imageBase;
 	if (startOffset + 32 <= dataLen)
@@ -590,97 +595,58 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 		
 		// If 3+ of first 8 instructions have EQ condition -> data
 		if (eqCount >= 3)
+		{
+			if (failReason) *failReason = "3+ EQ-condition in first 8";
 			return false;
-		
+		}
+
 		// If 5+ have low conditions (0-3) -> likely data
 		if (lowCondCount >= 5)
+		{
+			if (failReason) *failReason = "5+ low-condition (0-3) in first 8";
 			return false;
-		
+		}
+
 		// If no branches/calls in first 8 AND high data pattern score -> data
 		if (branchOrCallCount == 0 && dataPatternScore >= 4)
+		{
+			if (failReason) *failReason = "no branches + 4+ data patterns in first 8";
 			return false;
+		}
 	}
 
-	// Strict validation: all instructions in basic blocks must decode.
-	// This ensures we do not keep functions that contain invalid instructions.
+	// Single-pass validation: decode each instruction once, collecting both
+	// strict validity (all BB instructions must decode) and statistical metrics
+	// (valid/invalid ratio, EQ-condition heuristic) in one traversal.
 	const size_t align = arch->GetInstructionAlignment();
 	const size_t maxLen = arch->GetMaxInstructionLength();
-	uint64_t maxBlockEnd = start;
-	for (const auto& block : func->GetBasicBlocks())
-	{
-		uint64_t cur = block->GetStart();
-		const uint64_t blockEnd = block->GetEnd();
-		if (blockEnd > maxBlockEnd)
-			maxBlockEnd = blockEnd;
-		while (cur < blockEnd)
-		{
-			if (ScanShouldAbort(view))
-				return false;
-			if (cur < imageBase)
-				return false;
-			uint64_t offset = cur - imageBase;
-			if (offset + align > dataLen)
-				return false;
-			size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
-			InstructionInfo info;
-			if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
-			{
-				if (invalidAddr)
-					*invalidAddr = cur;
-				return false;
-			}
-			cur += info.length;
-		}
-	}
+	const bool isArm = (align == 4);
 
-	// If the function's highest address extends past the last basic block,
-	// validate the tail bytes as well (functions should not include invalid data).
-	const uint64_t funcEnd = (highest >= start) ? (highest + arch->GetDefaultIntegerSize()) : start;
-	if (funcEnd > maxBlockEnd)
-	{
-		uint64_t cur = maxBlockEnd;
-		while (cur < funcEnd)
-		{
-			if (ScanShouldAbort(view))
-				return false;
-			if (cur < imageBase)
-				return false;
-			uint64_t offset = cur - imageBase;
-			if (offset + align > dataLen)
-				return false;
-			size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
-			InstructionInfo info;
-			if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
-			{
-				if (invalidAddr)
-					*invalidAddr = cur;
-				return false;
-			}
-			cur += info.length;
-		}
-	}
-
-	const uint64_t maxBytes = 0x800;
-	uint64_t sizeBytes = end - start;
-	if (sizeBytes > maxBytes)
-		sizeBytes = maxBytes;
-
-	uint64_t cur = start;
-	uint64_t processed = 0;
-	size_t valid = 0;
-	size_t invalid = 0;
-	size_t eqConditionCount = 0;  // Count instructions with EQ condition (0x0)
+	// Statistical counters — populated during the BB + tail walk below
+	size_t validCount = 0;
+	size_t invalidCount = 0;
+	size_t eqConditionCount = 0;
 	size_t totalArmInstructions = 0;
 
-	while (processed + align <= sizeBytes)
-	{
-		if (ScanShouldAbort(view))
-			return false;
-		uint64_t offset = cur - imageBase;
-		if (offset + align > dataLen)
-			break;
+	// Cap statistical tracking to first 2KB (matches old sub-pass 3 limit)
+	const uint64_t statsLimit = start + std::min<uint64_t>(end - start, 0x800);
 
-		if (align == 4 && offset + 4 <= dataLen)
+	// Helper lambda: decode one instruction, update stats if within limit.
+	// Returns the instruction length on success, 0 on decode failure.
+	auto decodeAndTrack = [&](uint64_t addr) -> size_t
+	{
+		if (addr < imageBase)
+			return 0;
+		uint64_t offset = addr - imageBase;
+		if (offset + align > dataLen)
+			return 0;
+
+		// Track EQ-condition pattern for ARM instructions within the stats window.
+		// Note: zero/FF words are counted as "invalid" for ratio purposes but we
+		// still attempt a real decode below — the arch may handle them (e.g.
+		// 0x00000000 is ANDEQ r0,r0,r0 in ARM).
+		bool countedAsInvalid = false;
+		if (isArm && addr < statsLimit && offset + 4 <= dataLen)
 		{
 			uint32_t word = 0;
 			memcpy(&word, data + offset, sizeof(word));
@@ -688,50 +654,174 @@ static bool ValidateFunctionBody(const Ref<BinaryView>& view, const uint8_t* dat
 				word = Swap32(word);
 			if (word == 0 || word == 0xFFFFFFFF)
 			{
-				invalid++;
-				cur += align;
-				processed += align;
-				continue;
+				invalidCount++;
+				countedAsInvalid = true;
 			}
-			
-			// Check for suspicious "data-as-code" patterns
-			// Condition code 0x0 (EQ) means zeros in high nibble - common for data
-			uint32_t cond = (word >> 28) & 0xF;
-			if (cond == 0x0)
-				eqConditionCount++;
-			totalArmInstructions++;
+			else
+			{
+				uint32_t cond = (word >> 28) & 0xF;
+				if (cond == 0x0)
+					eqConditionCount++;
+				totalArmInstructions++;
+			}
 		}
 
 		size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
 		InstructionInfo info;
-		if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
-		{
-			invalid++;
-			cur += align;
-			processed += align;
-			continue;
-		}
+		if (!arch->GetInstructionInfo(data + offset, addr, avail, info) || info.length == 0)
+			return 0;
 
-		valid++;
-		cur += info.length;
-		processed += info.length;
+		if (addr < statsLimit && !countedAsInvalid)
+			validCount++;
+		return info.length;
+	};
+
+	// Collect basic block ranges (sorted) and walk them strictly.
+	// We also record the ranges so we can scan gap regions for statistics.
+	struct BlockRange { uint64_t start; uint64_t end; };
+	std::vector<BlockRange> blockRanges;
+	blockRanges.reserve(func->GetBasicBlocks().size());
+
+	uint64_t maxBlockEnd = start;
+	for (const auto& block : func->GetBasicBlocks())
+	{
+		uint64_t cur = block->GetStart();
+		const uint64_t blockEnd = block->GetEnd();
+		blockRanges.push_back({cur, blockEnd});
+		if (blockEnd > maxBlockEnd)
+			maxBlockEnd = blockEnd;
+
+		// Strict walk: every instruction in every basic block must decode
+		while (cur < blockEnd)
+		{
+			if (ScanShouldAbort(view))
+				return false;
+			size_t len = decodeAndTrack(cur);
+			if (len == 0)
+			{
+				if (invalidAddr)
+					*invalidAddr = cur;
+				if (failReason) *failReason = "BB instruction decode failure";
+				return false;
+			}
+			cur += len;
+		}
 	}
 
-	const size_t total = valid + invalid;
-	if (total == 0)
-		return false;
-	
-	// If most instructions have EQ condition (condition code 0), this is likely data
-	// Real code rarely has more than 20% EQ-condition instructions
+	// Walk tail bytes past last basic block (strict: must also decode)
+	if (end > maxBlockEnd)
+	{
+		uint64_t cur = maxBlockEnd;
+		while (cur < end)
+		{
+			if (ScanShouldAbort(view))
+				return false;
+			size_t len = decodeAndTrack(cur);
+			if (len == 0)
+			{
+				if (invalidAddr)
+					*invalidAddr = cur;
+				if (failReason) *failReason = "tail instruction decode failure";
+				return false;
+			}
+			cur += len;
+		}
+	}
+
+	// Scan gap regions between non-contiguous basic blocks (lenient, stats only).
+	// Functions can have embedded literal pools or data-in-code between blocks.
+	// The old code walked these gaps via an independent linear sweep; we replicate
+	// that coverage here without re-decoding any address already visited above.
+	std::sort(blockRanges.begin(), blockRanges.end(),
+		[](const BlockRange& a, const BlockRange& b) { return a.start < b.start; });
+
+	uint64_t coveredTo = start;
+	for (const auto& br : blockRanges)
+	{
+		// Walk the gap [coveredTo, br.start) leniently for stats
+		uint64_t gapStart = coveredTo;
+		uint64_t gapEnd = std::min(br.start, statsLimit);
+		if (gapStart < gapEnd && gapStart >= imageBase)
+		{
+			uint64_t cur = gapStart;
+			while (cur + align <= gapEnd)
+			{
+				if (ScanShouldAbort(view))
+					return false;
+				uint64_t offset = cur - imageBase;
+				if (offset + align > dataLen)
+					break;
+
+				// EQ-condition tracking for gap bytes
+				if (isArm && offset + 4 <= dataLen)
+				{
+					uint32_t word = 0;
+					memcpy(&word, data + offset, sizeof(word));
+					if (endian == BigEndian)
+						word = Swap32(word);
+					if (word == 0 || word == 0xFFFFFFFF)
+					{
+						invalidCount++;
+						cur += align;
+						continue;
+					}
+					uint32_t cond = (word >> 28) & 0xF;
+					if (cond == 0x0)
+						eqConditionCount++;
+					totalArmInstructions++;
+				}
+
+				size_t avail = (offset + maxLen <= dataLen) ? maxLen : (dataLen - offset);
+				InstructionInfo info;
+				if (!arch->GetInstructionInfo(data + offset, cur, avail, info) || info.length == 0)
+				{
+					invalidCount++;
+					cur += align;
+					continue;
+				}
+				validCount++;
+				cur += info.length;
+			}
+		}
+		if (br.end > coveredTo)
+			coveredTo = br.end;
+	}
+
+	// Statistical checks using counters collected during the walks above.
+	// EQ-condition heuristic: data bytes masquerading as ARM instructions
+	// often have 0x0 in the condition field (top nibble).
 	if (totalArmInstructions >= 4)
 	{
 		double eqRatio = static_cast<double>(eqConditionCount) / static_cast<double>(totalArmInstructions);
-		if (eqRatio >= 0.6)  // 60%+ EQ condition = almost certainly data
+		if (eqRatio >= 0.6)
+		{
+			if (failReason) *failReason = "60%+ EQ-condition instructions";
 			return false;
+		}
 	}
-	
-	const double ratio = static_cast<double>(valid) / static_cast<double>(total);
-	return (valid >= 2) && (ratio >= 0.6);
+
+	// Valid/invalid ratio check. All BB + tail instructions decoded successfully,
+	// but gap regions may have contributed invalids. For Thumb functions where
+	// the ARM-specific zero/FF check doesn't apply, this effectively becomes
+	// a minimum instruction count check (validCount >= 2).
+	const size_t total = validCount + invalidCount;
+	if (total == 0)
+	{
+		if (failReason) *failReason = "zero instructions counted";
+		return false;
+	}
+	const double ratio = static_cast<double>(validCount) / static_cast<double>(total);
+	if (validCount < 2)
+	{
+		if (failReason) *failReason = "fewer than 2 valid instructions";
+		return false;
+	}
+	if (ratio < 0.6)
+	{
+		if (failReason) *failReason = "valid/total ratio < 60%";
+		return false;
+	}
+	return true;
 }
 
 
@@ -2465,7 +2555,19 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 	cleanupTuning.minValidInstr = 2;
 	cleanupTuning.minBodyInstr = 0;
 
-	std::vector<uint64_t> toRemove;
+	enum class RemovalReason : uint8_t {
+		NoBasicBlocks,
+		InsideString,
+		LooksLikeString,
+		TinyFunction,
+		InvalidBody,
+		RepeatingOpcodeTable,
+	};
+	struct RemovalEntry {
+		uint64_t address;
+		RemovalReason reason;
+	};
+	std::vector<RemovalEntry> toRemove;
 	auto funcs = view->GetAnalysisFunctionList();
 	for (const auto& func : funcs)
 	{
@@ -2496,10 +2598,7 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		{
 			// Function has no basic blocks - this happens when analysis fails
 			// due to invalid instructions. Remove these functions.
-			if (verboseLog && logger)
-				logger->LogInfo("Cleanup: removing function at 0x%llx - no basic blocks (invalid instructions)",
-					(unsigned long long)start);
-			toRemove.push_back(start);
+			toRemove.push_back({start, RemovalReason::NoBasicBlocks});
 			removed++;
 			continue;
 		}
@@ -2507,7 +2606,7 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 			continue;
 		const bool isEntryPoint = (start == entryPoint);
 		const bool isProtected = (protectedStarts.find(start) != protectedStarts.end());
-		if (isEntryPoint)
+		if (isEntryPoint || isProtected)
 		{
 			skipProtected++;
 			continue;
@@ -2531,33 +2630,33 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		}
 
 		/*
-		 * Check if function is at a string address or looks like null-terminated ASCII string data.
-		 * This catches functions created by BN's core analysis in string regions.
-		 * Uses the centralized StringDetector logic for consistency.
+		 * Check if the function has incoming code references (callers).
+		 * If other analysed functions call this address via BL/BLX, it is
+		 * almost certainly real code regardless of what the heuristic body
+		 * or string checks say.  Skip all further heuristic checks.
 		 */
 		{
-			// First check BN's detected strings
+			auto refs = view->GetCodeReferences(start);
+			if (!refs.empty())
+			{
+				skipHasRefs++;
+				continue;
+			}
+		}
+
+		/*
+		 * Only remove functions that BN itself has identified as being inside
+		 * a string.  The previous LooksLikeNullTerminatedString heuristic
+		 * was too aggressive — ARM instruction bytes frequently fall in the
+		 * printable ASCII range, causing thousands of valid functions to be
+		 * misclassified as string data.  BN's GetStringAtAddress is purpose-
+		 * built and far more reliable.
+		 */
+		{
 			BNStringReference strRef;
 			if (view->GetStringAtAddress(start, strRef) && strRef.length > 0)
 			{
-				if (verboseLog && logger)
-					logger->LogInfo("Cleanup: removing function at 0x%llx - inside string at 0x%llx (len=%zu)",
-						(unsigned long long)start, (unsigned long long)strRef.start, strRef.length);
-				toRemove.push_back(start);
-				removed++;
-				continue;
-			}
-
-			// Use centralized string detection from StringDetector module
-			// Use permissive settings: minLen=2, minRatio=70% to catch more string patterns
-			constexpr size_t kMaxStringSearch = 256;
-			size_t searchLen = (offset + kMaxStringSearch <= dataLen) ? kMaxStringSearch : (size_t)(dataLen - offset);
-			if (Armv5Analysis::StringDetector::LooksLikeNullTerminatedString(data + offset, searchLen, 2, 0.70))
-			{
-				if (verboseLog && logger)
-					logger->LogInfo("Cleanup: removing function at 0x%llx - looks like null-terminated string",
-						(unsigned long long)start);
-				toRemove.push_back(start);
+				toRemove.push_back({start, RemovalReason::InsideString});
 				removed++;
 				continue;
 			}
@@ -2578,6 +2677,32 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		{
 			skipNonPcWrite++;
 			continue;
+		}
+
+		// A "function" whose very first instruction is a return (POP {…,pc},
+		// BX LR, MOV pc,lr) is not a real function — it is an orphaned
+		// epilogue block that BN split off from its parent function.
+		if (decodeOk)
+		{
+			bool isEpilogue = false;
+			// BX LR
+			if ((firstWord & 0x0FFFFFFF) == 0x012FFF1E)
+				isEpilogue = true;
+			// MOV pc, lr
+			if ((firstWord & 0x0FFFFFFF) == 0x01A0F00E)
+				isEpilogue = true;
+			// POP/LDMIA sp!, {..., pc}
+			if ((firstWord & 0x0FFF0000) == 0x08BD0000 && (firstWord & (1 << 15)))
+				isEpilogue = true;
+			// LDR pc, [sp], #imm
+			if ((firstWord & 0x0FFF0000) == 0x049D0000 && ((firstWord >> 12) & 0xF) == 0xF)
+				isEpilogue = true;
+			if (isEpilogue)
+			{
+				toRemove.push_back({start, RemovalReason::TinyFunction});
+				removed++;
+				continue;
+			}
 		}
 
 		// Check for functions that are too small to be real
@@ -2612,10 +2737,7 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		// Functions with fewer than 2 successfully decoded instructions are suspicious (except vector handlers)
 		if (decodedInstructions < 2 && start >= imageBase + 0x100)  // Skip vector table area
 		{
-			if (logger)  // Always log for debugging
-				logger->LogInfo("Cleanup: REMOVING tiny function at 0x%llx - only %zu decoded instructions",
-					(unsigned long long)start, decodedInstructions);
-			toRemove.push_back(start);
+			toRemove.push_back({start, RemovalReason::TinyFunction});
 			removed++;
 			continue;
 		}
@@ -2626,8 +2748,10 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 		 * invalid instructions to be real code.
 		 */
 		uint64_t invalidAddr = 0;
-		bool bodyValid = ValidateFunctionBody(view, data, dataLen, endian, imageBase, func, &invalidAddr);
-		
+		const char* bodyFailReason = nullptr;
+		bool bodyValid = ValidateFunctionBody(view, data, dataLen, endian, imageBase, func, &invalidAddr, &bodyFailReason);
+		bool repeatingOpcode = false;
+
 		// Additional check: if function has no return and looks like data, it's invalid
 		// Functions marked as "infinite loop" often are data being misinterpreted
 		if (bodyValid)
@@ -2639,7 +2763,7 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 				if (block->CanExit())
 					hasReturn = true;
 			}
-			
+
 			// If no return, check for additional data indicators
 			if (!hasReturn && offset + 16 <= dataLen)
 			{
@@ -2662,10 +2786,13 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 				}
 				// 3+ consecutive same opcode = likely data table
 				if (sameOpcodeCount >= 2)
+				{
 					bodyValid = false;
+					repeatingOpcode = true;
+				}
 			}
 		}
-		
+
 		if (bodyValid)
 		{
 			if (isProtected)
@@ -2689,32 +2816,54 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 					view->DefineDataVariable(invalidAddr, invalidType);
 			}
 		}
-		toRemove.push_back(start);
+		if (logger && bodyFailReason)
+			logger->LogDebug("Cleanup: 0x%llx body failed: %s (invalidAddr=0x%llx)",
+				(unsigned long long)start, bodyFailReason, (unsigned long long)invalidAddr);
+		toRemove.push_back({start, repeatingOpcode ? RemovalReason::RepeatingOpcodeTable : RemovalReason::InvalidBody});
 		removed++;
 	}
 
-	for (uint64_t start : toRemove)
+	// Get instance ID so we can blacklist removed addresses, preventing
+	// BN's call-following from re-creating them during post-cleanup analysis.
+	uint64_t instanceId = GetInstanceIdFromView(view.GetPtr());
+
+	auto reasonStr = [](RemovalReason r) -> const char* {
+		switch (r) {
+		case RemovalReason::NoBasicBlocks:        return "no basic blocks";
+		case RemovalReason::InsideString:         return "inside string";
+		case RemovalReason::LooksLikeString:      return "looks like string data";
+		case RemovalReason::TinyFunction:         return "tiny function (<2 instructions)";
+		case RemovalReason::InvalidBody:          return "invalid body";
+		case RemovalReason::RepeatingOpcodeTable: return "repeating opcode (data table)";
+		}
+		return "unknown";
+	};
+
+	for (const auto& entry : toRemove)
 	{
 		if (ScanShouldAbort(view))
 			break;
 		if (!actionPolicy.allowRemoveFunction)
 			continue;
-		if (verboseLog && logger)
-			logger->LogInfo("Cleanup invalid: removing function at 0x%llx",
-				(unsigned long long)start);
-		else if (logger)
-			logger->LogWarn("Cleanup invalid: removing function at 0x%llx",
-				(unsigned long long)start);
+		if (logger)
+			logger->LogInfo("Cleanup: removing 0x%llx (%s)",
+				(unsigned long long)entry.address, reasonStr(entry.reason));
+
+		// Record in blacklist BEFORE removal — prevents re-creation via
+		// AddFunctionForAnalysis during post-cleanup WaitForAnalysisIdle
+		if (instanceId != 0)
+			AddRemovedFunctionAddress(instanceId, entry.address);
+
 		if (plan)
 		{
-			PlanRemoveFunction(plan, start);
+			PlanRemoveFunction(plan, entry.address);
 			removed++;
 			continue;
 		}
-		Ref<Function> func = view->GetAnalysisFunction(defaultPlat.GetPtr(), start);
+		Ref<Function> func = view->GetAnalysisFunction(defaultPlat.GetPtr(), entry.address);
 		if (!func)
 		{
-			auto funcs = view->GetAnalysisFunctionsContainingAddress(start);
+			auto funcs = view->GetAnalysisFunctionsContainingAddress(entry.address);
 			if (!funcs.empty())
 				func = funcs.front();
 		}
@@ -2726,18 +2875,17 @@ size_t CleanupInvalidFunctions(const Ref<BinaryView>& view, const uint8_t* data,
 	}
 
 	if (logger)
-		logger->LogInfo("Cleanup invalid functions: removed=%zu candidates=%zu scanned=%zu",
-			removed, candidates, scanned);
-	if (verboseLog)
 	{
-		if (logger)
-			logger->LogInfo(
-				"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
-				"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu "
-				"skip_body_valid=%zu removed_no_blocks=%zu removed_invalid=%zu",
-				skipUser, skipProtected, skipTooLarge, skipHasRefs,
-				skipNonPcWrite, skipValid, skipNoData, skipBodyValid, skipNoBlocks, removed);
+		logger->LogInfo("Cleanup invalid functions: removed=%zu candidates=%zu scanned=%zu blacklisted=%zu",
+			removed, candidates, scanned, toRemove.size());
 	}
+	if (logger)
+		logger->LogInfo(
+			"Cleanup invalid detail: skip_user=%zu skip_protected=%zu skip_too_large=%zu "
+			"skip_has_refs=%zu skip_non_pc_write=%zu skip_valid=%zu skip_no_data=%zu "
+			"skip_body_valid=%zu removed_no_blocks=%zu removed_invalid=%zu",
+			skipUser, skipProtected, skipTooLarge, skipHasRefs,
+			skipNonPcWrite, skipValid, skipNoData, skipBodyValid, skipNoBlocks, removed);
 
 	return removed;
 }

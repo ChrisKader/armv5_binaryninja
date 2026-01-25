@@ -298,6 +298,20 @@ static std::unordered_map<InstanceId, std::unordered_set<uint64_t>> &FirmwareFun
 }
 
 /**
+ * Removed-functions blacklist: InstanceId -> set of addresses.
+ *
+ * When cleanup removes a function, its address is recorded here.
+ * The architecture's IsValidFunctionStart checks this set to prevent
+ * BN's call-following from re-creating functions that were already
+ * determined to be invalid. Cleared when scans complete.
+ */
+static std::unordered_map<InstanceId, std::unordered_set<uint64_t>> &RemovedFunctionsBlacklist()
+{
+	static auto *map = new std::unordered_map<InstanceId, std::unordered_set<uint64_t>>();
+	return *map;
+}
+
+/**
  * Create a snapshot of all function start addresses in a view.
  *
  * Used before/after firmware scans to track which functions were added.
@@ -424,7 +438,7 @@ InstanceId BinaryNinja::GetInstanceIdFromView(const BinaryView *view)
 
 static void OnFirmwareInitialAnalysisComplete(BinaryView *view)
 {
-	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+	auto logger = LogRegistry::CreateLogger("ARMv5.FirmwareView");
 	if (!view || !view->GetObject())
 		return;
 	if (view->GetTypeName() != "ARMv5 Firmware")
@@ -485,7 +499,7 @@ static void OnFirmwareViewFinalization(BinaryView *view)
 	if (view->GetTypeName() != "ARMv5 Firmware")
 		return;
 
-	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+	auto logger = LogRegistry::CreateLogger("ARMv5.FirmwareView");
 	if (logger)
 		logger->LogInfo("OnFirmwareViewFinalization: analysis finalization event");
 
@@ -709,11 +723,48 @@ void BinaryNinja::ClearFirmwareFunctionSnapshot(uint64_t instanceId)
 	FirmwareFunctionSnapshotMap().erase(instanceId);
 }
 
+void BinaryNinja::AddRemovedFunctionAddress(uint64_t instanceId, uint64_t addr)
+{
+	if (instanceId == 0)
+		return;
+	if (BNIsShutdownRequested())
+		return;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex);
+	RemovedFunctionsBlacklist()[instanceId].insert(addr);
+	// Also insert with Thumb bit cleared, since call targets may arrive
+	// with or without bit 0 set depending on the branch instruction.
+	RemovedFunctionsBlacklist()[instanceId].insert(addr & ~1ULL);
+}
+
+bool BinaryNinja::IsRemovedFunctionAddress(uint64_t instanceId, uint64_t addr)
+{
+	if (instanceId == 0)
+		return false;
+	if (BNIsShutdownRequested())
+		return false;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex);
+	auto it = RemovedFunctionsBlacklist().find(instanceId);
+	if (it == RemovedFunctionsBlacklist().end())
+		return false;
+	// Check both raw address and Thumb-bit-cleared version
+	return it->second.count(addr) > 0 || it->second.count(addr & ~1ULL) > 0;
+}
+
+void BinaryNinja::ClearRemovedFunctions(uint64_t instanceId)
+{
+	if (instanceId == 0)
+		return;
+	if (BNIsShutdownRequested())
+		return;
+	std::lock_guard<std::mutex> lock(FirmwareViewMutex);
+	RemovedFunctionsBlacklist().erase(instanceId);
+}
+
 Armv5FirmwareView::Armv5FirmwareView(BinaryView *data, bool parseOnly)
 		: BinaryView("ARMv5 Firmware", data->GetFile(), data), m_parseOnly(parseOnly), m_entryPoint(0), m_endian(LittleEndian), m_addressSize(4), m_postAnalysisScansDone(false), m_seededFunctions(), m_seededUserFunctions(), m_seededDataDefines(), m_seededSymbols(), m_instanceId(0), m_fileSessionId(0), m_viewPtr(0)
 {
-	CreateLogger("BinaryView");
-	m_logger = CreateLogger("BinaryView.ARMv5FirmwareView");
+	CreateLogger("ARMv5");
+	m_logger = CreateLogger("ARMv5.FirmwareView");
 
 	{
 		std::lock_guard<std::mutex> lock(FirmwareViewMutex);
@@ -777,6 +828,7 @@ Armv5FirmwareView::~Armv5FirmwareView()
 				FirmwareViewPointerToInstanceMap().erase(itPtr);
 		}
 		FirmwareFunctionSnapshotMap().erase(m_instanceId);
+		RemovedFunctionsBlacklist().erase(m_instanceId);
 	}
 }
 
@@ -1198,20 +1250,44 @@ bool Armv5FirmwareView::Init()
 
 void Armv5FirmwareView::RunFirmwareWorkflowScans(Ref<BinaryView> viewRef)
 {
-	if (!GetObject())
-		return;
-	if (BNIsShutdownRequested())
-		return;
-	if (m_instanceId == 0)
-		return;
-	if (IsFirmwareViewClosingById(m_instanceId))
-		return;
-	if (m_parseOnly)
-		return;
-	if (!TryBeginWorkflowScans())
-		return;
+	auto logger = LogRegistry::CreateLogger("ARMv5.FirmwareView");
 
-	// Pass through the Ref<> from workflow callback - do NOT create new Ref<> from this
+	if (!GetObject())
+	{
+		logger->LogWarn("RunFirmwareWorkflowScans: GetObject() is null");
+		return;
+	}
+	if (BNIsShutdownRequested())
+	{
+		logger->LogWarn("RunFirmwareWorkflowScans: shutdown requested");
+		return;
+	}
+	if (m_instanceId == 0)
+	{
+		logger->LogWarn("RunFirmwareWorkflowScans: m_instanceId is 0");
+		return;
+	}
+	if (IsFirmwareViewClosingById(m_instanceId))
+	{
+		logger->LogWarn("RunFirmwareWorkflowScans: view is closing");
+		return;
+	}
+	if (m_parseOnly)
+	{
+		logger->LogWarn("RunFirmwareWorkflowScans: m_parseOnly is true");
+		return;
+	}
+	if (!TryBeginWorkflowScans())
+	{
+		logger->LogInfo("RunFirmwareWorkflowScans: TryBeginWorkflowScans returned false (already done)");
+		return;
+	}
+
+	logger->LogInfo("RunFirmwareWorkflowScans: calling ScheduleArmv5FirmwareScanJob");
+	// Run asynchronously - cannot run synchronously here because scan job
+	// calls WaitForAnalysisIdle() which would deadlock (workflow is part of analysis).
+	// The user must call update_analysis_and_wait() again after initial analysis
+	// to wait for the scan job to complete, or use the Python API to poll.
 	ScheduleArmv5FirmwareScanJob(viewRef);
 }
 
@@ -1295,7 +1371,7 @@ bool BinaryNinja::IsFirmwareViewClosingById(uint64_t instanceId)
 	bool isClosing = closing.find(instanceId) != closing.end();
 	if (isClosing)
 	{
-		auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+		auto logger = LogRegistry::CreateLogger("ARMv5.FirmwareView");
 		if (logger)
 			logger->LogInfo("IsFirmwareViewClosingById: instanceId=%llx is closing", (unsigned long long)instanceId);
 	}
@@ -1388,7 +1464,7 @@ Armv5FirmwareView* BinaryNinja::GetFirmwareViewForFileSessionId(uint64_t fileSes
 Armv5FirmwareViewType::Armv5FirmwareViewType()
 		: BinaryViewType("ARMv5 Firmware", "ARMv5 Firmware")
 {
-	m_logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareViewType");
+	m_logger = LogRegistry::CreateLogger("ARMv5.FirmwareViewType");
 }
 
 Ref<BinaryView> Armv5FirmwareViewType::Create(BinaryView *data)

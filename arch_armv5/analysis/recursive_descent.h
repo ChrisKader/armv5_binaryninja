@@ -9,6 +9,7 @@
 #pragma once
 
 #include "binaryninjaapi.h"
+#include "function_detector.h"
 #include "cfg/control_flow_graph.h"
 #include "cfg/call_graph.h"
 
@@ -92,6 +93,29 @@ struct RecursiveDescentSettings
 	bool useExistingFunctions = true;       // Start from already-defined functions
 	bool useSymbols = true;                 // Start from exported symbols
 	bool useVectorTable = true;             // Start from exception handlers
+
+	/**
+	 * Apply a unified detection config, mapping to RecursiveDescent-specific parameters.
+	 */
+	void ApplyUnifiedConfig(const UnifiedDetectionConfig& config)
+	{
+		minConfidenceToAdd = config.minimumScore;
+
+		if (config.mode == DetectionMode::Aggressive)
+		{
+			callTargetBonus = 0.35;
+			validCfgBonus = 0.25;
+			returnBonus = 0.25;
+			maxFunctionsToDiscover = 10000;
+		}
+		else if (config.mode == DetectionMode::Conservative)
+		{
+			callTargetBonus = 0.25;
+			validCfgBonus = 0.15;
+			returnBonus = 0.15;
+			maxFunctionsToDiscover = 2000;
+		}
+	}
 };
 
 /**

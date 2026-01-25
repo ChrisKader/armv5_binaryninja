@@ -142,6 +142,26 @@ public:
 	bool IsRunning() const { return m_isRunning; }
 
 	/**
+	 * Record user feedback on a detection result.
+	 * @param addr The function address the feedback is about
+	 * @param type Whether it was correct, a false positive, or missed
+	 * @param sources Bitmask of DetectionSource (0 if unknown)
+	 * @param score Original detection score (0 if unknown)
+	 */
+	void RecordFeedback(uint64_t addr, FeedbackType type, uint32_t sources = 0, double score = 0.0);
+
+	/**
+	 * Get a snapshot of accumulated feedback (thread-safe copy)
+	 */
+	DetectionFeedback GetFeedback() const;
+
+
+	/**
+	 * Clear all accumulated feedback
+	 */
+	void ClearFeedback();
+
+	/**
 	 * Get the underlying detector (for advanced use)
 	 */
 	FunctionDetector* GetDetector() { return m_detector.get(); }
@@ -164,10 +184,13 @@ public:
 private:
 	bool ShouldCancel() const;
 	void UpdateProgress(size_t current, size_t total, const std::string& status);
+	void LoadFeedbackFromView();
+	void SaveFeedbackToView();
 
 	BinaryNinja::Ref<BinaryNinja::BinaryView> m_view;
 	std::unique_ptr<FunctionDetector> m_detector;
 	FunctionDetectionSettings m_settings;
+	DetectionFeedback m_feedback;
 	RecognitionResult m_lastResult;
 
 	RecognitionProgressCallback m_progressCallback;

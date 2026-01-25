@@ -94,7 +94,7 @@ static void RunArmv5StringTypingWorkflow(const Ref<AnalysisContext>& analysisCon
 	if (IsFirmwareViewClosing(view.GetPtr()))
 		return;
 
-	auto logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+	auto logger = LogRegistry::CreateLogger("ARMv5.Workflow");
 
 	try
 	{
@@ -438,12 +438,18 @@ static void RunArmv5StringTypingWorkflow(const Ref<AnalysisContext>& analysisCon
  */
 static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext)
 {
+	auto logger = LogRegistry::CreateLogger("ARMv5.Workflow");
+	logger->LogInfo("RunArmv5FirmwareWorkflow: ENTRY");
+
 	/*
 	 * Guard 1: Validate analysis context
 	 * This should never be null, but defensive programming is good.
 	 */
 	if (!analysisContext)
+	{
+		logger->LogWarn("RunArmv5FirmwareWorkflow: analysisContext is null");
 		return;
+	}
 
 	/*
 	 * Guard 2: Re-acquire the BinaryView from context
@@ -453,9 +459,15 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	 */
 	auto view = analysisContext->GetBinaryView();
 	if (!view)
+	{
+		logger->LogWarn("RunArmv5FirmwareWorkflow: view is null");
 		return;
+	}
 	if (!view->GetObject())
+	{
+		logger->LogWarn("RunArmv5FirmwareWorkflow: view->GetObject() is null");
 		return;
+	}
 
 	/*
 	 * Guard 3: Check if the view is closing
@@ -464,7 +476,12 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	 * IsFirmwareViewClosing() checks our instance tracking system.
 	 */
 	if (IsFirmwareViewClosing(view.GetPtr()))
+	{
+		logger->LogWarn("RunArmv5FirmwareWorkflow: view is closing, skipping");
 		return;
+	}
+
+	logger->LogInfo("RunArmv5FirmwareWorkflow: calling RunArmv5FirmwareWorkflowScans");
 
 	/*
 	 * Run the firmware scans with exception handling.
@@ -475,6 +492,7 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	try
 	{
 		RunArmv5FirmwareWorkflowScans(view);
+		logger->LogInfo("RunArmv5FirmwareWorkflow: scans completed");
 	}
 	catch (std::exception& e)
 	{
@@ -512,8 +530,15 @@ void BinaryNinja::RegisterArmv5FirmwareWorkflow()
 		return;
 
 	/*
-	 * Clone the workflow so we don't modify the shared original.
-	 * Our clone will have our activity added.
+	 * Clone the workflow to add our activities.
+	 *
+	 * NOTE: We clone WITHOUT a custom name so it inherits "core.module.metaAnalysis".
+	 * When we call RegisterWorkflow(), it updates the existing workflow in the
+	 * registry, effectively adding our activities to the default workflow.
+	 * This is the standard pattern used by other plugins (EFI resolver, RTTI, etc.).
+	 *
+	 * Our activities have eligibility predicates that restrict them to
+	 * "ARMv5 Firmware" view types, so they only run on our binaries.
 	 */
 	Ref<Workflow> firmwareWorkflow = metaWorkflow->Clone();
 	if (!firmwareWorkflow)

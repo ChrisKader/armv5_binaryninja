@@ -21,6 +21,7 @@
 #pragma once
 
 #include "binaryninjaapi.h"
+#include "function_detector.h"
 
 #include <cstdint>
 #include <map>
@@ -102,12 +103,40 @@ struct LinearSweepSettings
 	bool treatUnconditionalBranchAsInterprocedural = true;  // B = potential tail call
 	bool treatIndirectBranchAsTerminator = true;  // Indirect = function boundary
 	int64_t tailCallDistanceThreshold = 0x1000;   // Branches beyond this are likely tail calls
+	bool useAdaptiveThresholds = true;            // Derive threshold from segment/section layout
 
 	// Output filtering
 	double minimumConfidence = 0.4;
 	size_t minimumBlocksPerFunction = 1;
 	bool requireReturnOrCall = true;  // Require return or call for single-block functions
 	bool enforceAlignment = true;     // Reject misaligned function entries
+
+	// Leaf function detection
+	bool detectLeafFunctions = true;          // Allow single-block functions without return/call
+	double leafFunctionMinConfidence = 0.5;   // Higher threshold for leaf candidates
+
+	/**
+	 * Apply a unified detection config, mapping to LinearSweep-specific parameters.
+	 */
+	void ApplyUnifiedConfig(const UnifiedDetectionConfig& config)
+	{
+		minimumConfidence = config.minimumScore;
+
+		if (config.mode == DetectionMode::Aggressive)
+		{
+			minimumBlocksPerFunction = 1;
+			requireReturnOrCall = false;
+			tailCallDistanceThreshold = 0x2000;
+			useAdaptiveThresholds = true;
+		}
+		else if (config.mode == DetectionMode::Conservative)
+		{
+			minimumBlocksPerFunction = 2;
+			requireReturnOrCall = true;
+			tailCallDistanceThreshold = 0x800;
+			useAdaptiveThresholds = false;
+		}
+	}
 };
 
 /**
@@ -185,6 +214,9 @@ private:
 	// Phase 4: Extract functions from groups
 	std::vector<LinearFunction> extractFunctions();
 	double calculateConfidence(const LinearFunction& func);
+
+	// Adaptive threshold computation
+	int64_t computeAdaptiveThreshold(uint64_t address) const;
 
 	// Helper methods
 	bool isValidAddress(uint64_t addr);

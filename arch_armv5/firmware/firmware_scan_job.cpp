@@ -503,50 +503,41 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		std::vector<uint64_t> userAddrs = plan.addUserFunctions;
 		DedupAddresses(userAddrs);
 
-		const size_t batchSize = 256;
-		for (size_t i = 0; i < userAddrs.size(); i += batchSize)
+		for (size_t j = 0; j < userAddrs.size(); ++j)
 		{
-			if (shouldAbort())
+			if ((j & 0xFF) == 0 && shouldAbort())
 			{
 				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = std::min(userAddrs.size(), i + batchSize);
-			for (size_t j = i; j < end; ++j)
+			uint64_t addr = userAddrs[j];
+
+			if (IsAddressInDataRegion(view, fwSettings, addr))
 			{
-				uint64_t addr = userAddrs[j];
+				if (logger)
+					logger->LogDebug("Plan apply: Skipping user function at 0x%llx - in data region",
+						(unsigned long long)addr);
+				continue;
+			}
 
-				// Check code-data boundary using centralized logic
-				if (IsAddressInDataRegion(view, fwSettings, addr))
-				{
-					if (logger)
-						logger->LogDebug("Plan apply: Skipping user function at 0x%llx - in data region",
-							(unsigned long long)addr);
-					continue;
-				}
-
-				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
-				if (!targetPlat)
-					targetPlat = platform;
-				if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
-					continue;
-				Ref<Function> func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
+			Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
+			if (!targetPlat)
+				targetPlat = platform;
+			if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
+				continue;
+			Ref<Function> func = view->GetAnalysisFunction(targetPlat.GetPtr(), addr);
+			if (!func)
+			{
+				func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
 				if (!func)
 				{
-					func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
-					if (!func)
-					{
-						// Fall back to analysis function creation if user creation fails.
-						view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
-						if (logger)
-							logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
-								(unsigned long long)addr);
-					}
+					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+					if (logger)
+						logger->LogWarn("Firmware scan: user function create failed at 0x%llx, falling back to analysis",
+							(unsigned long long)addr);
 				}
 			}
-			// Delay to prevent overwhelming the analysis system
-			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
 
 		std::vector<uint64_t> addrs = plan.addFunctions;
@@ -581,40 +572,37 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			addrs.resize(fwSettings.maxFunctionAdds);
 		}
 
-		for (size_t i = 0; i < addrs.size(); i += batchSize)
+		for (size_t j = 0; j < addrs.size(); ++j)
 		{
-			if (shouldAbort())
+			if ((j & 0xFF) == 0 && shouldAbort())
 			{
 				undoGuard.Revert();
 				finishUpdatesGuard();
 				return false;
 			}
-			size_t end = std::min(addrs.size(), i + batchSize);
-			for (size_t j = i; j < end; ++j)
+			uint64_t addr = addrs[j];
+
+			if (IsAddressInDataRegion(view, fwSettings, addr))
 			{
-				uint64_t addr = addrs[j];
-
-				// Check code-data boundary using centralized logic
-				if (IsAddressInDataRegion(view, fwSettings, addr))
-				{
-					if (logger)
-						logger->LogDebug("Plan apply: Skipping analysis function at 0x%llx - in data region",
-							(unsigned long long)addr);
-					continue;
-				}
-
-				Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
-				if (!targetPlat)
-					targetPlat = platform;
-				if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
-					continue;
-				// Create function with analysis initially disabled for UI stability
-				Ref<Function> func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
-				if (!func)
-					view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
+				if (logger)
+					logger->LogDebug("Plan apply: Skipping analysis function at 0x%llx - in data region",
+						(unsigned long long)addr);
+				continue;
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+			Ref<Platform> targetPlat = resolvePlatformForAddress(addr);
+			if (!targetPlat)
+				targetPlat = platform;
+			if (!IsValidFunctionStart(view, targetPlat, addr, fwSettings.enableVerboseLogging, logger))
+				continue;
+			Ref<Function> func = view->CreateUserFunction(targetPlat.GetPtr(), addr);
+			if (!func)
+				view->AddFunctionForAnalysis(targetPlat.GetPtr(), addr, true);
 		}
+
+		// Data definitions, symbol definitions, and function removals use batched
+		// iteration for abort checks but no sleep delays (analysis is disabled).
+		const size_t batchSize = 256;
 
 		for (size_t i = 0; i < plan.defineData.size(); i += batchSize)
 		{
@@ -636,7 +624,6 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 						view->DefineDataVariable(def.address, def.type);
 				}
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		for (size_t i = 0; i < plan.undefineData.size(); i += batchSize)
@@ -650,7 +637,6 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			size_t end = std::min(plan.undefineData.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 				view->UndefineDataVariable(plan.undefineData[j], false);
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		for (size_t i = 0; i < plan.defineSymbols.size(); i += batchSize)
@@ -664,7 +650,6 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			size_t end = std::min(plan.defineSymbols.size(), i + batchSize);
 			for (size_t j = i; j < end; ++j)
 				view->DefineAutoSymbol(plan.defineSymbols[j]);
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		for (size_t i = 0; i < plan.removeFunctions.size(); i += batchSize)
@@ -694,7 +679,6 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 					view->RemoveAnalysisFunction(func, true);
 				}
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 
 		finishUpdatesGuard();
@@ -738,7 +722,7 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			return;
 		}
 
-		Ref<Logger> logger = LogRegistry::CreateLogger("BinaryView.ARMv5FirmwareView");
+		Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.ScanJob");
 
 	auto finishTask = [&]() {
 		FinishTask(task, instanceId);
@@ -760,10 +744,17 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			finishTask();
 			return;
 		}
-		if (!WaitForAnalysisIdle(instanceId, view, task, logger))
 		{
-			finishTask();
-			return;
+			auto t0 = std::chrono::steady_clock::now();
+			if (!WaitForAnalysisIdle(instanceId, view, task, logger))
+			{
+				finishTask();
+				return;
+			}
+			double waitSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::steady_clock::now() - t0).count();
+			if (auto l = LogRegistry::CreateLogger("ARMv5.ScanJob"))
+				l->LogInfo("Firmware workflow timing: WaitForAnalysisIdle (initial) took %.3f s", waitSeconds);
 		}
 
 		Ref<Settings> settings = view->GetLoadSettings(view->GetTypeName());
@@ -836,15 +827,10 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 		auto timePass = [&](const char* label, auto&& fn)
 		{
-			if (!fwSettings.enableVerboseLogging)
-			{
-				fn();
-				return;
-			}
-			auto start = std::chrono::steady_clock::now();
+			auto t0 = std::chrono::steady_clock::now();
 			fn();
 			double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
-				std::chrono::steady_clock::now() - start).count();
+				std::chrono::steady_clock::now() - t0).count();
 			if (logger)
 				logger->LogInfo("Firmware workflow timing: %s took %.3f s", label, seconds);
 		};
@@ -920,12 +906,8 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 			// function creation at call targets. This prevents false positives
 			// where BN creates functions at epilogue stubs (e.g., BX LR).
 			// Our recognizer explicitly validates each candidate before adding it.
-
-			if (!refreshViewForPhase())
-			{
-				finishTask();
-				return;
-			}
+			// No refreshViewForPhase() needed here — the recognizer only reads
+			// the binary data and populates a plan; it doesn't modify the view.
 
 			UpdateTaskText(task, instanceId, "ARMv5 scans: running unified function recognizer");
 
@@ -1126,15 +1108,29 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 
 		bool applied = false;
 		std::unordered_set<uint64_t> beforeFunctions = SnapshotFunctionStarts(view);
-		if (!refreshViewForPhase())
+		if (!view || !view->GetObject() || IsFirmwareViewClosingById(instanceId) || !IsFirmwareViewAliveById(instanceId))
 		{
 			finishTask();
 			return;
 		}
 		if (!ScanCancelled(view))
+		{
+			auto t0 = std::chrono::steady_clock::now();
 			applied = ApplyPlanBatchesDirect(view, fwSettings, plan, logger);
+			double applySeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::steady_clock::now() - t0).count();
+			if (logger)
+				logger->LogInfo("Firmware workflow timing: ApplyPlanBatchesDirect took %.3f s", applySeconds);
+		}
 
-		WaitForAnalysisIdle(instanceId, view, task, logger);
+		{
+			auto t0 = std::chrono::steady_clock::now();
+			WaitForAnalysisIdle(instanceId, view, task, logger);
+			double waitSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+				std::chrono::steady_clock::now() - t0).count();
+			if (logger)
+				logger->LogInfo("Firmware workflow timing: WaitForAnalysisIdle (post-apply) took %.3f s", waitSeconds);
+		}
 		auto afterFunctions = SnapshotFunctionStarts(view);
 		
 		// Run cleanup AFTER applying the plan and waiting for analysis
@@ -1156,24 +1152,52 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 				addProtected(addr);
 			for (uint64_t addr : seededUserFunctions)
 				addProtected(addr);
+			// Only protect user-created plan functions (entry points, handlers).
+			// Regular plan.addFunctions are NOT protected — they must survive
+			// body validation like any other function. The old approach of
+			// protecting all plan functions let false positives (data decoded
+			// as PUSH instructions) survive cleanup and cascade into thousands
+			// of additional bad functions via BN's call-following.
+			for (uint64_t addr : plan.addUserFunctions)
+				addProtected(addr);
 			
 			// Run cleanup directly (not via plan) since plan was already applied
-			size_t removed = CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
-				imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
-				fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
-				fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, nullptr);
-			
+			size_t removed = 0;
+			{
+				auto t0 = std::chrono::steady_clock::now();
+				removed = CleanupInvalidFunctions(view, fileData, fileDataLen, view->GetDefaultEndianness(),
+					imageBase, length, logger, fwSettings.enableVerboseLogging, tuning,
+					fwSettings.cleanupMaxSizeBytes, fwSettings.cleanupRequireZeroRefs,
+					fwSettings.cleanupRequirePcWriteStart, view->GetEntryPoint(), protectedStarts, nullptr);
+				double cleanupSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+					std::chrono::steady_clock::now() - t0).count();
+				if (logger)
+					logger->LogInfo("Firmware workflow timing: CleanupInvalidFunctions took %.3f s", cleanupSeconds);
+			}
+
 			if (logger)
 				logger->LogInfo("Cleanup invalid functions: removed %zu functions", removed);
 
 			// Update function snapshot after cleanup
-			WaitForAnalysisIdle(instanceId, view, task, logger);
+			{
+				auto t0 = std::chrono::steady_clock::now();
+				WaitForAnalysisIdle(instanceId, view, task, logger);
+				double waitSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+					std::chrono::steady_clock::now() - t0).count();
+				if (logger)
+					logger->LogInfo("Firmware workflow timing: WaitForAnalysisIdle (post-cleanup) took %.3f s", waitSeconds);
+			}
 			afterFunctions = SnapshotFunctionStarts(view);
 
 			// Additional cleanup passes removed - the finalization event
 			// (OnFirmwareViewFinalization) handles late-added functions when
 			// analysis completes, so multiple passes here are unnecessary.
 		}
+		// Clear the removed-functions blacklist now that post-cleanup analysis
+		// is complete. The blacklist prevented re-creation during
+		// WaitForAnalysisIdle; it's no longer needed.
+		ClearRemovedFunctions(instanceId);
+
 		LogFunctionDiff(logger, beforeFunctions, afterFunctions, fwSettings.enableVerboseLogging);
 		StoreFirmwareFunctionSnapshot(instanceId, afterFunctions);
 
@@ -1588,6 +1612,41 @@ void BinaryNinja::ScheduleArmv5FirmwareScanJob(Ref<BinaryView> view)
 
 	Ref<BackgroundTask> task = new BackgroundTask("ARMv5 firmware scans...", true);
 	std::thread([view, task, instanceId]() { RunFirmwareScanJob(view, task, instanceId); }).detach();
+}
+
+void BinaryNinja::RunArmv5FirmwareScanJobSync(Ref<BinaryView> view)
+{
+	// Run scans synchronously (for workflow callbacks which are already on worker threads).
+	// This ensures update_analysis_and_wait() waits for scans to complete.
+	if (!view || !view->GetObject())
+		return;
+	if (BNIsShutdownRequested())
+		return;
+	if (Armv5Settings::PluginConfig::Get().AreAllScansDisabled())
+		return;
+	if (view->GetTypeName() != "ARMv5 Firmware")
+		return;
+
+	uint64_t instanceId = 0;
+	Armv5FirmwareView* fwView = dynamic_cast<Armv5FirmwareView*>(view.GetPtr());
+	if (fwView)
+		instanceId = fwView->GetInstanceId();
+	else
+		instanceId = GetInstanceIdFromView(view.GetPtr());
+
+	if (instanceId == 0)
+		return;
+	if (IsFirmwareViewClosingById(instanceId))
+		return;
+	if (BNIsShutdownRequested())
+		return;
+
+	SetFirmwareViewScanCancelled(instanceId, false);
+	if (BNIsShutdownRequested())
+		return;
+
+	Ref<BackgroundTask> task = new BackgroundTask("ARMv5 firmware scans...", true);
+	RunFirmwareScanJob(view, task, instanceId);  // Run synchronously
 }
 
 void BinaryNinja::CancelArmv5FirmwareScanJob(uint64_t viewId, bool allowRelease)

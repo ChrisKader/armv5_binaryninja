@@ -14,6 +14,8 @@ namespace BinaryNinja
 	// Takes Ref<> that must be passed through from workflow callback - do NOT
 	// create a new Ref<> from a raw pointer as that causes shutdown crashes.
 	void ScheduleArmv5FirmwareScanJob(Ref<BinaryView> view);
+	// Synchronous version for workflow callbacks (which are already on worker threads)
+	void RunArmv5FirmwareScanJobSync(Ref<BinaryView> view);
 	void CancelArmv5FirmwareScanJob(uint64_t instanceId, bool allowRelease = true);
 
 	// Thread tracking for shutdown coordination

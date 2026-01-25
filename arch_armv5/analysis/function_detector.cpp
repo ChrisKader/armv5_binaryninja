@@ -3,6 +3,7 @@
  */
 
 #include "function_detector.h"
+#include "code_data_classifier.h"
 #include "cfg/control_flow_graph.h"
 #include "cfg/dominator_tree.h"
 #include "linear_sweep.h"
@@ -11,6 +12,7 @@
 #include "common/armv5_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 
@@ -78,7 +80,7 @@ FunctionDetector::FunctionDetector(Ref<BinaryView> view)
 	, m_settings(DefaultSettings())
 	, m_stats{}
 {
-	m_logger = LogRegistry::CreateLogger("FunctionDetector");
+	m_logger = LogRegistry::CreateLogger("ARMv5.FunctionDetector");
 }
 
 void FunctionDetector::SetProgressCallback(ProgressCallback callback)
@@ -113,63 +115,34 @@ FunctionDetectionSettings FunctionDetector::DefaultSettings()
 FunctionDetectionSettings FunctionDetector::AggressiveSettings()
 {
 	FunctionDetectionSettings s;
-	s.minimumScore = 0.35;  // Slightly higher to reduce false positives
-	s.highConfidenceScore = 0.6;
+	s.ApplyUnifiedConfig(UnifiedDetectionConfig::Aggressive());
 	s.alignmentPreference = 4;  // Prefer 4-byte aligned for ARM
-	
-	// Lower thresholds for weak signals
-	s.prologuePush.threshold = 0.3;
-	s.blTarget.threshold = 0.2;
-	s.afterUnconditionalRet.threshold = 0.3;
-	
-	// Moderate weights for weak signals
-	s.alignmentBoundary.weight = 0.3;
-	s.instructionSequence.weight = 1.0;
-	s.entropyTransition.weight = 0.8;
-	
-	// Keep strong penalties to filter out bad candidates
-	s.midInstructionPenalty = 3.0;  // Strong penalty for misaligned
+
+	// Weights for weak signals (not covered by unified config)
 	s.unlikelyPatternPenalty = 0.3;
-	
+
 	// Enable new detection methods with balanced weights
 	// Our linear sweep is disabled - BN's built-in is faster and incremental
 	// Our notification handler filters bad functions in real-time
 	s.useLinearSweep = false;
 	s.linearSweepWeight = 2.5;  // Weight if manually enabled
-	s.linearSweepMinConfidence = 0.3;  // Threshold if manually enabled
 	s.useSwitchResolution = true;
 	s.switchTargetWeight = 1.5;
 	s.useTailCallAnalysis = true;
 	s.tailCallTargetWeight = 1.5;
-	
+
 	// Higher limits for scanning
-	s.maxCandidates = 15000;
 	s.linearSweepMaxBlocks = 75000;
-	
+
 	return s;
 }
 
 FunctionDetectionSettings FunctionDetector::ConservativeSettings()
 {
 	FunctionDetectionSettings s;
-	s.minimumScore = 0.6;
-	s.highConfidenceScore = 0.9;
+	s.ApplyUnifiedConfig(UnifiedDetectionConfig::Conservative());
 	s.alignmentPreference = 4;
-	
-	// Higher thresholds
-	s.prologuePush.threshold = 0.7;
-	s.blTarget.threshold = 0.5;
-	s.afterUnconditionalRet.threshold = 0.7;
-	
-	// Lower weights for weak signals
-	s.alignmentBoundary.weight = 0.1;
-	s.instructionSequence.weight = 0.4;
-	s.entropyTransition.weight = 0.3;
-	
-	// Higher penalties
-	s.midInstructionPenalty = 1.5;
-	s.unlikelyPatternPenalty = 0.6;
-	
+
 	return s;
 }
 
@@ -218,8 +191,33 @@ FunctionDetectionSettings FunctionDetector::CallTargetOnlySettings()
 	return s;
 }
 
+void FunctionDetector::InitDataCache()
+{
+	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
+	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+
+	m_dataCacheStart = start;
+	m_dataCacheLen = static_cast<size_t>(end - start);
+	m_dataCache = m_view->ReadBuffer(start, m_dataCacheLen);
+	m_dataCacheLen = m_dataCache.GetLength();  // Actual bytes read
+
+	if (m_logger)
+		m_logger->LogInfo("FunctionDetector: Data cache initialized: 0x%llx - 0x%llx (%zu bytes)",
+			(unsigned long long)start, (unsigned long long)(start + m_dataCacheLen),
+			m_dataCacheLen);
+}
+
 uint32_t FunctionDetector::ReadInstruction32(uint64_t address)
 {
+	// Fast path: read from bulk cache
+	if (address >= m_dataCacheStart && address + 4 <= m_dataCacheStart + m_dataCacheLen)
+	{
+		const uint8_t* data = static_cast<const uint8_t*>(m_dataCache.GetData());
+		size_t offset = static_cast<size_t>(address - m_dataCacheStart);
+		return data[offset] | (data[offset + 1] << 8) |
+		       (data[offset + 2] << 16) | (data[offset + 3] << 24);
+	}
+	// Slow fallback for addresses outside cache
 	DataBuffer buf = m_view->ReadBuffer(address, 4);
 	if (buf.GetLength() < 4)
 		return 0;
@@ -229,6 +227,14 @@ uint32_t FunctionDetector::ReadInstruction32(uint64_t address)
 
 uint16_t FunctionDetector::ReadInstruction16(uint64_t address)
 {
+	// Fast path: read from bulk cache
+	if (address >= m_dataCacheStart && address + 2 <= m_dataCacheStart + m_dataCacheLen)
+	{
+		const uint8_t* data = static_cast<const uint8_t*>(m_dataCache.GetData());
+		size_t offset = static_cast<size_t>(address - m_dataCacheStart);
+		return data[offset] | (data[offset + 1] << 8);
+	}
+	// Slow fallback for addresses outside cache
 	DataBuffer buf = m_view->ReadBuffer(address, 2);
 	if (buf.GetLength() < 2)
 		return 0;
@@ -242,19 +248,60 @@ bool FunctionDetector::IsValidInstruction(uint64_t address, bool thumb)
 	{
 		if (address & 1)
 			return false;  // Must be 2-byte aligned
-		uint16_t instr = ReadInstruction16(address);
-		// Basic validity check
-		return instr != 0x0000 && instr != 0xFFFF;
 	}
 	else
 	{
 		if (address & 3)
 			return false;  // Must be 4-byte aligned
-		uint32_t instr = ReadInstruction32(address);
-		// Check condition field
-		uint32_t cond = (instr >> 28) & 0xF;
-		return instr != 0x00000000 && instr != 0xFFFFFFFF && cond <= 0xE;
 	}
+
+	// Reject if this address is in a data region
+	if (IsDataRegion(address))
+		return false;
+
+	// Read bytes and reject obvious padding
+	size_t instrLen = thumb ? 2 : 4;
+	DataBuffer buf = m_view->ReadBuffer(address, instrLen);
+	if (buf.GetLength() < instrLen)
+		return false;
+
+	const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
+
+	if (!thumb)
+	{
+		// Reject null and all-FF padding
+		uint32_t instr = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+		if (instr == 0x00000000 || instr == 0xFFFFFFFF)
+			return false;
+		// Basic condition field check
+		uint32_t cond = (instr >> 28) & 0xF;
+		if (cond > 0xE)
+			return false;
+	}
+	else
+	{
+		uint16_t instr = bytes[0] | (bytes[1] << 8);
+		if (instr == 0x0000 || instr == 0xFFFF)
+			return false;
+	}
+
+	// Attempt actual instruction decode via the architecture
+	Ref<Architecture> arch = m_view->GetDefaultArchitecture();
+	if (arch)
+	{
+		if (thumb)
+		{
+			uint64_t tempAddr = address | 1;
+			Ref<Architecture> thumbArch = arch->GetAssociatedArchitectureByAddress(tempAddr);
+			if (thumbArch)
+				arch = thumbArch;
+		}
+		InstructionInfo info;
+		if (!arch->GetInstructionInfo(bytes, address, buf.GetLength(), info) || info.length == 0)
+			return false;
+	}
+
+	return true;
 }
 
 bool FunctionDetector::IsInsideKnownFunction(uint64_t address)
@@ -270,54 +317,50 @@ bool FunctionDetector::IsInsideKnownFunction(uint64_t address)
 
 bool FunctionDetector::IsDataRegion(uint64_t address)
 {
-	// Check if in a non-executable segment
-	auto seg = m_view->GetSegmentAt(address);
-	if (seg && !(seg->GetFlags() & SegmentExecutable))
-		return true;
-	
-	// For raw firmware without segments, use heuristics to detect data
-	if (m_view->GetSegments().empty())
+	return CodeDataClassifier::IsDataRegion(m_view, address);
+}
+
+bool FunctionDetector::IsValidBranchSource(uint64_t sourceAddress, bool thumb)
+{
+	// Validate that a BL/BLX instruction's source address is in a legitimate
+	// code region. Data bytes that happen to decode as BL produce false call
+	// targets, so we verify the source is real code before trusting its target.
+
+	// Must be properly aligned
+	if (!thumb && (sourceAddress & 3))
+		return false;
+	if (thumb && (sourceAddress & 1))
+		return false;
+
+	// Must not be in a data region (covers segment flags, data variables,
+	// strings, code semantics, and file-backed checks)
+	if (IsDataRegion(sourceAddress))
+		return false;
+
+	// Must be a decodable instruction at the source
+	Ref<Architecture> arch = m_view->GetDefaultArchitecture();
+	if (arch)
 	{
-		// Check if this looks like ASCII string data
-		DataBuffer buf = m_view->ReadBuffer(address, 16);
-		if (buf.GetLength() >= 16)
+		if (thumb)
 		{
-			const uint8_t* bytes = static_cast<const uint8_t*>(buf.GetData());
-			int printableCount = 0;
-			bool hasNull = false;
-			for (size_t i = 0; i < 16; i++)
-			{
-				if (bytes[i] == 0)
-					hasNull = true;
-				else if ((bytes[i] >= 0x20 && bytes[i] < 0x7F) || bytes[i] == '\n' || bytes[i] == '\r' || bytes[i] == '\t')
-					printableCount++;
-			}
-			// If mostly printable ASCII with at least one null, likely a string region
-			if (printableCount >= 10 && hasNull)
-				return true;
+			uint64_t tempAddr = sourceAddress | 1;
+			Ref<Architecture> thumbArch = arch->GetAssociatedArchitectureByAddress(tempAddr);
+			if (thumbArch)
+				arch = thumbArch;
 		}
-		
-		// Check if this looks like a pointer table (4+ consecutive valid pointers)
-		if (buf.GetLength() >= 16)
-		{
-			uint64_t start = m_view->GetStart();
-			uint64_t end = m_view->GetEnd();
-			int ptrCount = 0;
-			for (size_t i = 0; i + 4 <= 16; i += 4)
-			{
-				uint32_t val = 0;
-				memcpy(&val, static_cast<const uint8_t*>(buf.GetData()) + i, 4);
-				// Check if it looks like a pointer into the binary
-				if (val >= start && val < end && (val & 3) == 0)
-					ptrCount++;
-			}
-			// 4 consecutive pointers = likely pointer table
-			if (ptrCount >= 4)
-				return true;
-		}
+		size_t readLen = thumb ? 4 : 4;  // BL is always 4 bytes (even Thumb BL is 32-bit)
+		DataBuffer buf = m_view->ReadBuffer(sourceAddress, readLen);
+		if (buf.GetLength() < readLen)
+			return false;
+
+		InstructionInfo info;
+		if (!arch->GetInstructionInfo(
+				static_cast<const uint8_t*>(buf.GetData()), sourceAddress, buf.GetLength(), info)
+			|| info.length == 0)
+			return false;
 	}
-	
-	return false;
+
+	return true;
 }
 
 bool FunctionDetector::CheckArmPrologue(uint64_t address, uint32_t instr)
@@ -480,26 +523,40 @@ void FunctionDetector::ScanProloguePatterns(std::map<uint64_t, FunctionCandidate
 	if (!m_settings.prologuePush.enabled && !m_settings.prologueSubSp.enabled &&
 		!m_settings.prologueMovFp.enabled && !m_settings.prologueStmfd.enabled)
 		return;
-	
+
 	m_logger->LogDebug("FunctionDetector: Scanning prologue patterns...");
-	
+
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+	// Limit to estimated code region to avoid scanning data
+	if (m_estimatedCodeEnd > 0 && m_estimatedCodeEnd < end)
+		end = m_estimatedCodeEnd;
 	
+	uint64_t rangeSize = (end > start) ? (end - start) : 1;
+
 	// Scan ARM mode
 	if (m_settings.detectArmFunctions)
 	{
 		for (uint64_t addr = start; addr + 4 <= end; addr += 4)
 		{
+			if ((addr - start) % 0x10000 == 0 && addr > start)
+			{
+				size_t pct = (size_t)(100 * (addr - start) / rangeSize);
+				ReportProgress(m_currentPhase, kTotalPhases,
+					"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+					+ "] ARM prologues... " + std::to_string(pct) + "%"
+					+ " (" + std::to_string(candidates.size()) + " found)");
+			}
+
 			if (m_settings.scanExecutableOnly && IsDataRegion(addr))
 				continue;
-			
+
 			uint32_t instr = ReadInstruction32(addr);
 			if (CheckArmPrologue(addr, instr))
 			{
 				DetectionSource source = DetectionSource::ProloguePush;
 				double score = m_settings.prologuePush.weight;
-				
+
 				// Check for STMFD specifically
 				if ((instr & 0x0FFF0000) == 0x092D0000)
 				{
@@ -509,29 +566,38 @@ void FunctionDetector::ScanProloguePatterns(std::map<uint64_t, FunctionCandidate
 					if (regCount >= 4)
 						score *= 1.2;
 				}
-				
+
 				AddCandidate(candidates, addr, false, source, score,
 					"ARM prologue detected");
 			}
 		}
 	}
-	
+
 	// Scan Thumb mode
 	if (m_settings.detectThumbFunctions)
 	{
 		for (uint64_t addr = start; addr + 4 <= end; addr += 2)
 		{
+			if ((addr - start) % 0x10000 == 0 && addr > start)
+			{
+				size_t pct = (size_t)(100 * (addr - start) / rangeSize);
+				ReportProgress(m_currentPhase, kTotalPhases,
+					"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+					+ "] Thumb prologues... " + std::to_string(pct) + "%"
+					+ " (" + std::to_string(candidates.size()) + " found)");
+			}
+
 			if (m_settings.scanExecutableOnly && IsDataRegion(addr))
 				continue;
-			
+
 			uint16_t instr = ReadInstruction16(addr);
 			uint16_t next = ReadInstruction16(addr + 2);
-			
+
 			if (CheckThumbPrologue(addr, instr, next))
 			{
 				DetectionSource source = DetectionSource::ProloguePush;
 				double score = m_settings.prologuePush.weight;
-				
+
 				AddCandidate(candidates, addr, true, source, score,
 					"Thumb prologue detected");
 			}
@@ -585,16 +651,26 @@ void FunctionDetector::EstimateCodeBoundary()
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
 
-	// Find the highest PROLOGUE address - prologues are reliable code indicators
-	// PUSH {lr} / STMFD sp!, {..., lr} patterns
+	// Find the highest PROLOGUE address by scanning backward from the end.
+	// Prologues (PUSH/STMFD with LR) are reliable code indicators.
+	// Backward scan finds it in O(data_tail) instead of O(entire_image).
 	uint64_t highestPrologue = start;
-	for (uint64_t addr = start; addr + 4 <= end; addr += 4)
+	if (end > start + 4)
 	{
-		uint32_t instr = ReadInstruction32(addr);
-		// PUSH/STMFD sp!, {...} with LR (bit 14 set)
-		if ((instr & 0x0FFF0000) == 0x092D0000 && (instr & 0x4000))
+		// Align to 4-byte boundary, scan backward
+		uint64_t addr = (end - 4) & ~3ULL;
+		for (; addr >= start; addr -= 4)
 		{
-			highestPrologue = addr;
+			uint32_t instr = ReadInstruction32(addr);
+			// PUSH/STMFD sp!, {...} with LR (bit 14 set)
+			if ((instr & 0x0FFF0000) == 0x092D0000 && (instr & 0x4000))
+			{
+				highestPrologue = addr;
+				break;
+			}
+			// Guard against underflow
+			if (addr == start)
+				break;
 		}
 	}
 
@@ -624,25 +700,43 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
 
-	// Use estimated code end to limit scan range
-	uint64_t codeRegionEnd = m_estimatedCodeEnd > 0 ? m_estimatedCodeEnd : end;
-	
+	// Scan the FULL range for BL/BLX source instructions (not limited to
+	// m_estimatedCodeEnd). The code boundary estimate can be wrong — code
+	// can exist beyond the highest prologue. IsValidBranchSource() already
+	// filters out BLs that originate from data regions, so scanning the
+	// full range is safe and avoids missing call targets in late-code.
 	m_logger->LogDebug("FunctionDetector: Scanning call targets from 0x%llx to 0x%llx",
-		(unsigned long long)start, (unsigned long long)codeRegionEnd);
+		(unsigned long long)start, (unsigned long long)end);
 
 	// Collect all call targets
 	m_callTargets.clear();
 
-	// Scan for BL/BLX instructions - ONLY in estimated code region
-	// This prevents data-as-BL from creating false call targets
-	for (uint64_t addr = start; addr + 4 <= codeRegionEnd; addr += 4)
+	uint64_t armRangeSize = (end > start) ? (end - start) : 1;
+	uint64_t thumbRangeSize = armRangeSize;
+
+	// Scan for BL/BLX instructions across the full range.
+	// IsValidBranchSource() filters out data-decoded BLs.
+	for (uint64_t addr = start; addr + 4 <= end; addr += 4)
 	{
+		if ((addr - start) % 0x10000 == 0 && addr > start)
+		{
+			size_t pct = (size_t)(100 * (addr - start) / armRangeSize);
+			ReportProgress(m_currentPhase, kTotalPhases,
+				"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+				+ "] ARM call targets... " + std::to_string(pct) + "%"
+				+ " (" + std::to_string(m_callTargets.size()) + " found)");
+		}
+
 		uint32_t instr = ReadInstruction32(addr);
 		uint32_t cond = (instr >> 28) & 0xF;
 
 		// BL <label> - Encoding: cond 1011 imm24
 		if ((instr & 0x0F000000) == 0x0B000000 && cond <= 0xE)
 		{
+			// Validate that the source BL instruction is in real code
+			if (!IsValidBranchSource(addr, false))
+				continue;
+
 			int32_t offset = instr & 0x00FFFFFF;
 			if (offset & 0x00800000)
 				offset |= 0xFF000000;  // Sign extend
@@ -665,6 +759,10 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 		// BLX <label> - Encoding: 1111 101 H imm24
 		if ((instr & 0xFE000000) == 0xFA000000)
 		{
+			// Validate that the source BLX instruction is in real code
+			if (!IsValidBranchSource(addr, false))
+				continue;
+
 			int32_t offset = instr & 0x00FFFFFF;
 			if (offset & 0x00800000)
 				offset |= 0xFF000000;
@@ -688,12 +786,25 @@ void FunctionDetector::ScanCallTargets(std::map<uint64_t, FunctionCandidate>& ca
 	// Also scan Thumb BL/BLX
 	for (uint64_t addr = start; addr + 4 <= end; addr += 2)
 	{
+		if ((addr - start) % 0x10000 == 0 && addr > start)
+		{
+			size_t pct = (size_t)(100 * (addr - start) / thumbRangeSize);
+			ReportProgress(m_currentPhase, kTotalPhases,
+				"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+				+ "] Thumb call targets... " + std::to_string(pct) + "%"
+				+ " (" + std::to_string(m_callTargets.size()) + " found)");
+		}
+
 		uint16_t hw1 = ReadInstruction16(addr);
 		uint16_t hw2 = ReadInstruction16(addr + 2);
 
 		// 32-bit Thumb BL: 11110 S imm10 11 J1 1 J2 imm11
 		if ((hw1 & 0xF800) == 0xF000 && (hw2 & 0xD000) == 0xD000)
 		{
+			// Validate that the source Thumb BL instruction is in real code
+			if (!IsValidBranchSource(addr, true))
+				continue;
+
 			uint32_t S = (hw1 >> 10) & 1;
 			uint32_t imm10 = hw1 & 0x3FF;
 			uint32_t J1 = (hw2 >> 13) & 1;
@@ -788,12 +899,25 @@ void FunctionDetector::ScanStructuralPatterns(std::map<uint64_t, FunctionCandida
 
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+	// Limit to estimated code region — scanning data for structural patterns is noise
+	if (m_estimatedCodeEnd > 0 && m_estimatedCodeEnd < end)
+		end = m_estimatedCodeEnd;
+	uint64_t rangeSize = (end > start) ? (end - start) : 1;
 
 	// Look for code after return instructions
 	if (m_settings.afterUnconditionalRet.enabled)
 	{
 		for (uint64_t addr = start; addr + 8 <= end; addr += 4)
 		{
+			if ((addr - start) % 0x10000 == 0 && addr > start)
+			{
+				size_t pct = (size_t)(100 * (addr - start) / rangeSize);
+				ReportProgress(m_currentPhase, kTotalPhases,
+					"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+					+ "] Structural patterns... " + std::to_string(pct) + "%"
+					+ " (" + std::to_string(candidates.size()) + " found)");
+			}
+
 			uint32_t instr = ReadInstruction32(addr);
 			uint32_t cond = (instr >> 28) & 0xF;
 
@@ -895,10 +1019,13 @@ void FunctionDetector::ScanStructuralPatterns(std::map<uint64_t, FunctionCandida
 					if ((nextInstr & 0x0FFF0000) == 0x052D0000 && ((nextInstr >> 12) & 0xF) == 14)
 						hasPrologue = true;
 
-					// Use full weight for prologue, reduced weight for non-prologue
-					// Non-prologue candidates will still be found but need more corroboration
+					// Use full weight for prologue, reduced weight for non-prologue.
+					// Non-prologue: 1.3 * 0.8 = 1.04 -> score 1.04/6.0 = 0.173
+					// This clears the 0.15 minimum threshold, allowing leaf functions
+					// (which often lack prologues) to be detected when they appear
+					// immediately after a return instruction.
 					double weight = hasPrologue ? m_settings.afterUnconditionalRet.weight
-					                            : m_settings.afterUnconditionalRet.weight * 0.6;
+					                            : m_settings.afterUnconditionalRet.weight * 0.8;
 
 					AddCandidate(candidates, nextAddr, false,
 						DetectionSource::AfterUnconditionalRet, weight,
@@ -973,7 +1100,7 @@ void FunctionDetector::ScanStructuralPatterns(std::map<uint64_t, FunctionCandida
 							hasPrologue = true;
 
 						double weight = hasPrologue ? m_settings.afterTailCall.weight
-						                            : m_settings.afterTailCall.weight * 0.5;
+						                            : m_settings.afterTailCall.weight * 0.8;
 
 						AddCandidate(candidates, nextAddr, false,
 							DetectionSource::AfterTailCall, weight,
@@ -1069,9 +1196,12 @@ void FunctionDetector::ScanExceptionHandlers(std::map<uint64_t, FunctionCandidat
 void FunctionDetector::ScanAdvancedPatterns(std::map<uint64_t, FunctionCandidate>& candidates)
 {
 	m_logger->LogDebug("FunctionDetector: Scanning advanced patterns...");
-	
+
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
 	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
+	// Limit to estimated code region
+	if (m_estimatedCodeEnd > 0 && m_estimatedCodeEnd < end)
+		end = m_estimatedCodeEnd;
 	
 	// Thunk detection: LDR pc, [pc, #offset]
 	if (m_settings.thunkPattern.enabled)
@@ -1115,20 +1245,32 @@ void FunctionDetector::ScanCompilerPatterns(std::map<uint64_t, FunctionCandidate
 	DetectedCompiler compiler = DetectCompilerStyle();
 	m_stats.detectedCompiler = compiler;
 
-	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
-	uint64_t end = m_settings.scanEnd ? m_settings.scanEnd : m_view->GetEnd();
-
-	// Use enhanced prologue matcher for comprehensive pattern detection
+	// Instead of re-scanning the entire range (which duplicates Phase 1 work and
+	// takes 20+ seconds for the PrologueMatcher's per-instruction ReadBuffer calls),
+	// annotate existing prologue candidates with compiler-specific attribution.
 	PrologueMatcher matcher(m_view);
 
-	// Scan with the enhanced pattern matcher
-	auto matches = matcher.scanForPrologues(start, end,
-		m_settings.detectArmFunctions,
-		m_settings.detectThumbFunctions,
-		0.7);  // Minimum confidence for compiler patterns
-
-	for (const auto& match : matches)
+	size_t annotated = 0;
+	for (auto& pair : candidates)
 	{
+		FunctionCandidate& c = pair.second;
+
+		// Only annotate candidates that came from prologue-related sources
+		uint32_t prologueBits =
+			static_cast<uint32_t>(DetectionSource::ProloguePush) |
+			static_cast<uint32_t>(DetectionSource::PrologueSubSp) |
+			static_cast<uint32_t>(DetectionSource::PrologueMovFp) |
+			static_cast<uint32_t>(DetectionSource::PrologueStmfd);
+		if (!(c.sources & prologueBits))
+			continue;
+
+		// Use PrologueMatcher to get detailed compiler attribution for this address
+		auto matches = matcher.matchPrologue(c.address, c.isThumb);
+		if (matches.empty() || matches[0].confidence < 0.7)
+			continue;
+
+		const auto& match = matches[0];
+
 		// Determine detection source based on compiler
 		DetectionSource source = DetectionSource::GccPrologue;
 		double weight = m_settings.gccPrologue.weight;
@@ -1149,10 +1291,8 @@ void FunctionDetector::ScanCompilerPatterns(std::map<uint64_t, FunctionCandidate
 			weight = m_settings.interruptPrologue.weight;
 		}
 
-		// Scale weight by confidence
 		double score = weight * match.confidence;
 
-		// Build description
 		std::string desc = match.patternName;
 		if (match.savesLR)
 			desc += " (saves LR)";
@@ -1161,56 +1301,14 @@ void FunctionDetector::ScanCompilerPatterns(std::map<uint64_t, FunctionCandidate
 		if (match.stackAdjustment != 0)
 			desc += " (stack: " + std::to_string(match.stackAdjustment) + ")";
 
-		AddCandidate(candidates, match.address, match.isThumb, source, score, desc);
+		// Add compiler source to existing candidate
+		c.sources |= static_cast<uint32_t>(source);
+		c.sourceScores[source] = score;
+		c.description += "; " + desc;
+		annotated++;
 	}
 
-	// Also do the legacy simple pattern detection for compatibility
-	// GCC-specific patterns (simple fallback)
-	if (compiler == DetectedCompiler::GCC || compiler == DetectedCompiler::Unknown)
-	{
-		for (uint64_t addr = start; addr + 8 <= end; addr += 4)
-		{
-			// Skip if already found by enhanced matcher
-			if (candidates.count(addr))
-				continue;
-
-			uint32_t instr1 = ReadInstruction32(addr);
-			uint32_t instr2 = ReadInstruction32(addr + 4);
-
-			// GCC often uses: PUSH {r4-r11, lr} followed by SUB sp, sp, #imm
-			if ((instr1 & 0x0FFF0000) == 0x092D0000 &&  // PUSH
-				(instr2 & 0x0FFF0000) == 0x024DD000)    // SUB sp
-			{
-				AddCandidate(candidates, addr, false,
-					DetectionSource::GccPrologue, m_settings.gccPrologue.weight,
-					"GCC prologue pattern (legacy)");
-			}
-		}
-	}
-
-	// ARMCC-specific patterns (simple fallback)
-	if (compiler == DetectedCompiler::ARMCC || compiler == DetectedCompiler::Unknown)
-	{
-		for (uint64_t addr = start; addr + 4 <= end; addr += 4)
-		{
-			if (candidates.count(addr))
-				continue;
-
-			uint32_t instr = ReadInstruction32(addr);
-
-			// ARMCC often uses STMFD with r12
-			if ((instr & 0x0FFF0000) == 0x092D0000)
-			{
-				uint32_t reglist = instr & 0xFFFF;
-				if ((reglist & (1 << 12)) && (reglist & (1 << 14)))  // r12 and lr
-				{
-					AddCandidate(candidates, addr, false,
-						DetectionSource::ArmccPrologue, m_settings.armccPrologue.weight,
-						"ARMCC prologue pattern (legacy)");
-				}
-			}
-		}
-	}
+	m_logger->LogDebug("FunctionDetector: Annotated %zu candidates with compiler patterns", annotated);
 }
 
 void FunctionDetector::ScanRtosPatterns(std::map<uint64_t, FunctionCandidate>& candidates)
@@ -1271,10 +1369,15 @@ void FunctionDetector::ScanSwitchTargets(std::map<uint64_t, FunctionCandidate>& 
 
 	m_logger->LogDebug("FunctionDetector: Resolving switch tables...");
 
-	// Configure switch resolver
+	// Configure switch resolver — limit to code region
 	SwitchResolverSettings swSettings;
 	swSettings.scanStart = m_settings.scanStart;
 	swSettings.scanEnd = m_settings.scanEnd;
+	if (m_estimatedCodeEnd > 0)
+	{
+		if (swSettings.scanEnd == 0 || m_estimatedCodeEnd < swSettings.scanEnd)
+			swSettings.scanEnd = m_estimatedCodeEnd;
+	}
 	swSettings.maxTotalTables = m_settings.switchMaxTables;
 	swSettings.validateTargets = true;
 
@@ -1552,10 +1655,14 @@ void FunctionDetector::ScanLinearSweep(std::map<uint64_t, FunctionCandidate>& ca
 	// Configure the linear sweep analyzer
 	// LIMIT scan range to estimated code region to avoid finding blocks in data
 	LinearSweepSettings lsSettings;
+
+	// Apply unified config first (sets minimumConfidence, mode-specific params)
+	lsSettings.ApplyUnifiedConfig(m_settings.unifiedConfig);
+
+	// Then apply FunctionDetector-specific overrides
 	lsSettings.scanStart = m_settings.scanStart;
 	lsSettings.scanEnd = m_estimatedCodeEnd > 0 ? m_estimatedCodeEnd : m_settings.scanEnd;
 	lsSettings.maxTotalBlocks = m_settings.linearSweepMaxBlocks;
-	lsSettings.minimumConfidence = m_settings.linearSweepMinConfidence;
 	lsSettings.skipKnownFunctions = m_settings.respectExistingFunctions;
 	
 	m_logger->LogDebug("FunctionDetector: Linear sweep range 0x%llx to 0x%llx",
@@ -1602,9 +1709,19 @@ void FunctionDetector::ScanCfgValidation(std::map<uint64_t, FunctionCandidate>& 
 
 	size_t validated = 0;
 	size_t failed = 0;
+	size_t processed = 0;
+	size_t totalCandidates = candidates.size();
 
 	for (auto& pair : candidates)
 	{
+		if (++processed % 100 == 0)
+		{
+			ReportProgress(m_currentPhase, kTotalPhases,
+				"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+				+ "] CFG validation... " + std::to_string(processed) + "/" + std::to_string(totalCandidates)
+				+ " (" + std::to_string(validated) + " valid)");
+		}
+
 		FunctionCandidate& c = pair.second;
 
 		// Only validate candidates with a minimum score threshold
@@ -1660,11 +1777,21 @@ void FunctionDetector::ScanCfgValidation(std::map<uint64_t, FunctionCandidate>& 
 void FunctionDetector::ApplyNegativePatterns(std::map<uint64_t, FunctionCandidate>& candidates)
 {
 	m_logger->LogDebug("FunctionDetector: Applying negative patterns...");
-	
+
+	size_t processed = 0;
+	size_t totalCandidates = candidates.size();
+
 	for (auto& pair : candidates)
 	{
+		if (++processed % 200 == 0)
+		{
+			ReportProgress(m_currentPhase, kTotalPhases,
+				"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+				+ "] Negative patterns... " + std::to_string(processed) + "/" + std::to_string(totalCandidates));
+		}
+
 		FunctionCandidate& c = pair.second;
-		
+
 		// Check if inside existing function
 		if (m_settings.respectExistingFunctions && IsInsideKnownFunction(c.address))
 		{
@@ -1760,28 +1887,89 @@ void FunctionDetector::ApplyNegativePatterns(std::map<uint64_t, FunctionCandidat
 	}
 }
 
+double FunctionDetector::GetConfiguredWeight(DetectionSource source) const
+{
+	switch (source)
+	{
+	case DetectionSource::ProloguePush:        return m_settings.prologuePush.weight;
+	case DetectionSource::PrologueSubSp:       return m_settings.prologueSubSp.weight;
+	case DetectionSource::PrologueMovFp:       return m_settings.prologueMovFp.weight;
+	case DetectionSource::PrologueStmfd:       return m_settings.prologueStmfd.weight;
+	case DetectionSource::BlTarget:            return m_settings.blTarget.weight;
+	case DetectionSource::BlxTarget:           return m_settings.blxTarget.weight;
+	case DetectionSource::IndirectCallTarget:  return m_settings.indirectCallTarget.weight;
+	case DetectionSource::HighXrefDensity:     return m_settings.highXrefDensity.weight;
+	case DetectionSource::PointerTableEntry:   return m_settings.pointerTableEntry.weight;
+	case DetectionSource::AfterUnconditionalRet: return m_settings.afterUnconditionalRet.weight;
+	case DetectionSource::AfterTailCall:       return m_settings.afterTailCall.weight;
+	case DetectionSource::AlignmentBoundary:   return m_settings.alignmentBoundary.weight;
+	case DetectionSource::AfterLiteralPool:    return m_settings.afterLiteralPool.weight;
+	case DetectionSource::AfterPadding:        return m_settings.afterPadding.weight;
+	case DetectionSource::VectorTableTarget:   return m_settings.vectorTableTarget.weight;
+	case DetectionSource::InterruptPrologue:   return m_settings.interruptPrologue.weight;
+	case DetectionSource::ThunkPattern:        return m_settings.thunkPattern.weight;
+	case DetectionSource::TrampolinePattern:   return m_settings.trampolinePattern.weight;
+	case DetectionSource::SwitchCaseHandler:   return m_settings.switchCaseHandler.weight;
+	case DetectionSource::GccPrologue:         return m_settings.gccPrologue.weight;
+	case DetectionSource::ArmccPrologue:       return m_settings.armccPrologue.weight;
+	case DetectionSource::IarPrologue:         return m_settings.iarPrologue.weight;
+	case DetectionSource::TaskEntryPattern:    return m_settings.taskEntryPattern.weight;
+	case DetectionSource::CallbackPattern:     return m_settings.callbackPattern.weight;
+	case DetectionSource::InstructionSequence: return m_settings.instructionSequence.weight;
+	case DetectionSource::EntropyTransition:   return m_settings.entropyTransition.weight;
+	case DetectionSource::CfgValidated:        return m_settings.cfgValidation.weight;
+	// Negative sources — return their penalty values
+	case DetectionSource::MidInstruction:      return m_settings.midInstructionPenalty;
+	case DetectionSource::InsideFunction:      return m_settings.insideFunctionPenalty;
+	case DetectionSource::DataRegion:          return m_settings.dataRegionPenalty;
+	case DetectionSource::InvalidInstruction:  return m_settings.invalidInstructionPenalty;
+	case DetectionSource::UnlikelyPattern:     return m_settings.unlikelyPatternPenalty;
+	default:                                   return 1.0;
+	}
+}
+
 double FunctionDetector::CalculateFinalScore(const FunctionCandidate& candidate)
 {
 	double positiveScore = 0;
 	double negativeScore = 0;
-	double maxPositive = 0;
-	
+	size_t positiveSourceCount = 0;
+
 	for (const auto& pair : candidate.sourceScores)
 	{
 		if (pair.second > 0)
 		{
 			positiveScore += pair.second;
-			maxPositive += 3.0;  // Assume max weight of 3.0
+			positiveSourceCount++;
 		}
 		else
 		{
 			negativeScore += std::abs(pair.second);
 		}
 	}
-	
-	// Normalize to 0-1 range
-	double score = (positiveScore - negativeScore) / std::max(maxPositive, 1.0);
-	return std::max(0.0, std::min(1.0, score));
+
+	// Normalize against a FIXED maximum rather than per-candidate maximum.
+	// This ensures a single weak source (e.g., AfterUnconditionalRet weight 0.78)
+	// doesn't score the same as a multi-source candidate (e.g., BL target + prologue).
+	//
+	// The fixed denominator represents "ideal strong evidence": a BL target (3.0)
+	// plus a prologue (1.5) plus structural evidence (1.3) = ~5.8.
+	// Using 6.0 as the ceiling means:
+	//   - Single BL target (3.0): score = 3.0/6.0 = 0.50
+	//   - BL target + prologue (4.5): score = 4.5/6.0 = 0.75
+	//   - BL + prologue + structural (5.8): score = 5.8/6.0 = 0.97
+	//   - Single weak "after return" (0.78): score = 0.78/6.0 = 0.13
+	static constexpr double kScoreCeiling = 6.0;
+
+	double rawScore = (positiveScore - negativeScore) / kScoreCeiling;
+
+	// Corroboration bonus: multiple independent sources increase confidence.
+	// Single-source candidates get no bonus; 2+ sources get a small boost.
+	if (positiveSourceCount >= 3)
+		rawScore *= 1.15;
+	else if (positiveSourceCount >= 2)
+		rawScore *= 1.05;
+
+	return std::max(0.0, std::min(1.0, rawScore));
 }
 
 DetectedCompiler FunctionDetector::DetectCompilerStyle()
@@ -1838,6 +2026,8 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	
 	m_logger->LogInfo("FunctionDetector: Starting detection...");
 
+	auto setupStart = std::chrono::steady_clock::now();
+
 	// Cache the function list once - calling GetAnalysisFunctionList() is expensive
 	m_cachedFunctionList = m_view->GetAnalysisFunctionList();
 
@@ -1847,74 +2037,82 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	{
 		m_existingFunctions.insert(func->GetStart());
 	}
-	
+
+	// Bulk-read the entire scan range into memory for fast instruction reads.
+	// This eliminates millions of individual ReadBuffer() heap allocations.
+	InitDataCache();
+
 	// Estimate code boundary FIRST - this limits where we scan for candidates
 	EstimateCodeBoundary();
 	m_stats.existingFunctions = m_existingFunctions.size();
-	
+
+	double setupSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - setupStart).count();
+	if (m_logger)
+		m_logger->LogInfo("FunctionDetector: Setup (func list + data cache + boundary) took %.3f s", setupSecs);
+
 	// Collect candidates from all detectors (14 phases total)
 	std::map<uint64_t, FunctionCandidate> candidates;
-	constexpr size_t kTotalPhases = 14;
-	size_t currentPhase = 0;
+	m_currentPhase = 0;
 
 	// Reset cancellation state
 	m_cancellationRequested = false;
 
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning prologue patterns"))
-		return {};
-	ScanProloguePatterns(candidates);
+	// Helper to build phase prefix string: "[N/14] label"
+	auto phaseMsg = [&](const std::string& label) -> std::string {
+		return "[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases) + "] " + label;
+	};
+	auto phaseDone = [&](const std::string& label) -> std::string {
+		return phaseMsg(label) + " — " + std::to_string(candidates.size()) + " candidates";
+	};
 
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning call targets"))
-		return {};
-	ScanCallTargets(candidates);
+	// Timed phase runner: logs per-phase duration to help identify bottlenecks.
+	auto runPhase = [&](const char* label, auto&& scanFn) -> bool {
+		++m_currentPhase;
+		if (!ReportProgress(m_currentPhase, kTotalPhases, phaseMsg(std::string("Scanning ") + label)))
+			return false;
+		auto t0 = std::chrono::steady_clock::now();
+		scanFn();
+		double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		if (m_logger)
+			m_logger->LogInfo("Phase %zu/%zu [%s] took %.3f s (%zu candidates)",
+				m_currentPhase, kTotalPhases, label, secs, candidates.size());
+		if (!ReportProgress(m_currentPhase, kTotalPhases, phaseDone(label)))
+			return false;
+		return true;
+	};
 
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning cross-references"))
+	if (!runPhase("Prologue patterns", [&]() { ScanProloguePatterns(candidates); }))
 		return {};
-	ScanCrossReferences(candidates);
+	if (!runPhase("Call targets", [&]() { ScanCallTargets(candidates); }))
+		return {};
+	if (!runPhase("Cross-references", [&]() { ScanCrossReferences(candidates); }))
+		return {};
+	if (!runPhase("Structural patterns", [&]() { ScanStructuralPatterns(candidates); }))
+		return {};
+	if (!runPhase("Exception handlers", [&]() { ScanExceptionHandlers(candidates); }))
+		return {};
+	if (!runPhase("Advanced patterns", [&]() { ScanAdvancedPatterns(candidates); }))
+		return {};
+	if (!runPhase("Compiler patterns", [&]() { ScanCompilerPatterns(candidates); }))
+		return {};
+	if (!runPhase("RTOS patterns", [&]() { ScanRtosPatterns(candidates); }))
+		return {};
+	if (!runPhase("Statistical patterns", [&]() { ScanStatisticalPatterns(candidates); }))
+		return {};
+	if (!runPhase("Switch tables", [&]() { ScanSwitchTargets(candidates); }))
+		return {};
+	if (!runPhase("Tail calls", [&]() { ScanTailCallTargets(candidates); }))
+		return {};
+	if (!runPhase("Linear sweep", [&]() { ScanLinearSweep(candidates); }))
+		return {};
+	if (!runPhase("Negative patterns", [&]() { ApplyNegativePatterns(candidates); }))
+		return {};
 
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning structural patterns"))
+	++m_currentPhase;
+	if (!ReportProgress(m_currentPhase, kTotalPhases, phaseMsg("Scoring candidates")))
 		return {};
-	ScanStructuralPatterns(candidates);
+	auto scoringStart = std::chrono::steady_clock::now();
 
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning exception handlers"))
-		return {};
-	ScanExceptionHandlers(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning advanced patterns"))
-		return {};
-	ScanAdvancedPatterns(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning compiler patterns"))
-		return {};
-	ScanCompilerPatterns(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning RTOS patterns"))
-		return {};
-	ScanRtosPatterns(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scanning statistical patterns"))
-		return {};
-	ScanStatisticalPatterns(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Resolving switch tables"))
-		return {};
-	ScanSwitchTargets(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Analyzing tail calls"))
-		return {};
-	ScanTailCallTargets(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Running linear sweep"))
-		return {};
-	ScanLinearSweep(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Applying negative patterns"))
-		return {};
-	ApplyNegativePatterns(candidates);
-
-	if (!ReportProgress(++currentPhase, kTotalPhases, "Scoring candidates"))
-		return {};
-	
 	// Estimate code boundary using multiple heuristics
 	// The key insight: data decoded as BL gives false targets, so we need to validate
 	
@@ -1963,8 +2161,18 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	
 	// Calculate final scores
 	std::vector<FunctionCandidate> result;
+	size_t scored = 0;
+	size_t totalToScore = candidates.size();
 	for (auto& pair : candidates)
 	{
+		if (++scored % 200 == 0)
+		{
+			ReportProgress(m_currentPhase, kTotalPhases,
+				"[" + std::to_string(m_currentPhase) + "/" + std::to_string(kTotalPhases)
+				+ "] Scoring... " + std::to_string(scored) + "/" + std::to_string(totalToScore)
+				+ " (" + std::to_string(result.size()) + " passed)");
+		}
+
 		FunctionCandidate& c = pair.second;
 
 		// HARD FILTER: Reject misaligned addresses - ARM must be 4-byte aligned, Thumb must be 2-byte aligned
@@ -2033,11 +2241,224 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	for (const auto& c : result)
 		totalScore += c.score;
 	m_stats.averageScore = result.empty() ? 0 : totalScore / result.size();
-	
+
+	// Log score distribution for diagnostics
+	if (m_logger && !result.empty())
+	{
+		size_t above90 = 0, above70 = 0, above50 = 0, above30 = 0, below30 = 0;
+		for (const auto& c : result)
+		{
+			if (c.score >= 0.9) above90++;
+			else if (c.score >= 0.7) above70++;
+			else if (c.score >= 0.5) above50++;
+			else if (c.score >= 0.3) above30++;
+			else below30++;
+		}
+		m_logger->LogInfo("FunctionDetector: Score distribution: >=0.9:%zu >=0.7:%zu >=0.5:%zu >=0.3:%zu <0.3:%zu (avg=%.3f, min=%.3f)",
+			above90, above70, above50, above30, below30,
+			m_stats.averageScore, result.back().score);
+	}
+
+	double scoringSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - scoringStart).count();
+	if (m_logger)
+		m_logger->LogInfo("Phase %zu/%zu [Scoring candidates] took %.3f s (%zu results)",
+			m_currentPhase, kTotalPhases, scoringSecs, result.size());
+
 	m_logger->LogInfo("FunctionDetector: Found %zu candidates (high=%zu, med=%zu, low=%zu)",
 		result.size(), m_stats.highConfidence, m_stats.mediumConfidence, m_stats.lowConfidence);
-	
+
 	return result;
+}
+
+// ============================================================================
+// DetectionFeedback Implementation
+// ============================================================================
+
+void DetectionFeedback::RecordCorrectDetection(uint64_t addr, uint32_t sources, double score)
+{
+	m_entries.push_back({addr, FeedbackType::Correct, sources, score});
+}
+
+void DetectionFeedback::RecordFalsePositive(uint64_t addr, uint32_t sources, double score)
+{
+	m_entries.push_back({addr, FeedbackType::FalsePositive, sources, score});
+}
+
+void DetectionFeedback::RecordMissedFunction(uint64_t addr)
+{
+	m_entries.push_back({addr, FeedbackType::Missed, 0, 0.0});
+}
+
+FunctionDetectionSettings DetectionFeedback::ComputeAdjustedSettings(const FunctionDetectionSettings& base) const
+{
+	FunctionDetectionSettings adjusted = base;
+
+	if (m_entries.empty())
+		return adjusted;
+
+	// Count per-source correct and false-positive rates.
+	// For each DetectionSource bit, tally how often it appears in correct
+	// versus false-positive entries. Then scale the corresponding weight.
+	std::map<uint32_t, size_t> sourceCorrect;
+	std::map<uint32_t, size_t> sourceFalsePos;
+	size_t totalCorrect = 0;
+	size_t totalFalsePositive = 0;
+	size_t totalMissed = 0;
+
+	for (const auto& entry : m_entries)
+	{
+		switch (entry.type)
+		{
+		case FeedbackType::Correct:
+			totalCorrect++;
+			for (uint32_t bit = 0; bit < 32; bit++)
+			{
+				if (entry.detectionSources & (1U << bit))
+					sourceCorrect[1U << bit]++;
+			}
+			break;
+		case FeedbackType::FalsePositive:
+			totalFalsePositive++;
+			for (uint32_t bit = 0; bit < 32; bit++)
+			{
+				if (entry.detectionSources & (1U << bit))
+					sourceFalsePos[1U << bit]++;
+			}
+			break;
+		case FeedbackType::Missed:
+			totalMissed++;
+			break;
+		}
+	}
+
+	// Helper: adjust a DetectorConfig weight based on its source bit's
+	// correct/false-positive ratio. Increase weight when mostly correct,
+	// decrease when mostly false-positive. Clamp to [0.1, 5.0].
+	auto adjustWeight = [&](DetectorConfig& dc, uint32_t sourceBit) {
+		size_t correct = sourceCorrect.count(sourceBit) ? sourceCorrect[sourceBit] : 0;
+		size_t falsePos = sourceFalsePos.count(sourceBit) ? sourceFalsePos[sourceBit] : 0;
+		size_t total = correct + falsePos;
+		if (total < 3)
+			return;  // Not enough data for this source
+
+		double correctRate = static_cast<double>(correct) / total;
+		// Scale factor: 0.7 for 0% correct, 1.0 for 50%, 1.3 for 100%
+		double factor = 0.7 + 0.6 * correctRate;
+		dc.weight = std::max(0.1, std::min(5.0, dc.weight * factor));
+	};
+
+	// Adjust prologue detector weights
+	adjustWeight(adjusted.prologuePush, static_cast<uint32_t>(DetectionSource::ProloguePush));
+	adjustWeight(adjusted.prologueSubSp, static_cast<uint32_t>(DetectionSource::PrologueSubSp));
+	adjustWeight(adjusted.prologueMovFp, static_cast<uint32_t>(DetectionSource::PrologueMovFp));
+	adjustWeight(adjusted.prologueStmfd, static_cast<uint32_t>(DetectionSource::PrologueStmfd));
+
+	// Call targets
+	adjustWeight(adjusted.blTarget, static_cast<uint32_t>(DetectionSource::BlTarget));
+	adjustWeight(adjusted.blxTarget, static_cast<uint32_t>(DetectionSource::BlxTarget));
+	adjustWeight(adjusted.indirectCallTarget, static_cast<uint32_t>(DetectionSource::IndirectCallTarget));
+
+	// Cross-reference
+	adjustWeight(adjusted.highXrefDensity, static_cast<uint32_t>(DetectionSource::HighXrefDensity));
+	adjustWeight(adjusted.pointerTableEntry, static_cast<uint32_t>(DetectionSource::PointerTableEntry));
+
+	// Structural
+	adjustWeight(adjusted.afterUnconditionalRet, static_cast<uint32_t>(DetectionSource::AfterUnconditionalRet));
+	adjustWeight(adjusted.afterTailCall, static_cast<uint32_t>(DetectionSource::AfterTailCall));
+	adjustWeight(adjusted.alignmentBoundary, static_cast<uint32_t>(DetectionSource::AlignmentBoundary));
+	adjustWeight(adjusted.afterLiteralPool, static_cast<uint32_t>(DetectionSource::AfterLiteralPool));
+	adjustWeight(adjusted.afterPadding, static_cast<uint32_t>(DetectionSource::AfterPadding));
+
+	// Exception/interrupt
+	adjustWeight(adjusted.vectorTableTarget, static_cast<uint32_t>(DetectionSource::VectorTableTarget));
+	adjustWeight(adjusted.interruptPrologue, static_cast<uint32_t>(DetectionSource::InterruptPrologue));
+
+	// Advanced
+	adjustWeight(adjusted.thunkPattern, static_cast<uint32_t>(DetectionSource::ThunkPattern));
+	adjustWeight(adjusted.trampolinePattern, static_cast<uint32_t>(DetectionSource::TrampolinePattern));
+	adjustWeight(adjusted.switchCaseHandler, static_cast<uint32_t>(DetectionSource::SwitchCaseHandler));
+
+	// Compiler-specific
+	adjustWeight(adjusted.gccPrologue, static_cast<uint32_t>(DetectionSource::GccPrologue));
+	adjustWeight(adjusted.armccPrologue, static_cast<uint32_t>(DetectionSource::ArmccPrologue));
+	adjustWeight(adjusted.iarPrologue, static_cast<uint32_t>(DetectionSource::IarPrologue));
+
+	// RTOS
+	adjustWeight(adjusted.taskEntryPattern, static_cast<uint32_t>(DetectionSource::TaskEntryPattern));
+	adjustWeight(adjusted.callbackPattern, static_cast<uint32_t>(DetectionSource::CallbackPattern));
+
+	// Statistical
+	adjustWeight(adjusted.instructionSequence, static_cast<uint32_t>(DetectionSource::InstructionSequence));
+	adjustWeight(adjusted.entropyTransition, static_cast<uint32_t>(DetectionSource::EntropyTransition));
+
+	// CFG
+	adjustWeight(adjusted.cfgValidation, static_cast<uint32_t>(DetectionSource::CfgValidated));
+
+	// Adjust minimumScore based on overall false-positive vs missed ratio.
+	// Too many false positives → raise threshold.
+	// Too many missed → lower threshold.
+	size_t totalFeedback = totalCorrect + totalFalsePositive + totalMissed;
+	if (totalFeedback >= 5)
+	{
+		double fpRate = static_cast<double>(totalFalsePositive) / totalFeedback;
+		double missRate = static_cast<double>(totalMissed) / totalFeedback;
+
+		// Shift threshold: positive when FP > missed (raise), negative otherwise (lower)
+		double shift = (fpRate - missRate) * 0.1;
+		adjusted.minimumScore = std::max(0.1, std::min(0.9, adjusted.minimumScore + shift));
+	}
+
+	return adjusted;
+}
+
+Ref<Metadata> DetectionFeedback::ToMetadata() const
+{
+	// Serialize as an array of entry maps
+	std::vector<Ref<Metadata>> entries;
+	entries.reserve(m_entries.size());
+
+	for (const auto& e : m_entries)
+	{
+		std::map<std::string, Ref<Metadata>> em;
+		em["address"] = new Metadata(e.address);
+		em["type"] = new Metadata((uint64_t)e.type);
+		em["sources"] = new Metadata((uint64_t)e.detectionSources);
+		em["score"] = new Metadata(e.originalScore);
+		entries.push_back(new Metadata(em));
+	}
+
+	return new Metadata(entries);
+}
+
+DetectionFeedback DetectionFeedback::FromMetadata(Ref<Metadata> md)
+{
+	DetectionFeedback feedback;
+	if (!md)
+		return feedback;
+
+	auto arr = md->GetArray();
+	for (const auto& item : arr)
+	{
+		auto m = item->GetKeyValueStore();
+		FeedbackEntry entry{};
+
+		if (m.count("address"))
+			entry.address = m["address"]->GetUnsignedInteger();
+		if (m.count("type"))
+		{
+			uint64_t typeVal = m["type"]->GetUnsignedInteger();
+			if (typeVal <= static_cast<uint64_t>(FeedbackType::Missed))
+				entry.type = static_cast<FeedbackType>(typeVal);
+		}
+		if (m.count("sources"))
+			entry.detectionSources = static_cast<uint32_t>(m["sources"]->GetUnsignedInteger());
+		if (m.count("score"))
+			entry.originalScore = m["score"]->GetDouble();
+
+		feedback.m_entries.push_back(entry);
+	}
+
+	return feedback;
 }
 
 size_t FunctionDetector::ApplyCandidates(const std::vector<FunctionCandidate>& candidates, double minScore)
