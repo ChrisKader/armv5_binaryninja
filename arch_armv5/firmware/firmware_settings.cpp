@@ -145,7 +145,7 @@ FirmwareSettings DefaultFirmwareSettings(FirmwareSettingsMode mode)
 	settings.orphanMaxPerPage = (mode == FirmwareSettingsMode::Init) ? 6 : 8;
 	// Require prologue only during initial analysis
 	settings.orphanRequirePrologue = (mode == FirmwareSettingsMode::Init);
-	settings.maxFunctionAdds = 50000;
+	settings.maxFunctionAdds = 0;  // 0 = no limit
 	settings.tuning = FirmwareScanTuning{};
 	settings.tuning.scanRawPointerTables = true;
 	// Unified recognizer settings - enabled by default for better function detection
@@ -414,7 +414,7 @@ void RegisterFirmwareSettings(const Ref<Settings>& settings)
 		"Call scan require in-function",
 		"Restrict call-target scanning to instructions already inside functions.");
 
-	fw->RegisterNumber(settings, kMaxFunctionAdds, 50000, 0, 100000,
+	fw->RegisterNumber(settings, kMaxFunctionAdds, 0, 0, 200000,
 		"Max firmware function additions",
 		"Cap the number of functions added per firmware scan run (0 disables the cap).");
 

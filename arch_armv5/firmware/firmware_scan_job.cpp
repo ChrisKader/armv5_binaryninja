@@ -1296,6 +1296,11 @@ bool WaitForAnalysisIdle(uint64_t instanceId, const Ref<BinaryView>& view,
 		if (logger)
 			logger->LogInfo("Firmware workflow scan: done (applied=%s)", applied ? "true" : "false");
 
+		// Store the plugin version in bndb metadata for caching.
+		// On subsequent opens, the workflow will check this version
+		// and skip re-analysis if it matches.
+		StorePluginVersionInView(view);
+
 		finishTask();
 		SetFirmwareViewScanCancelled(instanceId, false);
 	}
@@ -1672,4 +1677,64 @@ bool BinaryNinja::WaitForArmv5ScansToComplete(uint32_t timeoutMs)
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 	return true;  // All scans completed
+}
+
+// ============================================================================
+// Plugin Version Tracking for BNDB Caching
+// ============================================================================
+
+namespace
+{
+	// Metadata key for storing the plugin version
+	constexpr const char* kPluginVersionMetadataKey = "armv5.plugin_version";
+}
+
+void BinaryNinja::StorePluginVersionInView(const Ref<BinaryView>& view)
+{
+	if (!view || !view->GetObject())
+		return;
+
+	// Store as a simple integer metadata value
+	auto metadata = new Metadata(static_cast<uint64_t>(ARMV5_PLUGIN_VERSION));
+	view->StoreMetadata(kPluginVersionMetadataKey, metadata);
+
+	auto logger = LogRegistry::GetLogger("ARMv5.ScanJob");
+	if (logger)
+		logger->LogInfo("Stored plugin version %u in bndb metadata", ARMV5_PLUGIN_VERSION);
+}
+
+bool BinaryNinja::CheckPluginVersionInView(const Ref<BinaryView>& view)
+{
+	if (!view || !view->GetObject())
+		return false;  // No view, must run analysis
+
+	auto metadata = view->QueryMetadata(kPluginVersionMetadataKey);
+	if (!metadata)
+		return false;  // No version stored, must run analysis
+
+	// Check if metadata is an unsigned integer
+	if (!metadata->IsUnsignedInteger())
+		return false;  // Invalid format, must run analysis
+
+	uint64_t storedVersion = metadata->GetUnsignedInteger();
+
+	auto logger = LogRegistry::GetLogger("ARMv5.ScanJob");
+	if (logger)
+		logger->LogInfo("Checking plugin version: stored=%llu, current=%u",
+			(unsigned long long)storedVersion, ARMV5_PLUGIN_VERSION);
+
+	// Return true if versions match (skip analysis)
+	return storedVersion == ARMV5_PLUGIN_VERSION;
+}
+
+void BinaryNinja::ClearPluginVersionInView(const Ref<BinaryView>& view)
+{
+	if (!view || !view->GetObject())
+		return;
+
+	view->RemoveMetadata(kPluginVersionMetadataKey);
+
+	auto logger = LogRegistry::GetLogger("ARMv5.ScanJob");
+	if (logger)
+		logger->LogInfo("Cleared plugin version from bndb metadata (will re-analyze on next open)");
 }

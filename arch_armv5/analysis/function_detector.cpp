@@ -646,6 +646,206 @@ bool FunctionDetector::IsEpilogueInstruction(uint64_t address, bool isThumb)
 	return false;
 }
 
+void FunctionDetector::ValidatePrologueBody(FunctionCandidate& candidate)
+{
+	// Skip if body validation is disabled
+	if (!m_settings.useBodyValidation)
+		return;
+
+	// Only validate candidates that have a prologue source
+	bool hasPrologue = (candidate.sources & static_cast<uint32_t>(DetectionSource::ProloguePush)) ||
+	                   (candidate.sources & static_cast<uint32_t>(DetectionSource::PrologueStmfd)) ||
+	                   (candidate.sources & static_cast<uint32_t>(DetectionSource::PrologueSubSp));
+	if (!hasPrologue)
+		return;
+
+	// Reset validation state
+	candidate.bodyValidated = false;
+	candidate.bodyInstrCount = 0;
+	candidate.bodyBlCalls = 0;
+	candidate.bodyHasReturn = false;
+	candidate.bodyValidationBonus = 0;
+
+	uint64_t addr = candidate.address;
+	bool isThumb = candidate.isThumb;
+	size_t instrSize = isThumb ? 2 : 4;
+	size_t maxInstrs = m_settings.bodyValidationMaxInstrs;
+
+	// Start scanning after the prologue instruction
+	addr += instrSize;
+
+	for (size_t i = 0; i < maxInstrs; i++)
+	{
+		// Check bounds
+		if (addr < m_dataCacheStart || addr >= m_dataCacheStart + m_dataCacheLen)
+			break;
+
+		if (!isThumb)
+		{
+			// ARM mode
+			uint32_t instr = ReadInstruction32(addr);
+			uint32_t cond = (instr >> 28) & 0xF;
+
+			// Check for undefined/unpredictable instruction patterns
+			// 0xE7XXXXXX with specific sub-patterns are undefined
+			if (cond == 0xE && ((instr >> 25) & 0x7) == 0x3 && (instr & (1 << 4)))
+			{
+				// Undefined instruction - stop scanning
+				break;
+			}
+
+			// Check for return instructions
+			// BX LR (unconditional)
+			if ((instr & 0x0FFFFFFF) == 0x012FFF1E && cond == 0xE)
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+			// MOV pc, lr (unconditional)
+			if ((instr & 0x0FFFFFFF) == 0x01A0F00E && cond == 0xE)
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+			// POP/LDMIA sp!, {..., pc} (unconditional)
+			if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)) && cond == 0xE)
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+			// LDMFD sp!, {..., pc} alternate encoding
+			if ((instr & 0x0FFF0000) == 0x08BD0000 && (instr & (1 << 15)))
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+
+			// Check for BL/BLX instructions (internal calls)
+			// BL: 1110 1011 xxxx xxxx xxxx xxxx xxxx xxxx
+			if ((instr & 0x0F000000) == 0x0B000000)
+			{
+				candidate.bodyBlCalls++;
+			}
+			// BLX: 1111 101H xxxx xxxx xxxx xxxx xxxx xxxx
+			if ((instr & 0xFE000000) == 0xFA000000)
+			{
+				candidate.bodyBlCalls++;
+			}
+
+			// Check for obviously invalid patterns (all zeros, all ones)
+			if (instr == 0x00000000 || instr == 0xFFFFFFFF)
+				break;
+
+			// Check for another prologue (would indicate function boundary)
+			if ((instr & 0x0FFF0000) == 0x092D0000 && (instr & (1 << 14)))
+			{
+				// Found another prologue - we've crossed a function boundary
+				break;
+			}
+
+			candidate.bodyInstrCount++;
+			addr += 4;
+		}
+		else
+		{
+			// Thumb mode
+			uint16_t instr = ReadInstruction16(addr);
+
+			// Check for return instructions
+			// BX LR: 0x4770
+			if (instr == 0x4770)
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+			// POP {pc}: 1011 1 10 1 reglist8 (bit 8 = PC)
+			if ((instr & 0xFF00) == 0xBD00)
+			{
+				candidate.bodyHasReturn = true;
+				candidate.bodyInstrCount++;
+				break;
+			}
+
+			// Check for 32-bit Thumb instructions
+			if ((instr & 0xE000) == 0xE000 && (instr & 0x1800) != 0)
+			{
+				// 32-bit Thumb instruction
+				uint16_t instr2 = ReadInstruction16(addr + 2);
+				uint32_t instr32 = (static_cast<uint32_t>(instr) << 16) | instr2;
+
+				// Check for BL (32-bit): 1111 0xxx xxxx xxxx 11x1 xxxx xxxx xxxx
+				if ((instr32 & 0xF800D000) == 0xF000D000)
+				{
+					candidate.bodyBlCalls++;
+				}
+
+				// Check for 32-bit POP.W {pc}
+				// Encoding: 1110 1000 1011 1101 PM0x reglist
+				if ((instr32 & 0xFFFF0000) == 0xE8BD0000 && (instr32 & (1 << 15)))
+				{
+					candidate.bodyHasReturn = true;
+					candidate.bodyInstrCount++;
+					break;
+				}
+
+				candidate.bodyInstrCount++;
+				addr += 4;
+				i++;  // Count as 2 instruction slots
+			}
+			else
+			{
+				// 16-bit Thumb instruction
+
+				// Check for obviously invalid patterns
+				if (instr == 0x0000 || instr == 0xFFFF)
+					break;
+
+				// Check for another Thumb prologue (PUSH {lr})
+				if ((instr & 0xFF00) == 0xB500)
+				{
+					// Found another prologue - function boundary
+					break;
+				}
+
+				// Check for BL prefix (we handle BL in 32-bit section above)
+				// Just count valid instructions
+				candidate.bodyInstrCount++;
+				addr += 2;
+			}
+		}
+	}
+
+	// Determine if body validation passed
+	// Criteria: found return instruction AND sufficient valid instructions
+	if (candidate.bodyHasReturn && candidate.bodyInstrCount >= m_settings.bodyValidationMinInstrs)
+	{
+		candidate.bodyValidated = true;
+
+		// Calculate bonus based on evidence strength
+		double bonus = m_settings.bodyValidationWeight;
+
+		// Bonus for BL calls found (indicates real function behavior)
+		if (candidate.bodyBlCalls >= 3)
+			bonus *= 1.2;
+		else if (candidate.bodyBlCalls >= 1)
+			bonus *= 1.1;
+
+		// Bonus for longer instruction sequences (more confidence)
+		if (candidate.bodyInstrCount >= 32)
+			bonus *= 1.1;
+		else if (candidate.bodyInstrCount >= 16)
+			bonus *= 1.05;
+
+		// Cap at reasonable maximum
+		candidate.bodyValidationBonus = std::min(bonus, 2.0);
+	}
+}
+
 void FunctionDetector::EstimateCodeBoundary()
 {
 	uint64_t start = m_settings.scanStart ? m_settings.scanStart : m_view->GetStart();
@@ -1947,6 +2147,15 @@ double FunctionDetector::CalculateFinalScore(const FunctionCandidate& candidate)
 		}
 	}
 
+	// Add body validation bonus if prologue body was validated
+	// This rescues prologue-only candidates that have valid function bodies
+	// but no incoming BL calls to corroborate their detection
+	if (candidate.bodyValidated && candidate.bodyValidationBonus > 0)
+	{
+		positiveScore += candidate.bodyValidationBonus;
+		positiveSourceCount++;  // Count as an additional source for corroboration
+	}
+
 	// Normalize against a FIXED maximum rather than per-candidate maximum.
 	// This ensures a single weak source (e.g., AfterUnconditionalRet weight 0.78)
 	// doesn't score the same as a multi-source candidate (e.g., BL target + prologue).
@@ -1958,6 +2167,7 @@ double FunctionDetector::CalculateFinalScore(const FunctionCandidate& candidate)
 	//   - BL target + prologue (4.5): score = 4.5/6.0 = 0.75
 	//   - BL + prologue + structural (5.8): score = 5.8/6.0 = 0.97
 	//   - Single weak "after return" (0.78): score = 0.78/6.0 = 0.13
+	//   - Prologue (1.5) + body validated (1.5): score = 3.0/6.0 = 0.50 ✓
 	static constexpr double kScoreCeiling = 6.0;
 
 	double rawScore = (positiveScore - negativeScore) / kScoreCeiling;
@@ -2020,6 +2230,7 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	m_stats.thumbFunctions = 0;
 	m_stats.existingFunctions = 0;
 	m_stats.newFunctions = 0;
+	m_stats.bodyValidatedFunctions = 0;
 	m_stats.detectedCompiler = DetectedCompiler::Unknown;
 	m_stats.averageScore = 0.0;
 	m_stats.sourceContributions.clear();
@@ -2196,6 +2407,23 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 			}
 		}
 
+		// PROLOGUE BODY VALIDATION: For candidates with prologue but no BL target,
+		// scan forward to validate the function body. This rescues functions that
+		// have valid prologues but no incoming calls to corroborate.
+		bool hasPrologue = (c.sources & static_cast<uint32_t>(DetectionSource::ProloguePush)) ||
+		                   (c.sources & static_cast<uint32_t>(DetectionSource::PrologueStmfd));
+		bool hasBlTarget = (c.sources & static_cast<uint32_t>(DetectionSource::BlTarget)) ||
+		                   (c.sources & static_cast<uint32_t>(DetectionSource::BlxTarget));
+
+		// Only run body validation if:
+		// 1. Candidate has a prologue
+		// 2. Candidate does NOT have BL target (would already score well)
+		// 3. Body validation is enabled
+		if (m_settings.useBodyValidation && hasPrologue && !hasBlTarget)
+		{
+			ValidatePrologueBody(c);
+		}
+
 		c.score = CalculateFinalScore(c);
 		
 		if (c.score >= settings.minimumScore)
@@ -2217,7 +2445,11 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 			
 			if (m_existingFunctions.find(c.address) == m_existingFunctions.end())
 				m_stats.newFunctions++;
-			
+
+			// Track body-validated functions (rescued by forward scan)
+			if (c.bodyValidated)
+				m_stats.bodyValidatedFunctions++;
+
 			// Track source contributions
 			for (const auto& ss : c.sourceScores)
 			{
@@ -2229,9 +2461,9 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 	
 	// Sort by score
 	std::sort(result.begin(), result.end());
-	
-	// Limit results
-	if (result.size() > settings.maxCandidates)
+
+	// Limit results (0 = no limit)
+	if (settings.maxCandidates > 0 && result.size() > settings.maxCandidates)
 		result.resize(settings.maxCandidates);
 	
 	m_stats.totalCandidates = result.size();
@@ -2264,8 +2496,9 @@ std::vector<FunctionCandidate> FunctionDetector::Detect(const FunctionDetectionS
 		m_logger->LogInfo("Phase %zu/%zu [Scoring candidates] took %.3f s (%zu results)",
 			m_currentPhase, kTotalPhases, scoringSecs, result.size());
 
-	m_logger->LogInfo("FunctionDetector: Found %zu candidates (high=%zu, med=%zu, low=%zu)",
-		result.size(), m_stats.highConfidence, m_stats.mediumConfidence, m_stats.lowConfidence);
+	m_logger->LogInfo("FunctionDetector: Found %zu candidates (high=%zu, med=%zu, low=%zu, body-validated=%zu)",
+		result.size(), m_stats.highConfidence, m_stats.mediumConfidence, m_stats.lowConfidence,
+		m_stats.bodyValidatedFunctions);
 
 	return result;
 }

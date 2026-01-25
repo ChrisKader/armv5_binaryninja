@@ -68,6 +68,7 @@
 
 #include "firmware_workflow.h"
 #include "firmware/firmware_view.h"
+#include "firmware/firmware_scan_job.h"
 #include <algorithm>
 #include <exception>
 
@@ -478,6 +479,22 @@ static void RunArmv5FirmwareWorkflow(const Ref<AnalysisContext>& analysisContext
 	if (IsFirmwareViewClosing(view.GetPtr()))
 	{
 		logger->LogWarn("RunArmv5FirmwareWorkflow: view is closing, skipping");
+		return;
+	}
+
+	/*
+	 * Guard 4: Check plugin version for bndb caching
+	 *
+	 * If this is a bndb that was analyzed with the same plugin version,
+	 * skip re-analysis. This dramatically speeds up bndb reopening.
+	 *
+	 * Users can force re-analysis by:
+	 * 1. Incrementing ARMV5_PLUGIN_VERSION in firmware_scan_job.h
+	 * 2. Using ClearPluginVersionInView() to clear the stored version
+	 */
+	if (CheckPluginVersionInView(view))
+	{
+		logger->LogInfo("RunArmv5FirmwareWorkflow: plugin version matches, skipping re-analysis");
 		return;
 	}
 

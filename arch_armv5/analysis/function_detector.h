@@ -111,6 +111,14 @@ struct FunctionCandidate
 	size_t cfgLoopCount = 0;
 	int cfgComplexity = 0;          // Cyclomatic complexity
 
+	// Prologue body validation results
+	// For prologue-only candidates, we scan forward to validate the function body
+	bool bodyValidated = false;      // True if body scan found valid function structure
+	size_t bodyInstrCount = 0;       // Number of valid instructions scanned
+	size_t bodyBlCalls = 0;          // Number of BL/BLX calls found in body
+	bool bodyHasReturn = false;      // True if we found a return instruction
+	double bodyValidationBonus = 0;  // Score boost from body validation (0.0 - 1.5)
+
 	bool operator<(const FunctionCandidate& other) const
 	{
 		return score > other.score;  // Higher score = better
@@ -242,6 +250,15 @@ struct FunctionDetectionSettings
 	size_t cfgMaxBlocks = 200;              // Max blocks to explore per candidate
 	size_t cfgMaxInstructions = 5000;       // Max instructions per candidate
 
+	// Prologue body validation - for prologue-only candidates with low scores,
+	// scan forward to find evidence of a valid function body (return instruction,
+	// BL calls, valid instruction sequence). This rescues functions that have
+	// valid prologues but no incoming BL calls.
+	bool useBodyValidation = true;          // Enable prologue body validation
+	double bodyValidationWeight = 1.5;      // Score boost when body validates
+	size_t bodyValidationMaxInstrs = 128;   // Max instructions to scan forward (512 bytes ARM)
+	size_t bodyValidationMinInstrs = 4;     // Minimum valid instructions for boost
+
 	// Linear sweep (Nucleus-style basic block grouping)
 	// DISABLED by default - BN's built-in linear sweep is faster and adds functions
 	// incrementally. Our notification handler filters out bad functions in real-time.
@@ -268,7 +285,7 @@ struct FunctionDetectionSettings
 	double epiloguePenalty = 5.0;           // Very strong penalty for epilogue instructions (always reject)
 	
 	// Scanning parameters
-	uint32_t maxCandidates = 10000;
+	uint32_t maxCandidates = 0;     // 0 = no limit (all passing candidates returned)
 	uint64_t scanStart = 0;         // 0 = use BinaryView start
 	uint64_t scanEnd = 0;           // 0 = use BinaryView end
 	bool scanInChunks = true;
@@ -302,7 +319,7 @@ struct FunctionDetectionSettings
 			instructionSequence.weight = 1.0;
 			entropyTransition.weight = 0.8;
 			midInstructionPenalty = 3.0;
-			maxCandidates = 15000;
+			// maxCandidates stays at 0 (no limit)
 		}
 		else if (config.mode == DetectionMode::Conservative)
 		{
@@ -424,6 +441,7 @@ public:
 		size_t thumbFunctions;
 		size_t existingFunctions;
 		size_t newFunctions;
+		size_t bodyValidatedFunctions;  // Functions rescued by body validation
 		DetectedCompiler detectedCompiler;
 		double averageScore;
 		std::map<DetectionSource, size_t> sourceContributions;
@@ -502,6 +520,10 @@ private:
 	bool CheckThumbPrologue(uint64_t address, uint16_t instr, uint16_t next);
 	uint32_t ReadInstruction32(uint64_t address);
 	uint16_t ReadInstruction16(uint64_t address);
+
+	// Prologue body validation - scans forward from a prologue candidate to
+	// validate it's a real function by finding a return instruction
+	void ValidatePrologueBody(FunctionCandidate& candidate);
 	
 	// Statistical helpers
 	double CalculateLocalEntropy(uint64_t address, size_t windowSize);
