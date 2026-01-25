@@ -554,7 +554,10 @@ bool ArmCommonArchitecture::Assemble(const std::string &code, uint64_t addr, Dat
   int assembleResult;
 
   std::string triple = GetAssemblerTriple();
-  LogDebug("%s() retrieves and uses triple %s\n", __func__, triple.c_str());
+  {
+    static Ref<Logger> sArchLog = LogRegistry::CreateLogger("ARMv5.Architecture");
+    if (sArchLog) sArchLog->LogDebug("%s() retrieves and uses triple %s", __func__, triple.c_str());
+  }
 
   BNLlvmServicesInit();
 

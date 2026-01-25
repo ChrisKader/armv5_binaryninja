@@ -200,7 +200,7 @@ FirmwareSettings LoadMergedSettings(BinaryView* view)
  */
 Ref<Logger> GetCommandLogger()
 {
-	return LogRegistry::CreateLogger("BinaryView.ARMv5Commands");
+	return LogRegistry::CreateLogger("ARMv5.Commands");
 }
 
 /*

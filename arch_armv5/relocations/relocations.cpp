@@ -11,6 +11,12 @@
 
 using namespace BinaryNinja;
 
+static Ref<Logger> GetRelocLogger()
+{
+	static Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.Relocations");
+	return logger;
+}
+
 static const char* GetRelocationString(ElfArmRelocationType rel)
 {
 	static std::map<ElfArmRelocationType, const char*> relocTable =
@@ -369,7 +375,7 @@ public:
 		{
 			if (target & 1)
 			{
-				LogError("Unsupported relocation R_ARM_CALL to thumb target");
+				if (auto rLog = GetRelocLogger()) rLog->LogError("Unsupported relocation R_ARM_CALL to thumb target");
 				break;
 			}
 			struct _bl
@@ -382,7 +388,7 @@ public:
 			int64_t newTarget = (target + (info.implicitAddend ? ((bl->imm << 2) + 8) : info.addend)) - reloc->GetAddress();
 			if ((newTarget - 8) > 0x3ffffff)
 			{
-				LogError("Unsupported relocation R_ARM_CALL @ 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
+				if (auto rLog = GetRelocLogger()) rLog->LogError("Unsupported relocation R_ARM_CALL @ 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
 				break;
 			}
 			bl->imm = (newTarget - 8) >> 2;
@@ -438,7 +444,7 @@ public:
 		{
 			if (target & 1)
 			{
-				LogError("Unsupported relocation R_ARM_JUMP24 to thumb target");
+				if (auto rLog = GetRelocLogger()) rLog->LogError("Unsupported relocation R_ARM_JUMP24 to thumb target");
 				break;
 			}
 			struct _b
@@ -451,7 +457,7 @@ public:
 			int64_t newTarget = (target + (info.implicitAddend ? ((b->imm << 2) + 8) : info.addend)) - reloc->GetAddress();
 			if ((newTarget - 8) > 0x3ffffff)
 			{
-				LogError("Unsupported relocation R_ARM_JUMP24 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
+				if (auto rLog = GetRelocLogger()) rLog->LogError("Unsupported relocation R_ARM_JUMP24 0x%" PRIx64 " with target greater than 0x3ffffff: 0x%" PRIx64, reloc->GetAddress(), newTarget - 8);
 				break;
 			}
 			b->imm = (newTarget - 8) >> 2;
@@ -718,7 +724,7 @@ public:
 			}
 		}
 		for (auto& reloc : relocTypes)
-			LogWarn("Unsupported ELF relocation: %s", GetRelocationString((ElfArmRelocationType)reloc));
+			if (auto rLog = GetRelocLogger()) rLog->LogWarn("Unsupported ELF relocation: %s", GetRelocationString((ElfArmRelocationType)reloc));
 		return true;
 	}
 };

@@ -16,7 +16,7 @@ using namespace armv5;
  */
 static Ref<Logger> GetAnalysisLogger()
 {
-	static Ref<Logger> logger = LogRegistry::CreateLogger("BinaryView.ARMv5Analysis");
+	static Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.Analysis");
 	return logger;
 }
 

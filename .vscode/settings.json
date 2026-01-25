@@ -10,6 +10,8 @@
   "files.exclude": {
     "binaryninja-api/**": false
   },
+  "python.autoComplete.extraPaths": ["/Applications/Binary Ninja DEV.app/Contents/Resources/python"],
+  "python-env.workspaceSearchPaths": ["/Applications/Binary Ninja DEV.app/Contents/Resources/python"],
   "rust-analyzer.files.exclude": [
     "binaryninja-api/rust"
   ],
@@ -18,5 +20,7 @@
     "**/large_data_dir",
     "**/.git",
     "binaryninja-api/**"
-  ]
+  ],
+  "python-envs.defaultEnvManager": "ms-python.python:system",
+  "python-envs.pythonProjects": []
 }

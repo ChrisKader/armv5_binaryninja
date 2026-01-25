@@ -50,7 +50,7 @@ RegionDetector::RegionDetector(Ref<BinaryView> view)
 	: m_view(view)
 	, m_settings(DefaultSettings())
 {
-	m_logger = LogRegistry::CreateLogger("RegionDetector");
+	m_logger = LogRegistry::CreateLogger("ARMv5.RegionDetector");
 }
 
 RegionDetectionSettings RegionDetector::DefaultSettings()

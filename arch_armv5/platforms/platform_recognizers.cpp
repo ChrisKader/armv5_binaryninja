@@ -10,6 +10,12 @@
 
 using namespace BinaryNinja;
 
+static Ref<Logger> GetPlatformLogger()
+{
+  static Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.Platform");
+  return logger;
+}
+
 /*
  * Parse ARM .ARM.attributes to get Tag_CPU_arch for an ELF binary.
  *
@@ -273,8 +279,9 @@ static Ref<Platform> ElfArmv5PlatformRecognize(BinaryView* view, Metadata* metad
     if (cpuArch >= 0 && cpuArch <= 5)
     {
       const char* archNames[] = {"Pre-v4", "ARMv4", "ARMv4T", "ARMv5T", "ARMv5TE", "ARMv5TEJ"};
-      LogInfo("ELF .ARM.attributes Tag_CPU_arch=%d (%s): using armv5 architecture",
-              cpuArch, archNames[cpuArch]);
+      if (auto pLog = GetPlatformLogger())
+        pLog->LogInfo("ELF .ARM.attributes Tag_CPU_arch=%d (%s): using armv5 architecture",
+                      cpuArch, archNames[cpuArch]);
       return Platform::GetByName("arm");
     }
 
@@ -321,7 +328,8 @@ static Ref<Platform> ElfArmv5PlatformRecognize(BinaryView* view, Metadata* metad
   /* Claim binaries with older EABI versions as ARMv5 */
   if (eabiVersion == EF_ARM_EABI_VER1 || eabiVersion == EF_ARM_EABI_VER2)
   {
-    LogInfo("ELF e_flags 0x%08" PRIx64 " indicates early ARM EABI: using armv5 architecture", flags);
+    if (auto pLog = GetPlatformLogger())
+      pLog->LogInfo("ELF e_flags 0x%08" PRIx64 " indicates early ARM EABI: using armv5 architecture", flags);
     return Platform::GetByName("arm");
   }
 
@@ -382,7 +390,8 @@ static Ref<Platform> RawArmv5PlatformRecognize(BinaryView* view, Metadata* metad
   /* If we see at least 4 vector table entries that look like ARM code, claim it */
   if (armPatternCount >= 4)
   {
-    LogInfo("Raw binary detected as ARM: vector table pattern found (%d/8 entries), claiming as armv5", armPatternCount);
+    if (auto pLog = GetPlatformLogger())
+      pLog->LogInfo("Raw binary detected as ARM: vector table pattern found (%d/8 entries), claiming as armv5", armPatternCount);
     return Platform::GetByName("arm");
   }
 

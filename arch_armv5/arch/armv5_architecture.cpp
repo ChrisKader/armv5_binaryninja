@@ -46,6 +46,7 @@
 #include "arch_armv5.h"
 #include "arch/armv5_architecture.h"
 #include "common/armv5_utils.h"
+#include "firmware/firmware_view.h"
 #include "il/il.h"
 
 using namespace BinaryNinja;
@@ -62,6 +63,12 @@ using namespace armv5;
 #define DISASM_SUCCESS 0
 #define FAILED_TO_DISASSEMBLE_OPERAND 1
 #define FAILED_TO_DISASSEMBLE_REGISTER 2
+
+static Ref<Logger> GetArchLogger()
+{
+	static Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.Architecture");
+	return logger;
+}
 
 /*
  * Maximum number of instructions to consider for conditional coalescing.
@@ -2626,11 +2633,10 @@ public:
                 size_t emittedTargets = 0;
                 if (resolvedTargets.size() > kMaxIndirectTargets)
                 {
-                  auto clampLogger = LogRegistry::CreateLogger("BinaryView.ARMv5Architecture");
-                  if (clampLogger)
-                    clampLogger->LogWarn("Clamping indirect branch targets at 0x%llx from %zu to %zu",
-                                         (unsigned long long)location.address,
-                                         resolvedTargets.size(), kMaxIndirectTargets);
+                  if (auto archLog = GetArchLogger())
+                    archLog->LogWarn("Clamping indirect branch targets at 0x%llx from %zu to %zu",
+                                    (unsigned long long)location.address,
+                                    resolvedTargets.size(), kMaxIndirectTargets);
                 }
                 for (auto &branch : resolvedTargets)
                 {
@@ -2747,6 +2753,11 @@ public:
                 {
                   if (!IsValidFunctionStart(data, targetPlatform, target.address))
                     break;
+                  {
+                    uint64_t instId = GetInstanceIdFromView(data);
+                    if (instId != 0 && IsRemovedFunctionAddress(instId, target.address))
+                      break;
+                  }
                   Ref<Function> forcedFunc = data->AddFunctionForAnalysis(targetPlatform, target.address, true);
                   if (forcedFunc)
                   {
@@ -2780,8 +2791,9 @@ public:
                 else if (disallowBranchToString && data->GetStringAtAddress(target.address, strRef) &&
                          targetExceedsByteLimit(strRef))
                 {
-                  BNLogInfo("Not adding branch target from 0x%" PRIx64 " to string at 0x%" PRIx64 " length:%zu",
-                            location.address, target.address, strRef.length);
+                  if (auto archLog = GetArchLogger())
+                    archLog->LogInfo("Not adding branch target from 0x%" PRIx64 " to string at 0x%" PRIx64 " length:%zu",
+                                     location.address, target.address, strRef.length);
                   break;
                 }
                 else
@@ -2850,12 +2862,20 @@ public:
 
                 if (!IsValidFunctionStart(data, platform, target.address))
                   break;
+                // Check if this address was already removed by cleanup — prevents
+                // the re-creation cycle where call-following re-adds invalid functions.
+                {
+                  uint64_t instId = GetInstanceIdFromView(data);
+                  if (instId != 0 && IsRemovedFunctionAddress(instId, target.address))
+                    break;
+                }
                 Ref<Function> func = data->AddFunctionForAnalysis(platform, target.address, true);
                 if (!func)
                 {
                   if (!data->IsOffsetBackedByFile(target.address))
-                    BNLogError("Function at 0x%" PRIx64 " failed to add target not backed by file.",
-                               function->GetStart());
+                    if (auto archLog = GetArchLogger())
+                      archLog->LogError("Function at 0x%" PRIx64 " failed to add target not backed by file.",
+                                        function->GetStart());
                   break;
                 }
 

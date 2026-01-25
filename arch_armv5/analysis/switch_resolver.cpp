@@ -15,7 +15,7 @@ SwitchResolver::SwitchResolver(Ref<BinaryView> view)
 	: m_view(view)
 	, m_settings()
 {
-	m_logger = LogRegistry::CreateLogger("SwitchResolver");
+	m_logger = LogRegistry::CreateLogger("ARMv5.SwitchResolver");
 }
 
 std::vector<ResolvedSwitch> SwitchResolver::resolveAll()

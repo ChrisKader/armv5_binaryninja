@@ -17,7 +17,7 @@ using namespace armv5;
  */
 static Ref<Logger> GetAnalysisLogger()
 {
-	static Ref<Logger> logger = LogRegistry::CreateLogger("BinaryView.ARMv5Analysis");
+	static Ref<Logger> logger = LogRegistry::CreateLogger("ARMv5.Analysis");
 	return logger;
 }
 
@@ -501,7 +501,7 @@ static void ParseAndDefineTypes(BinaryView* view, const std::string& source, con
 
 	if (!success)
 	{
-		LogError("Failed to parse %s: %s", fileName.c_str(), errors.c_str());
+		if (auto aLog = GetAnalysisLogger()) aLog->LogError("Failed to parse %s: %s", fileName.c_str(), errors.c_str());
 		return;
 	}
 
